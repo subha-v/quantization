@@ -73,16 +73,33 @@ def download_checkpoint(config_name="pi05_libero"):
 
 
 def _find_local_checkpoint(config_name="pi05_libero"):
-    """Search for an already-downloaded checkpoint on disk."""
+    """Search for an already-downloaded checkpoint on disk.
+
+    Prefers PyTorch (model.safetensors) over JAX so we get nn.Module.
+    """
     cache_base = os.environ.get("OPENPI_DATA_HOME", os.path.join(WORKSPACE, ".cache/openpi"))
-    candidates = [
+
+    # PyTorch checkpoints first — these give us nn.Module
+    pytorch_candidates = [
+        os.path.join(WORKSPACE, f"{config_name}_pytorch"),
+        os.path.join(WORKSPACE, "pi05_libero_pytorch"),
+    ]
+    for c in pytorch_candidates:
+        if os.path.isdir(c) and (
+            os.path.exists(os.path.join(c, "model.safetensors"))
+            or os.path.exists(os.path.join(c, "model.pt"))
+        ):
+            print(f"[checkpoint] Found PyTorch: {c}")
+            return c
+
+    # Fall back to JAX
+    jax_candidates = [
         os.path.join(cache_base, "openpi-assets/checkpoints", config_name),
         os.path.join(cache_base, "checkpoints", config_name),
-        os.path.join(WORKSPACE, f"{config_name}_pytorch"),
     ]
-    for c in candidates:
+    for c in jax_candidates:
         if os.path.isdir(c):
-            print(f"[checkpoint] Found local: {c}")
+            print(f"[checkpoint] Found JAX: {c}")
             return c
     return None
 
@@ -243,10 +260,27 @@ def load_libero_observations(n_easy=128, n_hard=128, seed=42, suite_map=None):
     from datasets import load_dataset
 
     rng = np.random.RandomState(seed)
-    print("[data] Loading physical-intelligence/libero from HuggingFace...")
+    # Try multiple dataset sources — the primary one may need a newer datasets lib
+    ds = None
+    for repo_id in [
+        "physical-intelligence/libero",
+        "lerobot/libero",
+        "HuggingFaceVLA/libero",
+    ]:
+        try:
+            print(f"[data] Trying {repo_id}...")
+            ds = load_dataset(repo_id, split="train")
+            print(f"[data] Loaded {repo_id}: {len(ds)} frames, columns: {ds.column_names}")
+            break
+        except Exception as e:
+            print(f"[data] {repo_id} failed: {e}")
+            continue
 
-    ds = load_dataset("physical-intelligence/libero", split="train")
-    print(f"[data] {len(ds)} frames, columns: {ds.column_names}")
+    if ds is None:
+        raise RuntimeError(
+            "Could not load LIBERO dataset from any source. "
+            "Try: uv pip install --upgrade datasets huggingface-hub"
+        )
 
     # Get task descriptions for suite classification + prompts
     task_descriptions = _load_task_descriptions(ds)
