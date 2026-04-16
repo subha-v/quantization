@@ -72,6 +72,21 @@ def download_checkpoint(config_name="pi05_libero"):
     )
 
 
+def _find_local_checkpoint(config_name="pi05_libero"):
+    """Search for an already-downloaded checkpoint on disk."""
+    cache_base = os.environ.get("OPENPI_DATA_HOME", os.path.join(WORKSPACE, ".cache/openpi"))
+    candidates = [
+        os.path.join(cache_base, "openpi-assets/checkpoints", config_name),
+        os.path.join(cache_base, "checkpoints", config_name),
+        os.path.join(WORKSPACE, f"{config_name}_pytorch"),
+    ]
+    for c in candidates:
+        if os.path.isdir(c):
+            print(f"[checkpoint] Found local: {c}")
+            return c
+    return None
+
+
 def load_policy(config_name="pi05_libero", checkpoint_dir=None):
     """Load an openpi policy ready for inference.
 
@@ -86,7 +101,12 @@ def load_policy(config_name="pi05_libero", checkpoint_dir=None):
     print(f"[load_policy] config={config_name}")
 
     if checkpoint_dir is None:
+        # Try local first to avoid re-downloading
+        checkpoint_dir = _find_local_checkpoint(config_name)
+    if checkpoint_dir is None:
         checkpoint_dir = download_checkpoint(config_name)
+
+    print(f"[load_policy] checkpoint_dir={checkpoint_dir}")
 
     # create_trained_policy handles transforms + weight loading
     policy = pc.create_trained_policy(config, checkpoint_dir)

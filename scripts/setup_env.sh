@@ -115,24 +115,45 @@ print(f'Checkpoint: {path}')
 "
 
 # Try JAX → PyTorch conversion
-PYTORCH_DIR="$WORKSPACE/pi05_libero_pytorch"
-if [ -d "$PYTORCH_DIR" ] && [ -f "$PYTORCH_DIR/model.safetensors" ]; then
-    echo "  PyTorch checkpoint already exists at $PYTORCH_DIR"
+# Find the actual checkpoint path (download may nest under openpi-assets/)
+CKPT_DIR=""
+for candidate in \
+    "$OPENPI_DATA_HOME/openpi-assets/checkpoints/pi05_libero" \
+    "$OPENPI_DATA_HOME/checkpoints/pi05_libero" \
+    "$WORKSPACE/.cache/openpi/openpi-assets/checkpoints/pi05_libero" \
+    "$WORKSPACE/.cache/openpi/checkpoints/pi05_libero"; do
+    if [ -d "$candidate" ]; then
+        CKPT_DIR="$candidate"
+        break
+    fi
+done
+
+if [ -z "$CKPT_DIR" ]; then
+    echo "  WARNING: Could not find downloaded checkpoint directory"
+    echo "  Searched: $OPENPI_DATA_HOME/{openpi-assets/,}checkpoints/pi05_libero"
+    echo "  Will try create_trained_policy (auto-downloads) in experiments"
 else
-    echo "  Converting JAX → PyTorch..."
-    CONVERT_SCRIPT=""
-    for candidate in \
-        "$OPENPI_DIR/examples/convert_jax_model_to_pytorch.py" \
-        "$OPENPI_DIR/scripts/convert_jax_model_to_pytorch.py"; do
-        [ -f "$candidate" ] && CONVERT_SCRIPT="$candidate" && break
-    done
-    if [ -n "$CONVERT_SCRIPT" ]; then
-        uv run python "$CONVERT_SCRIPT" \
-            --checkpoint_dir "$OPENPI_DATA_HOME/checkpoints/pi05_libero" \
-            --config_name pi05_libero \
-            --output_path "$PYTORCH_DIR" || echo "  WARNING: Conversion failed — will try loading JAX directly"
+    echo "  Checkpoint found at: $CKPT_DIR"
+
+    PYTORCH_DIR="$WORKSPACE/pi05_libero_pytorch"
+    if [ -d "$PYTORCH_DIR" ] && [ -f "$PYTORCH_DIR/model.safetensors" ]; then
+        echo "  PyTorch checkpoint already exists at $PYTORCH_DIR"
     else
-        echo "  WARNING: Conversion script not found"
+        echo "  Converting JAX → PyTorch..."
+        CONVERT_SCRIPT=""
+        for candidate in \
+            "$OPENPI_DIR/examples/convert_jax_model_to_pytorch.py" \
+            "$OPENPI_DIR/scripts/convert_jax_model_to_pytorch.py"; do
+            [ -f "$candidate" ] && CONVERT_SCRIPT="$candidate" && break
+        done
+        if [ -n "$CONVERT_SCRIPT" ]; then
+            uv run python "$CONVERT_SCRIPT" \
+                --checkpoint_dir "$CKPT_DIR" \
+                --config_name pi05_libero \
+                --output_path "$PYTORCH_DIR" || echo "  WARNING: Conversion failed — will try loading JAX directly"
+        else
+            echo "  WARNING: Conversion script not found"
+        fi
     fi
 fi
 echo ""
