@@ -48,7 +48,7 @@ def main():
     def _gpu():
         assert torch.cuda.is_available(), "CUDA not available"
         n = torch.cuda.get_device_name(0)
-        m = torch.cuda.get_device_properties(0).total_mem / 1e9
+        m = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  {n}, {m:.1f} GB")
         return {"gpu": n, "mem_gb": round(m, 1)}
     check("GPU", _gpu)
@@ -99,7 +99,7 @@ def main():
     def _mem():
         torch.cuda.synchronize()
         a = torch.cuda.memory_allocated() / 1e9
-        t = torch.cuda.get_device_properties(0).total_mem / 1e9
+        t = torch.cuda.get_device_properties(0).total_memory / 1e9
         print(f"  Allocated {a:.2f} GB / {t:.1f} GB")
         return {"allocated_gb": round(a, 2), "total_gb": round(t, 1)}
     check("GPU memory", _mem)
