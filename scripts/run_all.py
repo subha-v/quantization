@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-Orchestrator — run all experiments sequentially.
+Orchestrator — run all experiments sequentially with fault tolerance.
 
-Usage (from the openpi directory on the GCP instance):
-    cd $OPENPI_DIR
-    uv run python $EXPERIMENT_DIR/run_all.py 2>&1 | tee $EXPERIMENT_DIR/results/overnight.log
+- Aborts ONLY if setup_and_verify fails (everything else is unrecoverable).
+- Continues through experiment failures so you get partial results.
+- Logs everything to both console and results/overnight.log.
+- Tracks GPU memory and wall time per experiment.
+
+Usage (from the openpi directory on the Stanford server):
+    cd /data/subha2/openpi
+    tmux new -s overnight
+    CUDA_VISIBLE_DEVICES=0 uv run python /data/subha2/experiments/run_all.py
 """
 
 import subprocess
@@ -18,103 +24,160 @@ from pathlib import Path
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, SCRIPT_DIR)
 
-RESULTS_DIR = os.environ.get(
+# Ensure GPU pinning even for subprocesses
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+EXPERIMENT_DIR = os.environ.get(
     "EXPERIMENT_DIR",
-    os.path.join(os.environ.get("WORKSPACE", os.path.expanduser("~")), "quantization_experiments"),
-) + "/results"
+    os.path.join(os.environ.get("WORKSPACE", "/data/subha2"), "experiments"),
+)
+RESULTS_DIR = os.path.join(EXPERIMENT_DIR, "results")
 Path(RESULTS_DIR).mkdir(parents=True, exist_ok=True)
 
 LOG_PATH = os.path.join(RESULTS_DIR, "run_log.json")
+LOG_FILE = os.path.join(RESULTS_DIR, "overnight.log")
+
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line, flush=True)
+    with open(LOG_FILE, "a") as f:
+        f.write(line + "\n")
+        f.flush()
 
 
 def run_experiment(script_name, label, timeout_s):
-    """Run one experiment script as a subprocess.  Returns (status, elapsed)."""
+    """Run one experiment.  Returns (status, elapsed_s, returncode)."""
     script_path = os.path.join(SCRIPT_DIR, script_name)
     if not os.path.exists(script_path):
-        return "MISSING", 0.0
+        log(f"  SKIP: {script_path} not found")
+        return "MISSING", 0.0, -1
 
-    print(f"\n{'='*60}")
-    print(f"  {label}")
-    print(f"  Script:  {script_path}")
-    print(f"  Timeout: {timeout_s}s ({timeout_s/3600:.1f}h)")
-    print(f"  Started: {datetime.now().isoformat()}")
-    print(f"{'='*60}\n")
+    log("")
+    log("=" * 60)
+    log(f"  STARTING: {label}")
+    log(f"  Script:   {script_path}")
+    log(f"  Timeout:  {timeout_s}s ({timeout_s/3600:.1f}h)")
+    log("=" * 60)
+
+    env = {**os.environ, "PYTHONUNBUFFERED": "1"}
 
     t0 = time.time()
     try:
-        result = subprocess.run(
-            [sys.executable, script_path],
-            timeout=timeout_s,
-            env={**os.environ, "PYTHONUNBUFFERED": "1"},
-        )
-        elapsed = time.time() - t0
-        status = "SUCCESS" if result.returncode == 0 else f"FAILED(rc={result.returncode})"
+        # Stream output to both console and log file
+        with open(LOG_FILE, "a") as logf:
+            proc = subprocess.Popen(
+                [sys.executable, script_path],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=env,
+                text=True,
+                bufsize=1,
+            )
+            for line in proc.stdout:
+                sys.stdout.write(line)
+                sys.stdout.flush()
+                logf.write(line)
+                logf.flush()
+
+            proc.wait(timeout=timeout_s)
+            elapsed = time.time() - t0
+            rc = proc.returncode
+            status = "SUCCESS" if rc == 0 else f"FAILED(rc={rc})"
+
     except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
         elapsed = float(timeout_s)
+        rc = -1
         status = "TIMEOUT"
     except Exception as e:
         elapsed = time.time() - t0
+        rc = -1
         status = f"ERROR({e})"
 
-    print(f"\n>>> {label}: {status} ({elapsed:.0f}s / {elapsed/60:.1f}min)")
-    return status, elapsed
+    log(f"\n>>> {label}: {status}  ({elapsed:.0f}s / {elapsed/60:.1f}min)")
+    return status, elapsed, rc
 
 
 def main():
-    log = {
+    log("\n" + "=" * 60)
+    log("  OVERNIGHT EXPERIMENT RUN")
+    log(f"  Server:   {os.uname().nodename}")
+    log(f"  GPU:      CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}")
+    log(f"  Started:  {datetime.now().isoformat()}")
+    log("=" * 60)
+
+    run_log = {
+        "server": os.uname().nodename,
+        "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES", "unset"),
         "start_time": datetime.now().isoformat(),
         "experiments": [],
     }
 
     experiments = [
-        ("setup_and_verify.py", "Phase 0: Verification",            300),    # 5 min
-        ("exp1_activation_stats.py", "Exp 1: Activation Statistics", 3600),   # 1 hour
-        ("exp2_layer_sensitivity.py", "Exp 2: Layer Sensitivity",    18000),  # 5 hours
-        ("exp3_flow_step_sensitivity.py", "Exp 3: Flow-Step",        10800),  # 3 hours
+        # (script,                         label,                          timeout_s, abort_on_fail)
+        ("setup_and_verify.py",            "Phase 0: Verification",        600,       True),
+        ("exp1_activation_stats.py",       "Exp 1: Activation Statistics", 3600,      False),
+        ("exp2_layer_sensitivity.py",      "Exp 2: Layer Sensitivity",     21600,     False),
+        ("exp3_flow_step_sensitivity.py",  "Exp 3: Flow-Step Sensitivity", 14400,     False),
     ]
 
-    for script, label, timeout in experiments:
-        status, elapsed = run_experiment(script, label, timeout)
-        log["experiments"].append({
+    for script, label, timeout, abort_on_fail in experiments:
+        status, elapsed, rc = run_experiment(script, label, timeout)
+
+        entry = {
             "script": script,
             "label": label,
             "status": status,
             "elapsed_s": round(elapsed, 1),
             "finished": datetime.now().isoformat(),
-        })
+        }
+        run_log["experiments"].append(entry)
 
-        # Save after each experiment (survive crashes)
-        log["last_update"] = datetime.now().isoformat()
-        with open(LOG_PATH, "w") as f:
-            json.dump(log, f, indent=2)
-            f.flush()
-            os.fsync(f.fileno())
+        # Save run_log after EVERY experiment (survive crashes)
+        run_log["last_update"] = datetime.now().isoformat()
+        _save_log(run_log)
 
-        # Abort on setup failure
-        if script == "setup_and_verify.py" and not status.startswith("SUCCESS"):
-            print("\n!!! SETUP FAILED — aborting all experiments !!!")
+        if abort_on_fail and not status.startswith("SUCCESS"):
+            log("\n!!! SETUP FAILED — aborting remaining experiments !!!")
+            log("!!! Fix the issue and re-run. Experiments 1-3 depend on setup. !!!")
             break
 
-    log["end_time"] = datetime.now().isoformat()
-    total = sum(e["elapsed_s"] for e in log["experiments"])
-    log["total_elapsed_s"] = round(total, 1)
+        if not status.startswith("SUCCESS"):
+            log(f"\n*** {label} failed but continuing with next experiment ***\n")
 
-    with open(LOG_PATH, "w") as f:
-        json.dump(log, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
+    # ---- Final summary ----
+    run_log["end_time"] = datetime.now().isoformat()
+    total = sum(e["elapsed_s"] for e in run_log["experiments"])
+    run_log["total_elapsed_s"] = round(total, 1)
+    _save_log(run_log)
 
-    print(f"\n{'='*60}")
-    print(f"  ALL EXPERIMENTS COMPLETE")
-    print(f"  Total time: {total/3600:.1f}h")
-    print(f"  Log: {LOG_PATH}")
-    print(f"{'='*60}")
+    log("")
+    log("=" * 60)
+    log("  RUN COMPLETE")
+    log(f"  Total time: {total/3600:.1f}h")
+    log(f"  Log file:   {LOG_FILE}")
+    log(f"  Run log:    {LOG_PATH}")
+    log("=" * 60)
 
-    for e in log["experiments"]:
-        marker = "+" if e["status"].startswith("SUCCESS") else "X"
-        print(f"  [{marker}] {e['label']}: {e['status']} ({e['elapsed_s']:.0f}s)")
+    for e in run_log["experiments"]:
+        icon = "OK" if e["status"].startswith("SUCCESS") else "XX"
+        log(f"  [{icon}] {e['label']}: {e['status']} ({e['elapsed_s']:.0f}s)")
+
+    log("")
+    log("Results in: " + RESULTS_DIR)
+    log("Plots in:   " + os.path.join(EXPERIMENT_DIR, "plots"))
 
     return 0
+
+
+def _save_log(run_log):
+    with open(LOG_PATH, "w") as f:
+        json.dump(run_log, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
 
 
 if __name__ == "__main__":

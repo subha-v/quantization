@@ -45,6 +45,19 @@ def main():
             n_easy=128, n_hard=128, seed=42, suite_map=suite_map,
         )
 
+    # ---- smoke test: 2 observations through full pipeline ----
+    def _smoke():
+        h, s = utils.register_activation_hooks(model)
+        for obs in observations[:2]:
+            utils.run_inference(policy, obs)
+        utils.remove_hooks(h)
+        assert len(s) > 0, "No activation stats captured"
+        utils.log(f"  Smoke: {len(s)} layers captured, {utils.gpu_mem_str()}")
+
+    if not utils.run_smoke_test("Exp1 forward+hooks", _smoke):
+        print("FATAL: smoke test failed")
+        return 1
+
     # ---- hooks ----
     hooks, raw_stats = utils.register_activation_hooks(model)
 

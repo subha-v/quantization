@@ -9,18 +9,24 @@ import os
 import sys
 import json
 import time
+import logging
 import torch
 import numpy as np
 from pathlib import Path
 from datetime import datetime
 
 # ---------------------------------------------------------------------------
+# GPU pinning — must happen before any CUDA call
+# ---------------------------------------------------------------------------
+os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
+
+# ---------------------------------------------------------------------------
 # Paths — all configurable via env vars.  Set these before importing.
 # ---------------------------------------------------------------------------
-WORKSPACE = os.environ.get("WORKSPACE", os.path.expanduser("~"))
+WORKSPACE = os.environ.get("WORKSPACE", "/data/subha2")
 OPENPI_DIR = os.environ.get("OPENPI_DIR", os.path.join(WORKSPACE, "openpi"))
 EXPERIMENT_DIR = os.environ.get(
-    "EXPERIMENT_DIR", os.path.join(WORKSPACE, "quantization_experiments")
+    "EXPERIMENT_DIR", os.path.join(WORKSPACE, "experiments")
 )
 RESULTS_DIR = os.path.join(EXPERIMENT_DIR, "results")
 PLOTS_DIR = os.path.join(EXPERIMENT_DIR, "plots")
@@ -663,4 +669,61 @@ class Timer:
     def __exit__(self, *_):
         self.elapsed = time.time() - self._t0
         if self.name:
-            print(f"[timer] {self.name}: {self.elapsed:.1f}s")
+            log(f"[timer] {self.name}: {self.elapsed:.1f}s")
+
+
+# ===================================================================
+# Logging — dual output to console + file
+# ===================================================================
+
+_log_file = None
+
+def setup_logging(log_path=None):
+    """Set up dual logging to console and file.  Call once at script start."""
+    global _log_file
+    if log_path is None:
+        log_path = os.path.join(RESULTS_DIR, "experiment.log")
+    Path(log_path).parent.mkdir(parents=True, exist_ok=True)
+    _log_file = open(log_path, "a")
+    _log_file.write(f"\n{'='*60}\n")
+    _log_file.write(f"Session started: {datetime.now().isoformat()}\n")
+    _log_file.write(f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', 'unset')}\n")
+    _log_file.write(f"{'='*60}\n")
+    _log_file.flush()
+
+
+def log(msg):
+    """Print to console AND append to log file."""
+    print(msg)
+    if _log_file is not None:
+        _log_file.write(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}\n")
+        _log_file.flush()
+
+
+def gpu_mem_str():
+    """Return a short string with current GPU memory usage."""
+    if not torch.cuda.is_available():
+        return "no-gpu"
+    a = torch.cuda.memory_allocated() / 1e9
+    r = torch.cuda.memory_reserved() / 1e9
+    return f"GPU mem: {a:.1f}GB alloc / {r:.1f}GB reserved"
+
+
+# ===================================================================
+# Smoke test wrapper
+# ===================================================================
+
+def run_smoke_test(name, fn, n_samples=2):
+    """Run fn on a small sample.  Returns True if it passes, False + prints error if not."""
+    log(f"\n[smoke test] {name} ({n_samples} samples)...")
+    try:
+        t0 = time.time()
+        fn()
+        dt = time.time() - t0
+        log(f"[smoke test] {name}: PASSED ({dt:.1f}s).  {gpu_mem_str()}")
+        return True
+    except Exception as e:
+        import traceback
+        log(f"[smoke test] {name}: FAILED — {e}")
+        log(traceback.format_exc())
+        return False
