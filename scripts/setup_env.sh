@@ -14,6 +14,14 @@ export EXPERIMENT_DIR="$WORKSPACE/experiments"
 export HF_HOME="$WORKSPACE/hf_cache"
 export OPENPI_DATA_HOME="$WORKSPACE/.cache/openpi"
 
+# Redirect uv/pip/XDG caches OFF the NFS home (/home is full)
+export UV_CACHE_DIR="$WORKSPACE/.uv-cache"
+export UV_PYTHON_INSTALL_DIR="$WORKSPACE/.uv-python"
+export XDG_DATA_HOME="$WORKSPACE/.local/share"
+export XDG_CACHE_HOME="$WORKSPACE/.cache"
+export PIP_CACHE_DIR="$WORKSPACE/.pip-cache"
+mkdir -p "$UV_CACHE_DIR" "$UV_PYTHON_INSTALL_DIR" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR"
+
 # Pin to GPU 0 (GPU 1 is occupied by other users)
 export CUDA_VISIBLE_DEVICES=0
 
