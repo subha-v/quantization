@@ -160,9 +160,9 @@ def _summarize_and_plot(jsonl_path, bits):
         mse = r["mse"]
         by_group[name]["all"].append(mse)
         suite = r.get("suite", "unknown")
-        if suite in ("easy", "spatial"):
+        if suite in ("easy", "spatial", "Object", "Spatial"):
             by_group[name]["easy"].append(mse)
-        elif suite in ("hard", "long"):
+        elif suite in ("hard", "long", "Long"):
             by_group[name]["hard"].append(mse)
 
     # Summary

@@ -125,7 +125,7 @@ def _aggregate(records):
 
     for r in records:
         suite = r.get("suite", "unknown")
-        bucket = "easy" if suite in ("easy", "spatial") else "hard" if suite in ("hard", "long") else None
+        bucket = "easy" if suite in ("easy", "spatial", "Object", "Spatial") else "hard" if suite in ("hard", "long", "Long") else None
         if bucket is None:
             continue
         by_layer[r["layer"]][bucket].append({k: r[k] for k in metrics if k in r})

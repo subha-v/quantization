@@ -21,6 +21,14 @@ from datetime import datetime
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 # ---------------------------------------------------------------------------
+# Redirect caches off NFS home (shared server: /home is quota-limited)
+# ---------------------------------------------------------------------------
+_WORKSPACE = os.environ.get("WORKSPACE", "/data/subha2")
+os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_WORKSPACE, ".triton"))
+os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_WORKSPACE, ".torch_inductor"))
+os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_WORKSPACE, ".cache"))
+
+# ---------------------------------------------------------------------------
 # Paths — all configurable via env vars.  Set these before importing.
 # ---------------------------------------------------------------------------
 WORKSPACE = os.environ.get("WORKSPACE", "/data/subha2")
@@ -273,11 +281,13 @@ def load_libero_observations(n_easy=128, n_hard=128, seed=42, suite_map=None, da
 
     Easy = Object (task 20-29), Hard = Long (task 0-9).
     Samples frames spread across episodes (early/mid/late per episode).
+    suite_map is accepted for backward compat but ignored (mapping is hardcoded).
 
     Returns (observations, metadata) where:
         observations: list of openpi-formatted dicts with real images
         metadata: list of per-sample metadata for post-hoc analysis
     """
+    # suite_map ignored — suite_of() handles mapping
     root = Path(data_root) if data_root else LIBERO_DATA_ROOT
     rng = _random.Random(seed)
     prompts = load_task_prompts(root)
