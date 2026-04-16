@@ -243,17 +243,38 @@ def classify_suite(instruction: str) -> str:
     return "unknown"
 
 
-def load_libero_dataset(repo_id="lerobot/libero"):
+def load_libero_dataset(repo_id=None):
     """Load the LIBERO LeRobotDataset. Downloads videos + parquet on first call.
+
+    Tries openpi's own repo_id first (physical-intelligence/libero), which is
+    guaranteed compatible with their pinned lerobot version.
 
     Returns the LeRobotDataset instance.
     """
     from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
 
-    print(f"[data] Loading LeRobotDataset({repo_id!r})...")
-    ds = LeRobotDataset(repo_id)
-    print(f"[data] Loaded: {len(ds)} frames")
-    return ds
+    candidates = [repo_id] if repo_id else []
+    candidates += [
+        "physical-intelligence/libero",  # openpi's own training dataset
+        "lerobot/libero",
+    ]
+
+    for rid in candidates:
+        if rid is None:
+            continue
+        try:
+            print(f"[data] Trying LeRobotDataset({rid!r})...")
+            ds = LeRobotDataset(rid)
+            print(f"[data] Loaded {rid}: {len(ds)} frames")
+            return ds
+        except Exception as e:
+            print(f"[data] {rid} failed: {e}")
+            continue
+
+    raise RuntimeError(
+        "Could not load any LIBERO LeRobotDataset. "
+        "Tried: " + ", ".join(c for c in candidates if c)
+    )
 
 
 def get_task_descriptions(ds):
@@ -382,7 +403,7 @@ def _format_lerobot_sample(sample, prompt):
             break
 
     # Wrist camera → observation/wrist_image
-    for key in ["observation.images.image2", "observation.images.wrist_image", "wrist_image"]:
+    for key in ["observation.images.wrist_image", "observation.images.image2", "wrist_image"]:
         if key in sample:
             obs["observation/wrist_image"] = _tensor_to_numpy(sample[key])
             break
