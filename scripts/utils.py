@@ -219,82 +219,80 @@ def get_layer_groups(model):
 
 
 # ===================================================================
-# Data loading  (lerobot HuggingFace → openpi observation format)
+# Data loading  (LeRobotDataset → openpi observation format)
 # ===================================================================
+#
+# Uses LeRobotDataset (already an openpi dependency) which handles video
+# decoding transparently.  This gives us real decoded images, real task
+# descriptions, and proper per-frame metadata.
 
-# LIBERO task suites.  The task_index→suite mapping depends on the dataset
-# version; we identify suites from the language instruction at runtime.
-SPATIAL_KEYWORDS = ["spatial", "left of", "right of", "behind", "in front of", "next to"]
-LONG_KEYWORDS = ["and then", "after that", "first.*then"]  # multi-step instructions
+# LIBERO task suite classification from language instruction
+LONG_KEYWORDS = ["and then", "after that", "first.*then"]
+SPATIAL_KEYWORDS = ["left of", "right of", "behind", "in front of", "next to"]
 
 def classify_suite(instruction: str) -> str:
-    """Heuristic suite classification from the language instruction.
-
-    Returns one of: spatial, object, goal, long, unknown.
-    The definitive mapping is printed by setup_and_verify.py; this is a fallback.
-    """
-    inst_lower = instruction.lower()
+    """Heuristic suite classification from the language instruction."""
     import re
+    inst = instruction.lower()
     for kw in LONG_KEYWORDS:
-        if re.search(kw, inst_lower):
+        if re.search(kw, inst):
             return "long"
     for kw in SPATIAL_KEYWORDS:
-        if kw in inst_lower:
+        if kw in inst:
             return "spatial"
     return "unknown"
 
 
-def load_libero_observations(n_easy=128, n_hard=128, seed=42, suite_map=None):
-    """Load observations from the LIBERO HuggingFace dataset.
+def load_libero_dataset(repo_id="lerobot/libero"):
+    """Load the LIBERO LeRobotDataset. Downloads videos + parquet on first call.
 
-    Args:
-        n_easy: samples from easy suite (LIBERO-Spatial or first 10 tasks)
-        n_hard: samples from hard suite (LIBERO-Long or last 10 tasks)
-        seed: RNG seed for reproducibility
-        suite_map: optional dict {task_index: suite_name} from setup_and_verify
+    Returns the LeRobotDataset instance.
+    """
+    from lerobot.common.datasets.lerobot_dataset import LeRobotDataset
+
+    print(f"[data] Loading LeRobotDataset({repo_id!r})...")
+    ds = LeRobotDataset(repo_id)
+    print(f"[data] Loaded: {len(ds)} frames")
+    return ds
+
+
+def get_task_descriptions(ds):
+    """Extract {task_index: language_instruction} from LeRobotDataset metadata."""
+    tasks_df = ds.meta.tasks  # pandas DataFrame, index=task str, col=task_index
+    descriptions = {}
+    for task_str, row in tasks_df.iterrows():
+        descriptions[int(row["task_index"])] = str(task_str)
+    print(f"[data] {len(descriptions)} task descriptions loaded")
+    return descriptions
+
+
+def build_suite_map(task_descriptions):
+    """Classify each task into a suite from its language instruction."""
+    suite_map = {}
+    for tid, desc in task_descriptions.items():
+        suite_map[tid] = classify_suite(desc)
+    return suite_map
+
+
+def load_libero_observations(n_easy=128, n_hard=128, seed=42, suite_map=None):
+    """Load real LIBERO observations with decoded images via LeRobotDataset.
 
     Returns (observations, metadata) where:
-        observations: list of openpi-formatted observation dicts
-        metadata: list of per-sample metadata dicts for post-hoc analysis
+        observations: list of openpi-formatted dicts with real images
+        metadata: list of per-sample metadata for post-hoc analysis
     """
-    from datasets import load_dataset
-
     rng = np.random.RandomState(seed)
-    # Try multiple dataset sources — the primary one may need a newer datasets lib
-    ds = None
-    for repo_id in [
-        "physical-intelligence/libero",
-        "lerobot/libero",
-        "HuggingFaceVLA/libero",
-    ]:
-        try:
-            print(f"[data] Trying {repo_id}...")
-            ds = load_dataset(repo_id, split="train")
-            print(f"[data] Loaded {repo_id}: {len(ds)} frames, columns: {ds.column_names}")
-            break
-        except Exception as e:
-            print(f"[data] {repo_id} failed: {e}")
-            continue
 
-    if ds is None:
-        raise RuntimeError(
-            "Could not load LIBERO dataset from any source. "
-            "Try: uv pip install --upgrade datasets huggingface-hub"
-        )
+    ds = load_libero_dataset("lerobot/libero")
+    task_descriptions = get_task_descriptions(ds)
 
-    # Get task descriptions for suite classification + prompts
-    task_descriptions = _load_task_descriptions(ds)
-    print(f"[data] {len(task_descriptions)} unique tasks")
-
-    # Build suite map if not provided
     if suite_map is None:
-        suite_map = _build_suite_map(task_descriptions)
+        suite_map = build_suite_map(task_descriptions)
 
     # Identify easy (spatial) and hard (long) task indices
     easy_tasks = [t for t, s in suite_map.items() if s in ("spatial", "easy")]
     hard_tasks = [t for t, s in suite_map.items() if s in ("long", "hard")]
 
-    # Fallback: if classification didn't work, use first 10 / last 10
     if not easy_tasks:
         print("[data] WARNING: no spatial tasks identified; using task_index 0-9")
         easy_tasks = list(range(10))
@@ -302,18 +300,15 @@ def load_libero_observations(n_easy=128, n_hard=128, seed=42, suite_map=None):
         print("[data] WARNING: no long tasks identified; using task_index 30-39")
         hard_tasks = list(range(30, 40))
 
-    print(f"[data] Easy tasks: {easy_tasks}")
-    print(f"[data] Hard tasks: {hard_tasks}")
+    print(f"[data] Easy tasks ({len(easy_tasks)}): {easy_tasks}")
+    print(f"[data] Hard tasks ({len(hard_tasks)}): {hard_tasks}")
 
-    # Get task indices from dataset
-    task_col = _find_column(ds, ["task_index", "task_id", "task"])
-    all_task_indices = np.array(ds[task_col])
+    # Get task indices from the underlying HF dataset (parquet, fast)
+    hf_ds = ds.hf_dataset
+    all_task_indices = np.array(hf_ds["task_index"])
 
-    easy_mask = np.isin(all_task_indices, easy_tasks)
-    hard_mask = np.isin(all_task_indices, hard_tasks)
-    easy_frame_indices = np.where(easy_mask)[0]
-    hard_frame_indices = np.where(hard_mask)[0]
-
+    easy_frame_indices = np.where(np.isin(all_task_indices, easy_tasks))[0]
+    hard_frame_indices = np.where(np.isin(all_task_indices, hard_tasks))[0]
     print(f"[data] Easy frames: {len(easy_frame_indices)}, Hard frames: {len(hard_frame_indices)}")
 
     n_e = min(n_easy, len(easy_frame_indices))
@@ -323,24 +318,24 @@ def load_libero_observations(n_easy=128, n_hard=128, seed=42, suite_map=None):
         rng.choice(hard_frame_indices, size=n_h, replace=False),
     ])
     print(f"[data] Sampled {n_e} easy + {n_h} hard = {len(sampled)} observations")
+    print(f"[data] Loading with video decoding (this may take a few minutes)...")
 
-    # Build observations + metadata
     observations = []
     metadata = []
-    ep_col = _find_column(ds, ["episode_index", "episode_id"])
-    frame_col = _find_column(ds, ["frame_index", "index"])
 
     for i, idx in enumerate(sampled):
         idx = int(idx)
+        # LeRobotDataset.__getitem__ decodes video frames automatically
         sample = ds[idx]
 
-        task_id = int(sample[task_col])
-        episode_id = int(sample[ep_col]) if ep_col else -1
-        frame_idx = int(sample[frame_col]) if frame_col else -1
+        task_id = int(sample["task_index"])
+        episode_id = int(sample["episode_index"])
+        frame_idx = int(sample["frame_index"])
+        # "task" key is the language instruction string, added by get_item()
+        prompt = sample.get("task", task_descriptions.get(task_id, "do something"))
         suite = suite_map.get(task_id, "unknown")
-        prompt = task_descriptions.get(task_id, "do something")
 
-        obs = _format_observation(sample, prompt)
+        obs = _format_lerobot_sample(sample, prompt)
         observations.append(obs)
 
         metadata.append({
@@ -351,119 +346,69 @@ def load_libero_observations(n_easy=128, n_hard=128, seed=42, suite_map=None):
             "frame_idx": frame_idx,
             "suite": suite,
             "prompt": prompt,
-            # phase_bin will be computed if episode_length is known
             "phase_bin": "unknown",
         })
 
-        if i % 50 == 0 and i > 0:
-            print(f"  loaded {i}/{len(sampled)}")
+        if (i + 1) % 25 == 0:
+            print(f"  loaded {i + 1}/{len(sampled)}")
 
-    # Try to compute phase bins from episode lengths
-    _compute_phase_bins(metadata, ds, ep_col, frame_col)
+    # Compute phase bins from episode lengths
+    _compute_phase_bins_from_hf(metadata, hf_ds)
 
-    print(f"[data] Done. {len(observations)} observations loaded.")
+    print(f"[data] Done. {len(observations)} observations with real images.")
     return observations, metadata
 
 
-def _load_task_descriptions(ds):
-    """Extract task_index → language instruction mapping."""
-    task_col = _find_column(ds, ["task_index", "task_id"])
-    desc_col = _find_column(ds, [
-        "language_instruction", "task_description", "prompt",
-        "observation.language_instruction",
-    ])
-    if not task_col or not desc_col:
-        # Try the meta/tasks.jsonl file via the dataset API
-        print("[data] No language instruction column; using generic prompts")
-        return {}
+def _format_lerobot_sample(sample, prompt):
+    """Convert a LeRobotDataset sample to openpi observation format.
 
-    # Sample a few rows per task to get descriptions
-    descriptions = {}
-    seen = set()
-    for i in range(0, len(ds), max(1, len(ds) // 200)):
-        tid = int(ds[i][task_col])
-        if tid not in seen:
-            seen.add(tid)
-            desc = ds[i][desc_col]
-            if isinstance(desc, str) and len(desc) > 2:
-                descriptions[tid] = desc
-    return descriptions
-
-
-def _build_suite_map(task_descriptions):
-    """Classify tasks into suites from their language instructions."""
-    suite_map = {}
-    for tid, desc in task_descriptions.items():
-        suite_map[tid] = classify_suite(desc)
-    return suite_map
-
-
-def _find_column(ds, candidates):
-    """Find the first matching column name in the dataset."""
-    for c in candidates:
-        if c in ds.column_names:
-            return c
-    return None
-
-
-def _format_observation(sample, prompt):
-    """Convert a lerobot HuggingFace sample to openpi observation format."""
+    LeRobotDataset returns images as float32 CHW tensors.
+    openpi's LiberoInputs._parse_image handles CHW→HWC and float→uint8.
+    """
     obs = {"prompt": prompt}
 
-    # State: observation.state → observation/state
-    for src in ["observation.state", "state"]:
-        if src in sample:
-            val = sample[src]
+    # State → observation/state
+    for key in ["observation.state", "state"]:
+        if key in sample:
+            val = sample[key]
             obs["observation/state"] = np.array(val, dtype=np.float32)
             break
 
-    # Top camera: observation.images.image → observation/image
-    for src in ["observation.images.image", "image", "observation.image"]:
-        if src in sample:
-            img = _to_numpy_image(sample[src])
-            obs["observation/image"] = img
+    # Main camera → observation/image
+    # LeRobotDataset uses "observation.images.image" or similar
+    for key in ["observation.images.image", "image"]:
+        if key in sample:
+            obs["observation/image"] = _tensor_to_numpy(sample[key])
             break
 
-    # Wrist camera: observation.images.image2 → observation/wrist_image
-    for src in ["observation.images.image2", "wrist_image", "image2", "observation.wrist_image"]:
-        if src in sample:
-            img = _to_numpy_image(sample[src])
-            obs["observation/wrist_image"] = img
+    # Wrist camera → observation/wrist_image
+    for key in ["observation.images.image2", "observation.images.wrist_image", "wrist_image"]:
+        if key in sample:
+            obs["observation/wrist_image"] = _tensor_to_numpy(sample[key])
             break
 
     return obs
 
 
-def _to_numpy_image(img):
-    """Convert various image formats to (H, W, 3) uint8 numpy array."""
-    if isinstance(img, np.ndarray):
-        return img.astype(np.uint8)
-    if isinstance(img, torch.Tensor):
-        arr = img.numpy()
-        if arr.ndim == 3 and arr.shape[0] == 3:  # CHW → HWC
-            arr = arr.transpose(1, 2, 0)
-        return arr.astype(np.uint8)
-    # PIL Image
-    try:
-        return np.array(img, dtype=np.uint8)
-    except Exception:
-        pass
-    return np.zeros((256, 256, 3), dtype=np.uint8)
+def _tensor_to_numpy(val):
+    """Convert a torch.Tensor or numpy array to numpy, preserving format.
+
+    openpi's _parse_image handles CHW→HWC and float→uint8 conversion,
+    so we just need a numpy array here.
+    """
+    if isinstance(val, torch.Tensor):
+        return val.numpy()
+    return np.asarray(val)
 
 
-def _compute_phase_bins(metadata, ds, ep_col, frame_col):
-    """Compute early/mid/late phase bins from episode structure."""
-    if not ep_col or not frame_col:
-        return
+def _compute_phase_bins_from_hf(metadata, hf_ds):
+    """Compute early/mid/late phase bins from the HF dataset."""
+    all_eps = np.array(hf_ds["episode_index"])
+    all_frames = np.array(hf_ds["frame_index"])
 
-    # Get max frame per episode (approximate episode length)
     ep_ids = set(m["episode_id"] for m in metadata if m["episode_id"] >= 0)
     if not ep_ids:
         return
-
-    # Use dataset to find episode lengths
-    all_eps = np.array(ds[ep_col])
-    all_frames = np.array(ds[frame_col])
 
     ep_lengths = {}
     for eid in ep_ids:

@@ -181,10 +181,9 @@ def main():
 
     # ---------------------------------------------------------------- task→suite mapping
     def _tasks():
-        from datasets import load_dataset
-        ds = load_dataset("physical-intelligence/libero", split="train")
-        descs = utils._load_task_descriptions(ds)
-        suite_map = utils._build_suite_map(descs)
+        ds = utils.load_libero_dataset("lerobot/libero")
+        descs = utils.get_task_descriptions(ds)
+        suite_map = utils.build_suite_map(descs)
         print(f"\n  task_index → suite → instruction:")
         for tid in sorted(descs.keys()):
             suite = suite_map.get(tid, "?")
