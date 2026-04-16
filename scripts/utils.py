@@ -21,6 +21,15 @@ from datetime import datetime
 os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 
 # ---------------------------------------------------------------------------
+# Disable torch.compile — openpi uses max-autotune which:
+#   1. Breaks nn.Module forward hooks (hooks never fire)
+#   2. Caches compiled graphs that don't see weight changes
+# Both are fatal for our experiments (activation stats, quantization).
+# Eager mode is ~2x slower per forward pass but hooks/weights work correctly.
+# ---------------------------------------------------------------------------
+os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
+# ---------------------------------------------------------------------------
 # Redirect caches off NFS home (shared server: /home is quota-limited)
 # ---------------------------------------------------------------------------
 _WORKSPACE = os.environ.get("WORKSPACE", "/data/subha2")
