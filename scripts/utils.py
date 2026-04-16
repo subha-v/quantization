@@ -36,6 +36,7 @@ _WORKSPACE = os.environ.get("WORKSPACE", "/data/subha2")
 os.environ.setdefault("TRITON_CACHE_DIR", os.path.join(_WORKSPACE, ".triton"))
 os.environ.setdefault("TORCHINDUCTOR_CACHE_DIR", os.path.join(_WORKSPACE, ".torch_inductor"))
 os.environ.setdefault("XDG_CACHE_HOME", os.path.join(_WORKSPACE, ".cache"))
+os.environ.setdefault("MPLCONFIGDIR", os.path.join(_WORKSPACE, ".matplotlib"))
 
 # ---------------------------------------------------------------------------
 # Paths — all configurable via env vars.  Set these before importing.
@@ -590,7 +591,6 @@ def setup_plotting():
         "axes.grid": True,
         "grid.alpha": 0.3,
         "savefig.dpi": 150,
-        "savefig.bbox_inches": "tight",
     })
     return plt
 
