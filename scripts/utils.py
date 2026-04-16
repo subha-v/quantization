@@ -409,7 +409,7 @@ def compute_reference_actions(policy, observations):
 def fake_quantize_module(module, bits=4, group_size=128):
     """Fake symmetric weight quantization on all Linear layers in module.
 
-    Modifies weights in-place.  Returns dict of cloned originals for restoration.
+    Modifies weights in-place via copy_().  Returns dict of cloned originals.
     """
     qmax = 2 ** (bits - 1) - 1
     saved = {}
@@ -421,10 +421,11 @@ def fake_quantize_module(module, bits=4, group_size=128):
         if group_size > 0 and w.shape[1] >= group_size and w.shape[1] % group_size == 0:
             g = w.reshape(w.shape[0], -1, group_size)
             s = g.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8) / qmax
-            child.weight.data = ((g / s).round().clamp(-qmax, qmax) * s).reshape_as(w).to(child.weight.dtype)
+            q = ((g / s).round().clamp(-qmax, qmax) * s).reshape_as(w).to(child.weight.dtype)
         else:
             s = w.abs().amax(dim=1, keepdim=True).clamp(min=1e-8) / qmax
-            child.weight.data = ((w / s).round().clamp(-qmax, qmax) * s).to(child.weight.dtype)
+            q = ((w / s).round().clamp(-qmax, qmax) * s).to(child.weight.dtype)
+        child.weight.data.copy_(q)
     return saved
 
 
@@ -432,7 +433,7 @@ def restore_weights(module, saved):
     """Restore weights from a dict produced by fake_quantize_module."""
     for name, child in module.named_modules():
         if isinstance(child, torch.nn.Linear) and name in saved:
-            child.weight.data = saved[name]
+            child.weight.data.copy_(saved[name])
 
 
 def precompute_quantized_weights(module, bits=4, group_size=128):

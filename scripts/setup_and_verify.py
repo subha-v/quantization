@@ -166,17 +166,37 @@ def main():
         groups = utils.get_layer_groups(model[0])
         g = groups[0]
         print(f"  Testing on: {g['name']} ({g['group_type']})")
-        ref = utils.run_inference(policy[0], observations[0][0])
+
+        # Get a reference weight tensor to verify restore directly
+        first_linear = None
+        for _, m in g["module"].named_modules():
+            if isinstance(m, torch.nn.Linear):
+                first_linear = m
+                break
+        orig_weight_snap = first_linear.weight.data.clone()
+
+        # Quantize
         saved = utils.fake_quantize_module(g["module"], bits=4)
-        q_act = utils.run_inference(policy[0], observations[0][0])
+
+        # Verify weights actually changed
+        w_diff = (first_linear.weight.data - orig_weight_snap).abs().max().item()
+        print(f"  Weight diff after quantize: {w_diff:.6f} (should be >0)")
+        assert w_diff > 1e-6, "Quantization didn't change weights!"
+
+        # Restore
         utils.restore_weights(g["module"], saved)
-        restored = utils.run_inference(policy[0], observations[0][0])
-        mse_q = utils.action_mse(ref, q_act)
-        mse_r = utils.action_mse(ref, restored)
-        print(f"  MSE(fp16, w4):      {mse_q:.6f}")
-        print(f"  MSE after restore:  {mse_r:.10f} (should be ~0)")
-        assert mse_r < 1e-10, f"Weight restore failed! MSE={mse_r}"
-        return {"group": g["name"], "mse_w4": mse_q, "mse_restore": mse_r}
+
+        # Verify weights are restored by direct tensor comparison (not inference output,
+        # since the denoising loop uses random noise making action comparison unreliable)
+        w_restore_diff = (first_linear.weight.data - orig_weight_snap).abs().max().item()
+        print(f"  Weight diff after restore: {w_restore_diff:.10f} (should be 0)")
+        assert w_restore_diff == 0.0, f"Weight restore failed! max diff={w_restore_diff}"
+
+        # Also run a quick inference to check it doesn't crash
+        utils.run_inference(policy[0], observations[0][0])
+        print(f"  Post-restore inference: OK")
+
+        return {"group": g["name"], "w_diff_quant": w_diff, "w_diff_restore": w_restore_diff}
     check("Quantization smoke test", _quant)
 
     # ---------------------------------------------------------------- task→suite mapping
