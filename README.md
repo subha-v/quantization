@@ -39,12 +39,41 @@ Three forward-pass-only experiments on a single H100, targeting pi0.5 LIBERO:
 2. **Layer-wise Sensitivity Probe** (~2-4 hours) — Quantize each layer group individually to W4/W8, measure action MSE. Per-sample metadata enables post-hoc temporal analysis.
 3. **Flow-Step Sensitivity** (~1-2 hours) — First-ever measurement of per-denoising-step quantization sensitivity for a VLA.
 
+Findings from the first run are in `EXPERIMENT_FINDINGS.md`; plots in `plots/`.
+
 ### Running on GCP
 ```bash
 export WORKSPACE=/path/to/local/ssd
 bash scripts/setup_env.sh
 cd $WORKSPACE/openpi
 uv run python $EXPERIMENT_DIR/run_all.py
+```
+
+## Exp3 Redesign (2026-04-16)
+
+The first exp3 run failed because `policy.infer()` samples fresh noise per call,
+so FP16 reference and W4 test conditions started from different `x_t`. The
+noise-induced variance (~0.05 MSE) swamped the quantization-induced error
+(~0.005 MSE).
+
+The redesigned `scripts/exp3_flow_step_sensitivity.py`:
+- Seeds per-observation noise with `torch.Generator(seed=1000+i)` and passes
+  it through `policy.infer(obs, noise=noise_np)` so reference and test runs
+  start from identical `x_t` per observation.
+- Monkey-patches `model.denoise_step` (not the expert module) to control
+  weight swapping at the correct per-step granularity. The prefix pass does
+  not call the gemma_expert, so the step counter is clean.
+- Validates before running sweeps: with `quantize_steps=∅` the patched run
+  must reproduce the FP16 reference within 1e-10 MSE; otherwise the script
+  aborts instead of wasting compute.
+- Streams per-config progress, running means, and a suite-split (easy/hard)
+  summary at each k, with a final tabular summary of all three sweeps.
+
+### Running exp3 on a shared server
+```bash
+# pick an idle GPU (check `nvidia-smi` first) and run unbuffered:
+CUDA_VISIBLE_DEVICES=1 python -u scripts/exp3_flow_step_sensitivity.py \
+  2>&1 | tee /data/<user>/experiments/results/exp3_stdout.log
 ```
 
 ## Key References

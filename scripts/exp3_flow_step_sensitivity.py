@@ -1,26 +1,39 @@
 #!/usr/bin/env python3
 """
-Experiment 3 — Flow-Step Sensitivity  (~1-2 hours on H100)
+Experiment 3 — Flow-Step Sensitivity  (redesigned, deterministic)  (~1-2 h on H100)
 
 First-ever measurement of per-denoising-step quantization sensitivity for a VLA.
-pi0.5 runs 10 Euler flow-matching steps (t=1.0 → ~0).  We measure which steps
-need full precision.
+pi0.5 runs 10 Euler flow-matching steps (t=1.0 → ~0).
+
+Why the previous version failed:
+  pi0.5's denoise loop starts from random x_t ~ N(0, I).  policy.infer() samples
+  fresh noise per call, so FP16 and W4 runs started from different x_t.  The
+  noise-induced variance (~0.05 MSE) swamped the quantization-induced error
+  (~0.005 MSE), giving indistinguishable bars.
+
+Fix:
+  1. Seed per-observation noise (torch.Generator, seed = 1000+sample_idx) and
+     pass it through policy.infer(obs, noise=noise_np).  Both the reference and
+     the test conditions start from identical x_t for a given obs.
+  2. Monkey-patch model.denoise_step with a wrapper that tracks step index
+     and swaps expert weights between steps.  denoise_step is the correct
+     granularity: one call per Euler step; the prefix pass does NOT invoke
+     the gemma_expert (inputs_embeds=[prefix_embs, None]), so the counter is
+     clean.
 
 Three sweep types:
   A) Per-step:     W4 at step k only, FP16 elsewhere          (10 configs)
   B) Cumulative-A: first k steps FP16, rest W4                (11 configs)
   C) Cumulative-B: first k steps W4, rest FP16                (11 configs)
 
-Implementation:
-  We pre-compute W4 weights for the action expert once.
-  A custom wrapper around the model's denoising loop pointer-swaps
-  between FP16 and W4 weights at each step boundary.  Swap is O(1).
+Validation: with quantize_steps=∅ we must reproduce the FP16 reference exactly
+(the sanity test aborts the run if that fails).
 """
 
-import sys
 import os
-import json
+import sys
 import time
+import json
 import numpy as np
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -30,110 +43,227 @@ import utils
 import torch
 
 
+NUM_STEPS = 10       # pi0.5 default
+NOISE_SEED_OFFSET = 1000
+LIVE_EVERY = 32      # print a running summary every N observations within a config
+
+
 # ===================================================================
-# Find the action expert module and the denoising interface
+# Locate the action expert
 # ===================================================================
 
 def find_action_expert(model):
-    """Locate the action expert (Gemma expert) sub-module."""
+    """Locate the gemma_expert sub-module (flow-matching action expert)."""
+    # Direct attribute path in openpi PaliGemmaWithExpert
+    candidates = []
     for name, mod in model.named_modules():
-        cls = type(mod).__name__
-        if "expert" in name.lower() or "Expert" in cls:
+        if name.endswith("gemma_expert"):
             n_lin = sum(1 for _, m in mod.named_modules() if isinstance(m, torch.nn.Linear))
             if n_lin > 5:
-                print(f"[exp3] Action expert: {name} ({cls}, {n_lin} linears)")
-                return name, mod
-    # Fallback: look for known openpi attribute names
-    for attr in ["gemma_expert", "action_expert"]:
+                candidates.append((name, mod, n_lin))
+
+    if not candidates:
+        # Fallback: any "expert" submodule with many linears
         for name, mod in model.named_modules():
-            if name.endswith(attr):
-                print(f"[exp3] Action expert (fallback): {name}")
-                return name, mod
-    raise RuntimeError("Could not find action expert in model. Dump model structure and check.")
+            cls = type(mod).__name__
+            if "expert" in name.lower() or "Expert" in cls:
+                n_lin = sum(1 for _, m in mod.named_modules() if isinstance(m, torch.nn.Linear))
+                if n_lin > 5:
+                    candidates.append((name, mod, n_lin))
 
+    if not candidates:
+        raise RuntimeError("Could not locate action expert.")
 
-def find_sample_actions_method(model):
-    """Find the method that runs the denoising loop.
-
-    Returns (method, method_name) or (None, None).
-    """
-    for attr in ["sample_actions", "_sample_actions", "generate_actions"]:
-        if hasattr(model, attr):
-            return getattr(model, attr), attr
-    return None, None
+    # Prefer the shortest matching name (outermost expert module).
+    candidates.sort(key=lambda c: len(c[0]))
+    name, mod, n_lin = candidates[0]
+    utils.log(f"[exp3] Action expert: {name}  ({type(mod).__name__}, {n_lin} linears)")
+    return name, mod
 
 
 # ===================================================================
-# Custom inference with per-step weight control
+# Seeded noise
 # ===================================================================
 
-def run_inference_with_step_control(policy, model, observation, expert_module,
-                                     orig_weights, quant_weights,
-                                     quantize_steps, num_steps=10):
-    """Run policy inference, quantizing the action expert at specific denoising steps.
+def make_noise(action_horizon, action_dim, seed, device):
+    """Deterministic noise tensor of shape (action_horizon, action_dim)."""
+    g = torch.Generator(device=device)
+    g.manual_seed(int(seed))
+    return torch.normal(
+        mean=0.0, std=1.0,
+        size=(action_horizon, action_dim),
+        generator=g, dtype=torch.float32, device=device,
+    )
 
-    This works by registering a pre-forward hook on the expert that swaps weights
-    based on an external step counter, then calling the standard policy.infer().
 
-    Args:
-        quantize_steps: set of step indices where the expert should be W4.
-                       Empty set = all FP16 (reference).  {0..9} = all W4.
-    """
-    # Track which denoising step we're on by counting expert forward calls.
-    # The expert is called once per denoising step (plus possibly once for
-    # the prefix pass).  We identify denoising steps by counting calls
-    # after the first one (prefix).
-    state = {"call_count": 0, "prefix_done": False}
+def get_action_shape(model):
+    """Extract (action_horizon, action_dim) from the model config."""
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        raise RuntimeError("Model has no .config")
+    ah = getattr(cfg, "action_horizon", None)
+    ad = getattr(cfg, "action_dim", None)
+    if ah is None or ad is None:
+        raise RuntimeError(f"Model config missing action_horizon/action_dim: {cfg}")
+    return int(ah), int(ad)
 
-    def _pre_hook(mod, inputs):
-        # First call is the prefix pass (no denoising yet).
-        # Subsequent calls correspond to denoising steps 0..N-1.
-        if not state["prefix_done"]:
-            # The prefix pass runs the VLM + expert jointly.
-            # We want the prefix in FP16.
-            state["prefix_done"] = True
-            state["call_count"] = 0
-            utils.swap_weights(expert_module, orig_weights)
+
+def infer_with_noise(policy, obs, noise_np):
+    """Run policy.infer(obs, noise=...) and return action ndarray."""
+    with torch.no_grad():
+        result = policy.infer(obs, noise=noise_np)
+    if isinstance(result, dict):
+        for key in ("actions", "action", "raw_actions"):
+            if key in result:
+                v = result[key]
+                return v.cpu().numpy() if isinstance(v, torch.Tensor) else np.asarray(v)
+    if isinstance(result, torch.Tensor):
+        return result.cpu().numpy()
+    return np.asarray(result)
+
+
+# ===================================================================
+# Per-step weight-swap controller — patches model.denoise_step
+# ===================================================================
+
+class StepController:
+    """Monkey-patches model.denoise_step so the action expert can be swapped
+    between FP16 and a pre-quantized weight set at each Euler step boundary."""
+
+    def __init__(self, model, expert_module, orig_weights, quant_weights):
+        self.model = model
+        self.expert_module = expert_module
+        self.orig_weights = orig_weights
+        self.quant_weights = quant_weights
+        self.quantize_steps = set()
+        self.step = 0
+        # Keep the bound original so we can restore it cleanly.
+        self._original_denoise_step = model.denoise_step
+        self._installed = False
+
+    def set(self, quantize_steps):
+        """Prepare for the next inference call: reset counter, set schedule."""
+        self.quantize_steps = set(quantize_steps)
+        self.step = 0
+
+    def install(self):
+        if self._installed:
             return
 
-        step = state["call_count"]
-        if step in quantize_steps:
-            utils.swap_weights(expert_module, quant_weights)
-        else:
-            utils.swap_weights(expert_module, orig_weights)
-        state["call_count"] += 1
+        controller = self
+        original = self._original_denoise_step
 
-    hook = expert_module.register_forward_pre_hook(_pre_hook)
-    try:
-        action = utils.run_inference(policy, observation)
-    finally:
-        hook.remove()
-        # Always restore to FP16
-        utils.swap_weights(expert_module, orig_weights)
+        def patched(state, prefix_pad_masks, past_key_values, x_t, timestep):
+            if controller.step in controller.quantize_steps:
+                utils.swap_weights(controller.expert_module, controller.quant_weights)
+            else:
+                utils.swap_weights(controller.expert_module, controller.orig_weights)
+            try:
+                return original(state, prefix_pad_masks, past_key_values, x_t, timestep)
+            finally:
+                controller.step += 1
 
-    return action
+        # Setting an instance attribute overrides the class method via normal
+        # attribute lookup; sample_actions uses self.denoise_step(...) which
+        # will resolve to our patched function.
+        self.model.denoise_step = patched
+        self._installed = True
+
+    def uninstall(self):
+        if not self._installed:
+            return
+        try:
+            del self.model.denoise_step
+        except AttributeError:
+            pass
+        utils.swap_weights(self.expert_module, self.orig_weights)
+        self._installed = False
 
 
 # ===================================================================
-# Alternative: step control via direct weight swap around infer()
+# Validation
 # ===================================================================
 
-def run_inference_brute_force(policy, observation, expert_module,
-                               orig_weights, quant_weights, use_quant=False):
-    """Simpler fallback: run entire inference with expert either FP16 or W4.
+def _validate_controller(policy, controller, observations, noises, n_check=3):
+    """Ensure that the patched denoise_step is transparent when quantize_steps=∅
+    (must reproduce FP16 within floating-point noise) and that quantizing all
+    10 steps produces a measurably different output."""
+    utils.log("[exp3] Validating deterministic step control...")
 
-    Use this if the hook-based approach doesn't work (e.g., the expert module
-    isn't called separately per step).
-    """
-    if use_quant:
-        utils.swap_weights(expert_module, quant_weights)
-    else:
-        utils.swap_weights(expert_module, orig_weights)
+    # Baseline: FP16, seeded.  This is our reference.
+    ref = [infer_with_noise(policy, observations[i], noises[i]) for i in range(n_check)]
+
+    # Install controller with empty quantize set → should be identical to FP16.
+    controller.install()
     try:
-        action = utils.run_inference(policy, observation)
+        for i in range(n_check):
+            controller.set(set())          # no steps quantized
+            a = infer_with_noise(policy, observations[i], noises[i])
+            mse_fp16 = utils.action_mse(a, ref[i])
+            if mse_fp16 > 1e-10:
+                utils.log(
+                    f"  FAIL: controller with quantize_steps=∅ does not match FP16 "
+                    f"(obs {i}, MSE={mse_fp16:.3e})"
+                )
+                return False
+
+        # All W4.  Should produce a measurable difference.
+        all_q = set(range(NUM_STEPS))
+        total_q_mse = 0.0
+        for i in range(n_check):
+            controller.set(all_q)
+            a = infer_with_noise(policy, observations[i], noises[i])
+            total_q_mse += utils.action_mse(a, ref[i])
+        mean_q_mse = total_q_mse / n_check
     finally:
-        utils.swap_weights(expert_module, orig_weights)
-    return action
+        controller.uninstall()
+
+    utils.log(f"  all-FP16 vs ref:        MSE ~ 0 (passed)")
+    utils.log(f"  all-W4  vs ref (mean):  MSE = {mean_q_mse:.6e}")
+    if mean_q_mse < 1e-8:
+        utils.log("  FAIL: W4 produces no distinguishable output — quantization ineffective.")
+        return False
+    return True
+
+
+# ===================================================================
+# Live logging helpers
+# ===================================================================
+
+def _suite_of(meta):
+    s = meta.get("suite", "")
+    if s in ("Long", "hard"):
+        return "hard"
+    if s in ("Object", "easy"):
+        return "easy"
+    return "other"
+
+
+def _summarize(mses, metas):
+    """Return a compact one-line summary of per-sample MSEs, split by suite."""
+    if not mses:
+        return "no samples"
+    arr = np.asarray(mses, dtype=np.float64)
+    easy = [m for m, md in zip(mses, metas) if _suite_of(md) == "easy"]
+    hard = [m for m, md in zip(mses, metas) if _suite_of(md) == "hard"]
+    parts = [f"mean={arr.mean():.4e} std={arr.std():.3e} "
+             f"min={arr.min():.3e} max={arr.max():.3e}"]
+    if easy and hard:
+        delta = float(np.mean(hard)) - float(np.mean(easy))
+        parts.append(
+            f"easy={float(np.mean(easy)):.4e} (n={len(easy)}) "
+            f"hard={float(np.mean(hard)):.4e} (n={len(hard)}) "
+            f"Δ(h-e)={delta:+.3e}"
+        )
+    return "  ".join(parts)
+
+
+def _progress(done, total, start):
+    pct = 100.0 * done / max(total, 1)
+    elapsed = time.time() - start
+    rate = done / max(elapsed, 1e-6)
+    eta = (total - done) / max(rate, 1e-6)
+    return f"{done:3d}/{total} ({pct:5.1f}%)  elapsed={elapsed:5.1f}s  eta={eta:5.1f}s"
 
 
 # ===================================================================
@@ -141,11 +271,10 @@ def run_inference_brute_force(policy, observation, expert_module,
 # ===================================================================
 
 def main():
-    print("=" * 60)
-    print("EXPERIMENT 3: Flow-Step Sensitivity")
-    print("=" * 60)
-
-    NUM_STEPS = 10  # pi0.5 default
+    utils.setup_logging()
+    utils.log("=" * 60)
+    utils.log("EXPERIMENT 3: Flow-Step Sensitivity (deterministic, redesigned)")
+    utils.log("=" * 60)
 
     # ---- suite map ----
     suite_map = None
@@ -158,8 +287,11 @@ def main():
     with utils.Timer("Model loading"):
         policy, model = utils.load_policy("pi05_libero")
         if model is None:
-            print("FATAL: no model")
+            utils.log("FATAL: no model")
             return 1
+
+    device = next(model.parameters()).device
+    utils.log(f"[exp3] Device: {device}")
 
     # ---- data ----
     with utils.Timer("Data loading"):
@@ -168,259 +300,290 @@ def main():
         )
     n_obs = len(observations)
 
-    # ---- find expert ----
-    expert_name, expert_module = find_action_expert(model)
+    # ---- seeded noise ----
+    action_horizon, action_dim = get_action_shape(model)
+    utils.log(f"[exp3] Action shape: ({action_horizon}, {action_dim})")
+    utils.log(f"[exp3] Pre-generating {n_obs} seeded noise tensors...")
+    noises_np = []
+    for i in range(n_obs):
+        n = make_noise(action_horizon, action_dim, NOISE_SEED_OFFSET + i, device)
+        noises_np.append(n.cpu().numpy())
+    utils.log(f"  seed range: [{NOISE_SEED_OFFSET}, {NOISE_SEED_OFFSET + n_obs - 1}]")
 
-    # ---- pre-compute W4 weights ----
-    print("[exp3] Pre-computing W4 weights for action expert...")
-    orig_ptrs, quant_tensors = utils.precompute_quantized_weights(expert_module, bits=4)
-    print(f"  {len(orig_ptrs)} linear layers")
-
-    # ---- FP16 reference actions (reuse from exp2 if available) ----
-    ref_path = os.path.join(utils.RESULTS_DIR, "exp2_reference_actions.npz")
+    # ---- FP16 reference with SEEDED noise (cannot reuse exp2's cache) ----
+    ref_path = os.path.join(utils.RESULTS_DIR, "exp3_reference_actions_seeded.npz")
     if os.path.exists(ref_path):
-        print(f"[exp3] Loading cached reference actions")
+        utils.log(f"[exp3] Loading cached seeded reference: {ref_path}")
         ref_data = np.load(ref_path, allow_pickle=True)
         ref_actions = [ref_data[f"action_{i}"] for i in range(n_obs)]
     else:
-        print(f"[exp3] Computing FP16 reference actions...")
-        with utils.Timer("Reference actions"):
-            ref_actions = utils.compute_reference_actions(policy, observations)
+        utils.log(f"[exp3] Computing FP16 reference with SEEDED noise ({n_obs} obs)...")
+        ref_actions = []
+        t0 = time.time()
+        for i in range(n_obs):
+            ref_actions.append(infer_with_noise(policy, observations[i], noises_np[i]))
+            if i % 50 == 0:
+                utils.log(f"  ref {i}/{n_obs}")
+        utils.log(f"  Reference took {time.time() - t0:.1f}s")
         arrays = {f"action_{i}": a for i, a in enumerate(ref_actions)}
         utils.save_npz(ref_path, **arrays)
 
-    # ---- detect whether hook-based step control works ----
-    print("\n[exp3] Testing hook-based step control...")
-    hook_works = _test_hook_approach(
-        policy, model, observations[0], expert_module,
-        orig_ptrs, quant_tensors, ref_actions[0], NUM_STEPS,
-    )
+    # ---- find expert + pre-compute W4 weights ----
+    expert_name, expert_module = find_action_expert(model)
+    utils.log("[exp3] Pre-computing W4 weights for action expert...")
+    orig_ptrs, quant_tensors = utils.precompute_quantized_weights(expert_module, bits=4)
+    utils.log(f"  {len(orig_ptrs)} linear layers in expert")
 
-    if hook_works:
-        print("  Hook-based step control: OK")
-        run_fn = lambda obs, q_steps: run_inference_with_step_control(
-            policy, model, obs, expert_module, orig_ptrs, quant_tensors,
-            q_steps, NUM_STEPS,
-        )
-    else:
-        print("  Hook-based step control: FAILED — falling back to brute-force (all-or-nothing per step)")
-        print("  NOTE: this means per-step probing is NOT possible; only all-FP16 vs all-W4.")
-        run_fn = None
+    controller = StepController(model, expert_module, orig_ptrs, quant_tensors)
+
+    # ---- validate ----
+    if not _validate_controller(policy, controller, observations, noises_np, n_check=3):
+        utils.log("FATAL: step controller validation failed.  Not running sweeps.")
+        return 1
 
     # ---- smoke test: time one config ----
-    print(f"\n[exp3] Smoke test: timing 1 config x {n_obs} observations...")
-    t0 = time.time()
-    for obs in observations:
-        if run_fn:
-            run_fn(obs, {0})  # W4 at step 0 only
-        else:
-            run_inference_brute_force(policy, obs, expert_module, orig_ptrs, quant_tensors, True)
-    smoke_time = time.time() - t0
-    n_configs = 10 + 11 + 11 if run_fn else 2
+    utils.log(f"\n[exp3] Smoke test: timing 1 config x {n_obs} observations...")
+    controller.install()
+    try:
+        t0 = time.time()
+        for si in range(n_obs):
+            controller.set({0})
+            infer_with_noise(policy, observations[si], noises_np[si])
+        smoke_time = time.time() - t0
+    finally:
+        controller.uninstall()
+    n_configs = 10 + 11 + 11
     est = smoke_time * n_configs
-    print(f"  1 config: {smoke_time:.1f}s")
-    print(f"  Estimated total ({n_configs} configs): {est/3600:.1f}h")
+    utils.log(f"  1 config: {smoke_time:.1f}s  |  estimated total ({n_configs} configs): {est/3600:.2f}h")
 
-    # ---- per-step sweep ----
+    # ---- sweeps ----
     per_step_path = os.path.join(utils.RESULTS_DIR, "exp3_per_step.jsonl")
     cumul_path = os.path.join(utils.RESULTS_DIR, "exp3_cumulative.jsonl")
+    for p in (per_step_path, cumul_path):
+        if os.path.exists(p):
+            os.remove(p)
 
-    if run_fn:
-        # Clear previous
-        for p in [per_step_path, cumul_path]:
-            if os.path.exists(p):
-                os.remove(p)
-
+    controller.install()
+    try:
         # A) Per-step: W4 at step k only
-        print(f"\n[exp3] Sweep A: per-step probing (10 configs)...")
+        utils.log(f"\n[exp3] Sweep A: per-step probing ({NUM_STEPS} configs)...")
+        a_means = []  # per-step means for running summary
         for k in range(NUM_STEPS):
+            q_steps = {k}
             t0 = time.time()
+            mses_k, metas_k = [], []
             for si in range(n_obs):
-                action = run_fn(observations[si], {k})
-                mse = utils.action_mse(action, ref_actions[si])
+                controller.set(q_steps)
+                a = infer_with_noise(policy, observations[si], noises_np[si])
+                mse = utils.action_mse(a, ref_actions[si])
                 utils.append_jsonl({
                     "sweep": "per_step", "quant_step": k,
                     "sample_idx": si, "mse": mse, **metadata[si],
                 }, per_step_path)
+                mses_k.append(mse)
+                metas_k.append(metadata[si])
+                if (si + 1) % LIVE_EVERY == 0 or si == n_obs - 1:
+                    utils.log(
+                        f"    step={k}  {_progress(si + 1, n_obs, t0)}  "
+                        f"running-mean={float(np.mean(mses_k)):.4e}"
+                    )
             dt = time.time() - t0
-            print(f"  step {k}: {dt:.1f}s")
+            m = float(np.mean(mses_k))
+            a_means.append(m)
+            utils.log(f"  [A] step {k:2d}: {dt:.1f}s  |  {_summarize(mses_k, metas_k)}")
+            utils.log(f"       running per-step means so far: "
+                      + ", ".join(f"k={i}:{v:.3e}" for i, v in enumerate(a_means)))
 
-        # B) Cumulative: first k steps FP16, rest W4
-        print(f"\n[exp3] Sweep B: first-k-FP16 (11 configs)...")
+        # B) first k steps FP16, rest W4
+        utils.log(f"\n[exp3] Sweep B: first-k-FP16 ({NUM_STEPS + 1} configs)...")
+        b_means = []
         for k in range(NUM_STEPS + 1):
-            quant_steps = set(range(k, NUM_STEPS))
+            q_steps = set(range(k, NUM_STEPS))
             t0 = time.time()
+            mses_k, metas_k = [], []
             for si in range(n_obs):
-                action = run_fn(observations[si], quant_steps)
-                mse = utils.action_mse(action, ref_actions[si])
+                controller.set(q_steps)
+                a = infer_with_noise(policy, observations[si], noises_np[si])
+                mse = utils.action_mse(a, ref_actions[si])
                 utils.append_jsonl({
                     "sweep": "first_k_fp16", "k": k,
                     "sample_idx": si, "mse": mse, **metadata[si],
                 }, cumul_path)
-            dt = time.time() - t0
+                mses_k.append(mse)
+                metas_k.append(metadata[si])
+                if (si + 1) % LIVE_EVERY == 0 or si == n_obs - 1:
+                    utils.log(
+                        f"    B k={k}  {_progress(si + 1, n_obs, t0)}  "
+                        f"running-mean={float(np.mean(mses_k)):.4e}"
+                    )
             label = "all-FP16" if k == NUM_STEPS else f"FP16[0:{k}]+W4[{k}:{NUM_STEPS}]"
-            print(f"  k={k:2d} ({label}): {dt:.1f}s")
+            m = float(np.mean(mses_k))
+            b_means.append(m)
+            utils.log(f"  [B] k={k:2d} ({label}): {time.time()-t0:.1f}s  |  {_summarize(mses_k, metas_k)}")
+            utils.log(f"       B curve so far: " + ", ".join(f"k={i}:{v:.3e}" for i, v in enumerate(b_means)))
 
-        # C) Cumulative: first k steps W4, rest FP16
-        print(f"\n[exp3] Sweep C: first-k-W4 (11 configs)...")
+        # C) first k steps W4, rest FP16
+        utils.log(f"\n[exp3] Sweep C: first-k-W4 ({NUM_STEPS + 1} configs)...")
+        c_means = []
         for k in range(NUM_STEPS + 1):
-            quant_steps = set(range(0, k))
+            q_steps = set(range(0, k))
             t0 = time.time()
+            mses_k, metas_k = [], []
             for si in range(n_obs):
-                action = run_fn(observations[si], quant_steps)
-                mse = utils.action_mse(action, ref_actions[si])
+                controller.set(q_steps)
+                a = infer_with_noise(policy, observations[si], noises_np[si])
+                mse = utils.action_mse(a, ref_actions[si])
                 utils.append_jsonl({
                     "sweep": "first_k_w4", "k": k,
                     "sample_idx": si, "mse": mse, **metadata[si],
                 }, cumul_path)
-            dt = time.time() - t0
+                mses_k.append(mse)
+                metas_k.append(metadata[si])
+                if (si + 1) % LIVE_EVERY == 0 or si == n_obs - 1:
+                    utils.log(
+                        f"    C k={k}  {_progress(si + 1, n_obs, t0)}  "
+                        f"running-mean={float(np.mean(mses_k)):.4e}"
+                    )
             label = "all-FP16" if k == 0 else f"W4[0:{k}]+FP16[{k}:{NUM_STEPS}]"
-            print(f"  k={k:2d} ({label}): {dt:.1f}s")
+            m = float(np.mean(mses_k))
+            c_means.append(m)
+            utils.log(f"  [C] k={k:2d} ({label}): {time.time()-t0:.1f}s  |  {_summarize(mses_k, metas_k)}")
+            utils.log(f"       C curve so far: " + ", ".join(f"k={i}:{v:.3e}" for i, v in enumerate(c_means)))
 
-    else:
-        # Brute-force fallback: just all-FP16 vs all-W4
-        print("\n[exp3] Brute-force: all-FP16 vs all-W4 only")
-        if os.path.exists(per_step_path):
-            os.remove(per_step_path)
-
-        for use_q, label in [(False, "all_fp16"), (True, "all_w4")]:
-            t0 = time.time()
-            for si in range(n_obs):
-                action = run_inference_brute_force(
-                    policy, observations[si], expert_module,
-                    orig_ptrs, quant_tensors, use_q,
-                )
-                mse = utils.action_mse(action, ref_actions[si])
-                utils.append_jsonl({
-                    "sweep": "brute_force", "config": label,
-                    "sample_idx": si, "mse": mse, **metadata[si],
-                }, per_step_path)
-            dt = time.time() - t0
-            print(f"  {label}: {dt:.1f}s")
+        # ---- final end-of-run summary, tabular ----
+        utils.log("\n" + "=" * 60)
+        utils.log("EXP3 FINAL SUMMARY (mean action MSE vs FP16 reference)")
+        utils.log("=" * 60)
+        utils.log("[A] Per-step (W4 at step k only, FP16 elsewhere):")
+        for i, v in enumerate(a_means):
+            utils.log(f"    step {i:2d}:  {v:.6e}")
+        utils.log("\n[B] First k steps FP16, rest W4:")
+        for i, v in enumerate(b_means):
+            utils.log(f"    k={i:2d}:    {v:.6e}")
+        utils.log("\n[C] First k steps W4, rest FP16:")
+        for i, v in enumerate(c_means):
+            utils.log(f"    k={i:2d}:    {v:.6e}")
+        utils.log("=" * 60)
+    finally:
+        controller.uninstall()
 
     # ---- plots ----
-    print("\n[exp3] Generating plots...")
+    utils.log("\n[exp3] Generating plots...")
     _plot(per_step_path, cumul_path, NUM_STEPS)
-
-    print("\nExperiment 3 complete.")
+    utils.log("\nExperiment 3 complete.")
     return 0
 
 
-def _test_hook_approach(policy, model, obs, expert_module,
-                         orig_ptrs, quant_tensors, ref_action, num_steps):
-    """Test whether the hook-based step control produces different results
-    for different step configurations (proving it actually works)."""
-    try:
-        # All FP16 — should match reference
-        a_fp16 = run_inference_with_step_control(
-            policy, model, obs, expert_module, orig_ptrs, quant_tensors,
-            set(), num_steps,
-        )
-        mse_fp16 = utils.action_mse(a_fp16, ref_action)
-
-        # All W4 — should differ from reference
-        a_w4 = run_inference_with_step_control(
-            policy, model, obs, expert_module, orig_ptrs, quant_tensors,
-            set(range(num_steps)), num_steps,
-        )
-        mse_w4 = utils.action_mse(a_w4, ref_action)
-
-        print(f"    all-FP16 vs ref MSE: {mse_fp16:.8f} (should be ~0)")
-        print(f"    all-W4 vs ref MSE:   {mse_w4:.6f} (should be >0)")
-
-        # FP16 should be close to reference; W4 should differ
-        return mse_fp16 < 1e-6 and mse_w4 > 1e-8
-    except Exception as e:
-        print(f"    Hook test failed: {e}")
-        return False
-
+# ===================================================================
+# Plots
+# ===================================================================
 
 def _plot(per_step_path, cumul_path, num_steps):
+    from collections import defaultdict
     plt = utils.setup_plotting()
 
-    # Per-step sensitivity
+    # ---- per-step sensitivity ----
     if os.path.exists(per_step_path):
-        recs = utils.load_jsonl(per_step_path)
-        per_step_recs = [r for r in recs if r.get("sweep") == "per_step"]
+        recs = [r for r in utils.load_jsonl(per_step_path) if r.get("sweep") == "per_step"]
+        if recs:
+            by_step_all = defaultdict(list)
+            by_step_easy = defaultdict(list)
+            by_step_hard = defaultdict(list)
+            for r in recs:
+                s = r["quant_step"]
+                by_step_all[s].append(r["mse"])
+                suite = r.get("suite", "")
+                if suite in ("Object", "easy"):
+                    by_step_easy[s].append(r["mse"])
+                elif suite in ("Long", "hard"):
+                    by_step_hard[s].append(r["mse"])
 
-        if per_step_recs:
-            from collections import defaultdict
-            by_step = defaultdict(list)
-            for r in per_step_recs:
-                by_step[r["quant_step"]].append(r["mse"])
-
-            steps = sorted(by_step.keys())
-            means = [np.mean(by_step[s]) for s in steps]
-            stds = [np.std(by_step[s]) for s in steps]
+            steps = sorted(by_step_all.keys())
+            means = [float(np.mean(by_step_all[s])) for s in steps]
+            stds = [float(np.std(by_step_all[s])) for s in steps]
 
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.bar(steps, means, yerr=stds, capsize=4, color="#1565c0", alpha=0.8)
-            ax.set_xlabel("Denoising Step (quantized to W4)")
-            ax.set_ylabel("Action MSE vs FP16 Reference")
-            ax.set_title("Per-Step Quantization Sensitivity")
+            ax.bar(steps, means, yerr=stds, capsize=4, color="#1565c0", alpha=0.85)
+            ax.set_xlabel("Denoising step k (quantized to W4, all others FP16)")
+            ax.set_ylabel("Action MSE vs FP16 reference")
+            ax.set_title(f"Per-Step Sensitivity of Action Expert (seeded noise, n={len(recs)//num_steps})")
             ax.set_xticks(steps)
             plt.tight_layout()
             plt.savefig(os.path.join(utils.PLOTS_DIR, "exp3_per_step_sensitivity.png"))
             plt.close()
-            print(f"  exp3_per_step_sensitivity.png")
+            utils.log("  exp3_per_step_sensitivity.png")
 
-    # Cumulative sweep
+            # easy vs hard split
+            if by_step_easy and by_step_hard:
+                means_e = [float(np.mean(by_step_easy[s])) if by_step_easy[s] else 0 for s in steps]
+                means_h = [float(np.mean(by_step_hard[s])) if by_step_hard[s] else 0 for s in steps]
+                fig, ax = plt.subplots(figsize=(10, 5))
+                width = 0.4
+                x = np.array(steps)
+                ax.bar(x - width/2, means_e, width, label="Easy (Object)", color="#1565c0", alpha=0.85)
+                ax.bar(x + width/2, means_h, width, label="Hard (Long)", color="#d32f2f", alpha=0.85)
+                ax.set_xlabel("Denoising step k (quantized to W4)")
+                ax.set_ylabel("Action MSE vs FP16 reference")
+                ax.set_title("Per-Step Sensitivity: Easy vs Hard")
+                ax.set_xticks(steps)
+                ax.legend()
+                plt.tight_layout()
+                plt.savefig(os.path.join(utils.PLOTS_DIR, "exp3_per_step_easy_vs_hard.png"))
+                plt.close()
+                utils.log("  exp3_per_step_easy_vs_hard.png")
+
+    # ---- cumulative sweeps ----
     if os.path.exists(cumul_path):
         recs = utils.load_jsonl(cumul_path)
-
-        from collections import defaultdict
-
-        for sweep_name, label, xlabel in [
-            ("first_k_fp16", "First k steps FP16, rest W4", "k (FP16 steps)"),
-            ("first_k_w4", "First k steps W4, rest FP16", "k (W4 steps)"),
+        for sweep_name, label, xlabel, color in [
+            ("first_k_fp16", "First k steps FP16, rest W4", "k (FP16 prefix length)", "#1565c0"),
+            ("first_k_w4",   "First k steps W4, rest FP16", "k (W4 prefix length)",   "#d32f2f"),
         ]:
-            sweep_recs = [r for r in recs if r.get("sweep") == sweep_name]
-            if not sweep_recs:
+            sub = [r for r in recs if r.get("sweep") == sweep_name]
+            if not sub:
                 continue
             by_k = defaultdict(list)
-            for r in sweep_recs:
+            for r in sub:
                 by_k[r["k"]].append(r["mse"])
-
             ks = sorted(by_k.keys())
-            means = [np.mean(by_k[k]) for k in ks]
+            means = [float(np.mean(by_k[k])) for k in ks]
+            stds = [float(np.std(by_k[k])) for k in ks]
 
             fig, ax = plt.subplots(figsize=(10, 5))
-            ax.plot(ks, means, "o-", color="#d32f2f", linewidth=2)
+            ax.errorbar(ks, means, yerr=stds, fmt="o-", color=color, linewidth=2, capsize=3)
             ax.set_xlabel(xlabel)
-            ax.set_ylabel("Action MSE vs FP16 Reference")
+            ax.set_ylabel("Action MSE vs FP16 reference")
             ax.set_title(label)
             ax.set_xticks(ks)
             plt.tight_layout()
-            fname = f"exp3_cumulative_{sweep_name}.png"
-            plt.savefig(os.path.join(utils.PLOTS_DIR, fname))
+            plt.savefig(os.path.join(utils.PLOTS_DIR, f"exp3_cumulative_{sweep_name}.png"))
             plt.close()
-            print(f"  {fname}")
+            utils.log(f"  exp3_cumulative_{sweep_name}.png")
 
-        # Combined cumulative plot
+        # combined
         fig, ax = plt.subplots(figsize=(10, 5))
         for sweep_name, color, label in [
             ("first_k_fp16", "#1565c0", "First k FP16, rest W4"),
-            ("first_k_w4", "#d32f2f", "First k W4, rest FP16"),
+            ("first_k_w4",   "#d32f2f", "First k W4, rest FP16"),
         ]:
-            sweep_recs = [r for r in recs if r.get("sweep") == sweep_name]
-            if not sweep_recs:
+            sub = [r for r in recs if r.get("sweep") == sweep_name]
+            if not sub:
                 continue
             by_k = defaultdict(list)
-            for r in sweep_recs:
+            for r in sub:
                 by_k[r["k"]].append(r["mse"])
             ks = sorted(by_k.keys())
-            means = [np.mean(by_k[k]) for k in ks]
+            means = [float(np.mean(by_k[k])) for k in ks]
             ax.plot(ks, means, "o-", color=color, linewidth=2, label=label)
-
         ax.set_xlabel("k (switchover step)")
-        ax.set_ylabel("Action MSE vs FP16 Reference")
+        ax.set_ylabel("Action MSE vs FP16 reference")
         ax.set_title("Cumulative Precision Scheduling")
         ax.legend()
         ax.set_xticks(range(num_steps + 1))
         plt.tight_layout()
         plt.savefig(os.path.join(utils.PLOTS_DIR, "exp3_cumulative_sweep.png"))
         plt.close()
-        print(f"  exp3_cumulative_sweep.png")
+        utils.log("  exp3_cumulative_sweep.png")
 
 
 if __name__ == "__main__":
