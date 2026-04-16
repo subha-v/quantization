@@ -124,7 +124,7 @@ def main():
 
     # ---------------------------------------------------------------- forward pass sanity
     def _forward():
-        assert policy[0] is not None and observations[0]
+        assert policy[0] is not None and len(observations[0]) > 0
         obs = observations[0]
         a1 = utils.run_inference(policy[0], obs[0])
         print(f"  Action shape: {a1.shape}, dtype: {a1.dtype}")
@@ -147,7 +147,7 @@ def main():
 
     # ---------------------------------------------------------------- hooks
     def _hooks():
-        assert model[0] is not None and policy[0] is not None and observations[0]
+        assert model[0] is not None and policy[0] is not None and len(observations[0]) > 0
         hooks, stats = utils.register_activation_hooks(model[0])
         utils.run_inference(policy[0], observations[0][0])
         n_triggered = sum(1 for v in stats.values() if v)
@@ -162,7 +162,7 @@ def main():
 
     # ---------------------------------------------------------------- quantization round-trip
     def _quant():
-        assert model[0] and policy[0] and observations[0]
+        assert model[0] is not None and policy[0] is not None and len(observations[0]) > 0
         groups = utils.get_layer_groups(model[0])
         g = groups[0]
         print(f"  Testing on: {g['name']} ({g['group_type']})")
@@ -181,20 +181,20 @@ def main():
 
     # ---------------------------------------------------------------- task→suite mapping
     def _tasks():
-        ds = utils.load_libero_dataset("lerobot/libero")
-        descs = utils.get_task_descriptions(ds)
-        suite_map = utils.build_suite_map(descs)
+        prompts = utils.load_task_prompts()
         print(f"\n  task_index → suite → instruction:")
-        for tid in sorted(descs.keys()):
-            suite = suite_map.get(tid, "?")
-            print(f"    {tid:3d}  [{suite:8s}]  {descs[tid][:80]}")
+        suite_map = {}
+        for tid in sorted(prompts.keys()):
+            suite = utils.suite_of(tid)
+            suite_map[tid] = suite
+            print(f"    {tid:3d}  [{suite:8s}]  {prompts[tid][:80]}")
         suites = {}
         for tid, s in suite_map.items():
             suites.setdefault(s, []).append(tid)
         print(f"\n  Suite summary:")
         for s, tids in sorted(suites.items()):
             print(f"    {s}: task indices {tids}")
-        return {"descriptions": {str(k): v for k, v in descs.items()},
+        return {"descriptions": {str(k): v for k, v in prompts.items()},
                 "suite_map": {str(k): v for k, v in suite_map.items()},
                 "suites": {s: tids for s, tids in suites.items()}}
     task_info = check("Task→suite mapping", _tasks)
