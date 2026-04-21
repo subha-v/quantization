@@ -21,8 +21,8 @@ Studying how weight quantization of the VLM backbone in flow-matching VLAs (pi0,
 ├── INITIAL_EXPERIMENT.md     — Quick validation experiment template
 ├── UPDATED_IDEAS.md          — Refined ideas after mentor meeting
 ├── papers/                   — Reference papers (QVLA, BlockDialect, KVQuant, etc.)
-└── scripts/                  — Overnight experiment scripts for H100
-    ├── setup_env.sh          — GCP environment setup (clone openpi, install deps, convert checkpoint)
+└── scripts/                  — Experiment scripts for H100
+    ├── setup_env.sh          — Environment setup (clone openpi, install deps, convert checkpoint)
     ├── setup_libero.sh       — LIBERO install helper (third_party/libero → openpi venv)
     ├── run_phase0.sh         — One-shot Phase 0 orchestrator (sync + install + smokes + full run)
     ├── utils.py              — Shared utilities (model loading, data, quantization, hooks, I/O, MUJOCO_GL)
@@ -32,6 +32,12 @@ Studying how weight quantization of the VLM backbone in flow-matching VLAs (pi0,
     ├── exp1_activation_stats.py  — Cross-suite activation statistics
     ├── exp2_layer_sensitivity.py — Per-layer sensitivity probe with per-sample metadata
     ├── exp3_flow_step_sensitivity.py — Per-denoising-step sensitivity (novel)
+    ├── exp5_trajectory_attention.py — 50-rollout VLM attention capture + Easy/Hard classifier
+    ├── exp5_reanalyze.py     — Leave-one-task-pair CV against task-identity leakage
+    ├── exp6_attention_predicts_quant.py — Re-run rollouts under W4/W2 quant; regress attention → outcome
+    ├── exp6_diagnostics.py   — Bootstrap CIs, Spearman + Bonferroni, RF/GB nonlinear comparison
+    ├── exp7_per_frame_sensitivity.py — Per-call (obs, FP16, W4) capture for per-frame MSE
+    ├── exp7_analyze.py       — Per-frame regression (n=1879, LOTP, ridge/RF, Spearman)
     └── run_all.py            — Orchestrator for overnight runs
 ```
 
@@ -54,7 +60,29 @@ tmux new -s phase0
 bash scripts/run_phase0.sh
 ```
 
-Phase 1 (trajectory attention analysis) is planned conditional on Phase 0 passing.
+Result (2026-04-20): 18/18 FP16 rollouts succeeded, matching/exceeding QuantVLA published numbers on Object (99.0%→100%) and Long (93.5%→100%).
+
+## Phase 1 — Trajectory Attention Analysis (2026-04-20)
+
+`exp5_trajectory_attention.py`: 50 rollouts (5 tasks × 5 seeds × {Object, Long}) with forward-hook capture of all 45 VLM attention modules at every VLM call. Per (layer, head, call): sparsity, entropy, top-1/top-5 mass, attention-sink mass. Aggregated per rollout into static + dynamic features (1350 per rollout). Trained binary classifier Object vs Long.
+
+**Result: AUC = 1.000** under leave-one-task-pair-out CV. Three confounds make this result tell us less than it looks: prompt grammar differs between suites, scenes have different visual complexity, and rollout lengths differ systematically. All three are mediated through vision_tower attention, not a difficulty-specific signal.
+
+## Phase 2 — Attention vs Quantization Sensitivity (2026-04-20)
+
+Two experiments testing whether the exp5 signal actually predicts which rollouts are quantization-sensitive:
+
+`exp6_attention_predicts_quant.py`: re-run the 50 rollouts under quantization (W4 both, W2 VLM-protect) and regress FP16 attention features against steps_delta. Initial verdict "signal dead" was walked back after bootstrap CI analysis showed the 1350-feature, n=50 regime is too noisy to distinguish "attention beats suite" from "ties suite."
+
+`exp7_per_frame_sensitivity.py`: capture (obs, FP16_chunk, W4_chunk) at each of ~1900 VLM calls across all 50 rollouts. Regress per-call attention features against per-call action MSE. **Finding: 32 of 90 attention features survive Bonferroni correction at p<0.05; signal localizes to language_model decoder layers; best R² = 0.125 within Object rollouts. Real but weak.**
+
+Two distinct attention signals in two parts of the VLM:
+- `vision_tower` → suite/scene fingerprinting (exp5 AUC=1.0 confound)
+- `language_model` → per-frame W4 sensitivity (weak but statistically robust)
+
+Paper headline remains exp2 (layer-sensitivity) + exp3 (step-asymmetric expert) as the strong, clean findings; exp7 is a supplementary section.
+
+Full write-up with tables in `EXPERIMENT_FINDINGS.md`.
 
 ## Overnight Experiments (2026-04-15)
 

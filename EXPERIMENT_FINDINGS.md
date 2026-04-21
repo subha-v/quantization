@@ -185,38 +185,237 @@ Long is flat across rollout phases. Object early-phase frames are the single mos
 
 ---
 
-## Proposed next experiment — Exp4: VLM/KV-cache propagation through denoising steps
+## Bridge to Phase 1 — pivoting from Exp4 to trajectory attention analysis
 
-Exp3 answered "which denoising step is the expert most sensitive to errors in **its own weights**?" The thesis-relevant question is: "which denoising step is the expert most sensitive to errors in the **VLM-produced KV cache**?"
+We originally planned **Exp4** (VLM/KV-cache propagation through denoising steps) as the natural follow-up to exp3. After a closer code audit, that design was reframed: openpi's `denoise_step` is called with `use_cache=False`, so the VLM-produced `past_key_values` is **never mutated across the 10 Euler steps** — it's a read-only input. "Which denoising step is most sensitive to VLM-side error" is ill-posed because the KV is temporally constant within one inference. Exp4 was deferred in favor of a more mechanistically interesting question: *do attention dynamics during a closed-loop rollout predict where quantization precision needs to be spent?*
 
-Structural note: the VLM runs once per action inference, producing a fixed KV cache that is consumed by the expert via cross-attention across all 10 Euler steps. So "quantize the VLM at step k" is not the right framing — there's only one VLM forward pass. The right framing: the expert's per-step *consumption* of a noisy vs clean cache.
+This section documents exp0 (rollout infrastructure), exp5 (trajectory attention capture + suite classifier), exp6 (attention vs per-rollout quantization sensitivity), and exp7 (attention vs per-frame W4 action MSE). The narrative matters because exp6 produced an initial "signal dead" verdict that was walked back after a methodological critique and exp7's per-frame reanalysis.
 
-**Design.**
+---
 
-1. Run VLM once at FP16 → cache `KV_fp`.
-2. Run VLM once with weights quantized to W4 (or W3, W2) → cache `KV_q`.
-3. During the denoising loop, at step `k`, monkey-patch the expert's cross-attention layers to read from either `KV_fp` or `KV_q`, following a per-step schedule.
-4. Run the same three sweeps as exp3 (A/B/C) over the choice of `KV_fp` vs `KV_q` per step.
+## Experiment 0 — LIBERO closed-loop rollout infrastructure (2026-04-20)
 
-**What this tells us.** At which step is the expert most sensitive to the VLM's quantization error? Candidate priors:
-- Early steps dominant: "coarse scaffolding uses the scene heavily; late refinement is scene-agnostic."
-- Late steps dominant: mirrors exp3's expert-side curve; suggests a universal "last step matters" law.
-- Flat: the expert averages scene errors over the whole Euler loop.
+**Goal.** Build a reusable in-process rollout harness for pi0.5 on LIBERO and validate it reproduces published FP16 success rates on a subset. All prior experiments (exp1-3) used static parquet observations; attention-dynamics analysis required actual closed-loop rollouts with the MuJoCo simulator.
 
-Any of these is a clean architectural claim.
+**Method.** Single-process integration of openpi's `Policy.infer()` with LIBERO's `OffScreenRenderEnv` via a new `scripts/rollout.py`. Observation adapter matches openpi's `examples/libero/main.py` preprocessing (180° image rotation, resize_with_pad to 224, eef_pos + axisangle(quat) + gripper_qpos → state vector). Seeded per-episode via LIBERO's `task_suite.get_task_init_states(task_id)[episode_idx]`. Callback seams (`obs_callback`, `action_callback`) for downstream hook integration.
 
-**Variants.**
-- **Exp4b — direct KV cache quantization.** Instead of quantizing VLM weights, directly round the cached K, V tensors (KVQuant-style). Same per-step sweeps. Decouples "VLM weight quantization" from "KV numerical precision."
-- **Exp4c — uniform VLM precision baseline.** Sweep VLM global bitwidth W8 / W4 / W3 / W2 with FP16 expert. "How bad is uniform VLM quantization" as a reference point. This is also the layer-granularity version of what Wonsuk originally asked for, collapsed into a single curve.
+**Setup friction.** Documented in `COMMON_ERRORS.md`. Two non-obvious fixes required:
+1. LIBERO's `libero/libero/__init__.py` calls `input()` at import time if `~/.libero/config.yaml` is missing. Under `uv run python -c "import libero.libero"` (stdin redirected) this blocks forever. Fix: pre-create `$LIBERO_CONFIG_PATH/config.yaml` in `run_phase0.sh`.
+2. PyTorch 2.6 flipped `torch.load` default `weights_only` to True. LIBERO's legacy numpy-pickled `.pruned_init` task-state files fail the new safe loader. Fix: monkey-patch `torch.load` in `rollout.py` before LIBERO is imported.
 
-**Cost.** ~1–1.5 h on H100 with the exp3 fixture (same seeded-noise, same JSONL schema, same plot scaffolding). Can run tonight.
+Also: `robosuite` is unpinned in LIBERO's requirements → uv resolves to 1.5.x which broke LIBERO's API. Downgraded to `robosuite==1.4.1`.
+
+**Result.** 3 tasks × 3 seeds × {Object, Long} = 18 rollouts at FP16 on one H100 (tambe-server-1 GPU 0).
+
+| suite | our FP16 | published (QuantVLA Table 2) | Δ | n |
+|---|---|---|---|---|
+| Object | 9/9 = 100.0% | 99.0% | +1.0pp | 9 |
+| Long | 9/9 = 100.0% | 93.5% | +6.5pp | 9 |
+
+Total runtime 5.5 min on H100. Object rollouts ~8–15s each, Long ~13–18s each.
+
+**Caveats.** n=9 per suite is too small for sharp significance claims; only first 3 tasks per suite tested. But infrastructure is validated and reusable for all subsequent experiments.
+
+---
+
+## Experiment 5 — Trajectory attention dynamics + Easy-vs-Hard classifier
+
+**Framing.** Exp1 found that per-frame activation distributions don't separate Easy from Hard observations. Working hypothesis (ThinKV-inspired): difficulty signal lives in attention *dynamics* across a rollout — how attention shifts (or doesn't) as the task unfolds — not per-frame snapshots. An Object-task rollout might lock onto one object; a Long-task rollout might shift across sub-goals.
+
+**Method.**
+- 50 rollouts: 5 tasks × 5 seeds × {Object, Long} using exp0's harness.
+- Monkey-patched all 45 VLM attention modules (27 SigLIP vision tower + 18 PaliGemma decoder, excluding `gemma_expert`) to force `output_attentions=True` and capture softmax probs at every VLM forward pass.
+- Per (layer, head, infer-call): sparsity (ThinKV-style <1% of row max), entropy, top-1 mass, top-5 mass, attention-sink mass at position 0.
+- Per rollout: aggregated across time into static features (mean) AND dynamic features (std, max, range, lag-1 autocorrelation). 45 layers × 5 metrics × 6 stats = **1350 features per rollout**.
+- Classifier: logistic regression, 5-fold stratified CV, then leave-one-task-pair-out (LOTP) CV to control for task-identity leakage.
+
+**Result: AUC = 1.000 under both CV protocols** (25 LOTP folds, per-fold range [1.00, 1.00]). Object and Long are perfectly linearly separable from attention features. Static features alone give AUC=1.000, dynamic features alone give AUC=1.000. Even 5 features per-fold selected by univariate t-test give AUC=1.000. Top-30 differentiating features all live in the **vision tower**, not the language model.
+
+**Interpretation — the confound.** Perfect separation is suspicious. Three systematic differences between suites confound the result:
+1. **Prompt grammar.** Object: "pick up X and place it in Y" (~10 tokens). Long: "put both X and Y in Z" (~15 tokens, conjunction structure). Language-model attention fingerprints grammatical shape.
+2. **Scene visual complexity.** Long tasks show more objects. Vision tower attention on cluttered scenes differs from single-object scenes. Top features in vision_tower layer 0 are consistent with this.
+3. **Rollout length.** Object averages 30 VLM calls, Long averages 53. Dynamic features computed over longer time series have different statistical properties by construction.
+
+All three are correlated with "Long is harder" but none is the **quantization-relevant** signal we care about. AUC=1.0 proved attention classifies tasks cleanly — it did **not** prove attention identifies a difficulty-for-quantization signal.
+
+**Runtime.** ~13 min on H100 for all 50 rollouts.
+
+---
+
+## Experiment 6 — Attention features vs per-rollout quantization sensitivity (the payoff test, part 1)
+
+**Question.** Do the same 1350 FP16 attention features that gave AUC=1.0 actually predict which rollouts will be *quantization-sensitive*? This is the test that matters for the adaptive-precision-controller hypothesis. Exp5 answered "does attention fingerprint suite"; exp6 asks "does attention fingerprint quant-sensitivity."
+
+**Method.**
+- Reuse exp5's 50 FP16 rollouts (matched by task × seed × episode_idx for determinism).
+- For each rollout, re-run under a quantization config and record outcome (success, step count, `steps_delta = quant_steps - fp16_steps`, `broke_by_quant`).
+- Two configs:
+  - `w4_both` — W4 on both VLM and expert (QuantVLA-mild setup)
+  - `w2_vlm_protect` — W2 on VLM with layer 0 + vision_tower kept at FP16 per exp2's protection recommendation (aggressive)
+- Regress FP16 attention features from exp5 against `steps_delta` with Ridge + LOTP CV. Also: binary `broke_by_quant` classifier.
+
+**Outcome variance:**
+
+| config | FP16 succ | quant succ | broken | Δsteps mean ± std | range |
+|---|---|---|---|---|---|
+| w4_both | 49/50 | 50/50 | 0 (0.0%) | −4.1 ± 55.9 | [−310, +170] |
+| w2_vlm_protect | 49/50 | **0/50** | 49 (98.0%) | +199.9 ± 77.6 | [0, +313] |
+
+w4_both was too mild (nobody broke). w2_vlm_protect was too aggressive (everybody maxed out at `max_steps` — outcomes became deterministic per suite). Neither gave the ideal "some rollouts break, others don't" heterogeneity for binary classification.
+
+**Initial verdict (later walked back):**
+
+| config | R² on steps_delta (LOTP) | AUC on broke_by_quant (LOTP) |
+|---|---|---|
+| w4_both | −1.632 ± 1.873 | n/a (0 broken) |
+| w2_vlm_protect | +0.324 ± 0.439 | n/a (1 unbroken) |
+
+Suite-only baseline under w2_vlm_protect: R² = +0.665. Attention's best: +0.450. Read naively, the 1-feature suite classifier beats the 1350-feature attention regression, and within-suite R² was strongly negative (−0.92 to −6.89). I reported "hypothesis falsified."
+
+### Exp6 diagnostics — the walked-back verdict
+
+After methodological critique (n=50 vs 1350 features is a regime where bootstrap CIs on R² are ~±0.3 wide; point estimate gaps may not be significant), I reran with proper diagnostics:
+
+**Bootstrap 95% CIs on R² (500 resamples):**
+
+| config | model | point R² | 95% CI |
+|---|---|---|---|
+| w2_vlm_protect | suite (1 feat) | +0.663 | [+0.128, +0.855] |
+| w2_vlm_protect | ridge α=1000 (1350 feat) | +0.450 | [**−0.150, +0.717**] |
+| w2_vlm_protect | random forest (d=4) | +0.616 | point only |
+| w2_vlm_protect | gradient boost (d=3) | +0.610 | point only |
+| w4_both | suite | −0.359 | [−9.04, −0.28] |
+| w4_both | ridge α=1000 | −0.478 | [−13.98, −0.56] |
+
+**The CIs overlap heavily.** The "suite beats attention" conclusion is not statistically robust at n=50. RF and GB also match suite-baseline roughly, so nonlinearity doesn't rescue the ridge regression either.
+
+**Spearman + Bonferroni (more sensitive to weak monotonic signal):**
+- `w2_vlm_protect`: **169 of 1315** features survive Bonferroni correction at p<0.05. Top feature |ρ|=0.79, Bonferroni-p ≈ 1e-8. Strong nonlinear/monotonic signal that ridge couldn't convert to incremental R² over a 1-feature suite classifier.
+- `w4_both`: 0 of 1315 survive Bonferroni. Under mild quantization, there's barely any per-rollout variance to predict.
+
+**Revised interpretation.** At n=50 with a coarse rollout-level target, we can neither confirm nor reject the hypothesis with the precision needed. Point estimates favor "suite beats attention" but CIs don't. The 169 Bonferroni-significant Spearman features say signal exists at the per-feature level but doesn't translate to ridge R² at this scale. The right next move: test at per-frame granularity, where n is ~30× larger and the target is a direct quantity from exp3 (action MSE, not rollout success).
+
+---
+
+## Experiment 7 — Per-frame attention features vs per-frame W4 action MSE (the payoff test, part 2)
+
+**Setup (mentor-motivated correction to exp6's aggregation).** Instead of aggregating attention per rollout and regressing against rollout outcome, regress at the granularity the hypothesis is actually about: a single VLM call.
+
+**Data collection.** For each of the 50 FP16 rollouts:
+1. Roll out under FP16, capturing at every VLM call: `(observation_dict, fp16_action_chunk)`.
+2. Install W4 weights (both VLM and expert).
+3. For each captured observation, call `policy.infer(obs)` to get the W4 action chunk. **This is a single 1-chunk inference per captured obs — not a re-rollout** — so no trajectory divergence confounds the comparison.
+4. Per-call target: `MSE(FP16_chunk, W4_chunk)` for the same input observation. This is exactly the quantity exp3 measured at a single-frame level, now across ~1900 frames drawn from real LIBERO rollouts.
+
+**Data joined with attention features.** Per-call attention records already in `exp5_per_call.jsonl` (~200K records, 45 layers × ~4200 VLM calls across 50 rollouts × 5 metrics per head). Joined with exp7's W4-MSE output on `(rollout_idx, call_idx)`, head-averaged per layer-metric → **n = 1879 per-frame samples, 225 features per sample**.
+
+**Target distribution:**
+
+| suite | n | mean MSE | std | median | min | max |
+|---|---|---|---|---|---|---|
+| all | 1879 | 9.7e-3 | 3.0e-2 | 5.0e-4 | 3.2e-5 | 4.0e-1 |
+| Object | 664 | 8.4e-3 | 2.4e-2 | 4.8e-4 | 4.3e-5 | 1.7e-1 |
+| Long | 1215 | 1.0e-2 | 3.4e-2 | 5.2e-4 | 3.2e-5 | 4.0e-1 |
+
+Important: Object and Long mean MSEs differ by only ~25%, well within std. **Suite confound is almost absent at per-frame granularity**, unlike exp6 where it dominated.
+
+**LOTP CV R² (25 folds):**
+
+| model | R² (mean ± std) | 95% CI |
+|---|---|---|
+| suite label (1 feat) | **+0.000 ± 0.001** | — |
+| ridge α=100 (225 feat) | +0.006 ± 0.039 | — |
+| ridge α=1000 (225 feat) | **+0.032 ± 0.025** | [−0.017, +0.052] |
+| random forest (d=6) | −0.286 ± 0.630 | overfits catastrophically |
+
+**Within-suite R²:**
+
+| suite | n | y std | ridge α=1000 | RF |
+|---|---|---|---|---|
+| Object | 664 | 2.4e-2 | **+0.125 ± 0.074** | −0.042 |
+| Long | 1215 | 3.4e-2 | +0.007 ± 0.019 | −0.227 |
+
+**Spearman per feature (Bonferroni-corrected over 90 effective features):**
+- **32 of 90 features survive Bonferroni correction at p<0.05.**
+- Strongest: `language_model.layers.8.self_attn` with |ρ|=0.165, Bonferroni-p ≈ 5.6e-11.
+- All top-15 features are in **`language_model` decoder layers** (layers 2, 3, 8, 9, 11, 13, 15, 17). Not vision_tower — a different locus than exp5's suite-classification signal.
+
+### Interpretation
+
+**What's real.** There IS a statistically robust per-frame correlation between attention features and W4 action MSE. 32 features survive Bonferroni at p<0.05; the strongest Bonferroni-p ≈ 5e-11. The suite-label baseline gives R²=0.000 at per-frame granularity, so this signal is NOT the exp5 suite-identity confound reappearing.
+
+**What's also real.** The effect is **weak**. Best aggregate R² = 0.032 across suites, 0.125 within Object, 0.007 within Long. Linear ridge with strong regularization wins; random forest overfits catastrophically. The within-Long R² is near zero — the signal shows up under Object but not Long.
+
+**Two distinct attention signals in two parts of the VLM.** This was not obvious going in:
+- `vision_tower` attention → **suite-level scene fingerprinting** (exp5's AUC=1.0 classification confound).
+- `language_model` attention → **per-frame W4 sensitivity** (exp7's weak-but-real regression signal).
+
+These are not the same thing and carrying them through to the paper requires care.
+
+---
+
+## Revised synthesis
+
+1. **Architectural bottleneck (exp2 W2).** Of 42 layer groups, VLM block 0 + SigLIP vision tower dominate W2 sensitivity by ~50–70×. "Protect two, compress forty" — clean static spatial precision map. **Unchanged.**
+
+2. **Temporal bottleneck (exp3).** Expert's 10-step Euler loop is wildly asymmetric: step 9 is ~75× more sensitive than step 0. W4 first 9 steps → ~84% of memory benefit at ~16% of quality cost. Static step-wise schedule; no runtime controller needed. **Unchanged, and still the strongest novel finding vs QuantVLA's uniform-bitwidth baseline.**
+
+3. **Horizon-differential, localized (exp2 + exp3).** Long tasks are ~20% more sensitive to quantization than Object tasks at step 9. Spatially and temporally co-localized with where precision matters. **Unchanged, modest effect.**
+
+4. **Attention-as-controller hypothesis — nuanced result (exp5 + exp6 + exp7).**
+   - Exp5: AUC=1.0 classifying Object vs Long from FP16 attention features — but confounded by prompt grammar + scene complexity + rollout length, all mediated through vision_tower attention.
+   - Exp6: Regression from per-rollout attention to per-rollout quant-sensitivity is ambiguous at n=50 — point estimates favor suite-baseline but bootstrap CIs overlap; Spearman finds 169 Bonferroni-significant features under w2_vlm_protect.
+   - Exp7: At per-frame granularity (n=1879, direct action-MSE target), 32 language_model attention features survive Bonferroni at p<0.05 with R²=0.125 within-Object. **Signal is real but quantitatively too weak to motivate an adaptive-precision controller as a headline contribution.**
+   - Distinct signals localize to distinct VLM components: vision_tower → task-identity, language_model → per-frame quant-sensitivity.
+
+### What we do NOT have
+
+- **Rollout-level task success under a deployable quantization schedule.** We have FP16 baselines (18/18 at 100% from exp0) and destructive-aggressive baselines (w2_vlm_protect: 0/50 at exp6). The clean Phase-3 experiment — does the exp3 schedule ("W4 expert steps 0-8, FP16 step 9" + exp2-protected VLM) maintain rollout success? — is not yet run.
+- **KV cache direct quantization (KVQuant-style).** Not tested. Exp4 was deferred and remains deferred; exp7 shows that the VLM's per-frame attention signal for sensitivity is weak, which indirectly suggests KV-cache precision effects may also be weak for this model, but this wasn't directly measured.
+
+### What the paper should say
+
+Headline contributions remain exp2 (layer-sensitivity map) and exp3 (step-asymmetric expert sensitivity). These are strong, clean, and novel against QuantVLA. The paper should:
+- Lead with "Flow-matching VLAs have step-asymmetric precision requirements 75× concentrated at the final Euler step." Static schedule from exp3 is the deployable artifact.
+- Include exp2's "protect VLM layer 0 + vision tower" as the architectural precision map.
+- Include exp7 as a supplementary section: per-frame attention in language_model decoder layers weakly predicts W4 sensitivity (Bonferroni-significant 32/90 features; R²=0.125 within Object). Effect size is too small to motivate an adaptive controller as the paper's primary claim, but validates the hypothesis space isn't empty and provides a direction for future work with more aggressive quantization.
+- Explicitly distinguish the two attention signals: vision_tower (suite/scene fingerprinting, NOT precision-relevant) vs language_model (weak precision-relevant signal).
+
+### Methodological lessons (for the writeup)
+
+- Per-rollout aggregation can hide per-frame signals. When the hypothesis is frame-level, test at frame-level even if rollout-level metrics are the eventual target.
+- At n=50 with 1350 features, bootstrap CIs on R² are ±0.3 wide. Point-estimate gaps of 0.2 are not significant. Spearman with Bonferroni is the right diagnostic for weak monotonic signals.
+- Random forest and gradient boosting overfit catastrophically at n/p ratios worse than ~10:1 even with regularization. Linear ridge with strong α is the correct baseline.
 
 ---
 
 ## Files of record
 
-- Scripts: `scripts/exp1_activation_stats.py`, `scripts/exp2_layer_sensitivity.py`, `scripts/exp3_flow_step_sensitivity.py`, `scripts/utils.py`.
-- Plots: `plots/exp{1,2,3}_*.png`.
-- Raw per-sample data: `results/exp3_per_step.jsonl`, `results/exp3_cumulative.jsonl` (exp2 JSONLs are on the server at `/data/subha2/experiments/results/`).
-- Run log: `results/exp3_stdout.log`.
-- Reference actions (seeded): `/data/subha2/experiments/results/exp3_reference_actions_seeded.npz` (server-side, ~256 action chunks).
+**Scripts**
+- `scripts/utils.py` — shared model loading, quantization (`fake_quantize_module`, `precompute_quantized_weights`, `swap_weights`), JSONL/NPZ I/O, logging. Added `MUJOCO_GL=egl` env default for headless rendering.
+- `scripts/rollout.py` — LIBERO closed-loop rollout harness with obs/action callbacks. Monkey-patches `torch.load` for LIBERO's legacy pickles.
+- `scripts/setup_libero.sh`, `scripts/run_phase0.sh` — idempotent server setup + Phase 0 orchestrator (env → LIBERO install → smoke tests → full run).
+- `scripts/exp0_rollout_reproduce.py` — 18-rollout FP16 reproduction.
+- `scripts/exp1_activation_stats.py`, `scripts/exp2_layer_sensitivity.py`, `scripts/exp3_flow_step_sensitivity.py` — original static-obs experiments.
+- `scripts/exp5_trajectory_attention.py` — 50-rollout attention capture, aggregation, classifier.
+- `scripts/exp5_reanalyze.py` — LOTP CV re-analysis to control for task-identity leakage.
+- `scripts/exp6_attention_predicts_quant.py` — re-run 50 rollouts under quantization configs, record outcome deltas, regress.
+- `scripts/exp6_diagnostics.py` — bootstrap CIs, Spearman + Bonferroni, RF/GB point estimates.
+- `scripts/exp7_per_frame_sensitivity.py` — capture per-call (obs, FP16_chunk) during rollout, replay each obs under W4, compute per-call MSE.
+- `scripts/exp7_analyze.py` — per-frame regression: suite-baseline vs ridge vs RF, bootstrap CI, within-suite, Spearman + Bonferroni.
+
+**Results on the server (`/data/subha2/experiments/results/`)**
+- `exp0_rollouts.jsonl` — FP16 reproduction baseline.
+- `exp3_per_step.jsonl`, `exp3_cumulative.jsonl` — step-wise expert sensitivity.
+- `exp5_per_call.jsonl` (200K records), `exp5_rollout_summary.jsonl` (50 rollouts).
+- `exp6_per_rollout.jsonl` (100 rows = 50 rollouts × 2 configs), `exp6_tables.md`, `exp6_reanalysis_tables.md`, `exp6_diagnostics.md`.
+- `exp7_per_frame__w4_both.jsonl` (1984 rows), `exp7_analysis.md`.
+
+**Local**
+- `plots/exp{1,2,3}_*.png` — generated from exp1-3 analysis.
+
+## Timeline
+
+- **2026-04-15 (overnight):** exp1, exp2, broken exp3 (fresh noise bug).
+- **2026-04-16:** redesigned exp3 with seeded noise; findings documented above.
+- **2026-04-20:** Phase 0 (exp0 rollout infra) + Phase 1 (exp5 trajectory attention) + Phase 2 (exp6 attention-vs-quant + reanalysis) + Phase 2b (exp7 per-frame regression). Research direction evolved from "attention-as-online-controller" to "static temporal + spatial schedule with attention as supplementary signal."
