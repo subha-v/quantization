@@ -70,11 +70,30 @@ export PIP_CACHE_DIR="${PIP_CACHE_DIR:-$WORKSPACE/.pip-cache}"
 export MUJOCO_GL="${MUJOCO_GL:-egl}"
 export PYOPENGL_PLATFORM="${PYOPENGL_PLATFORM:-egl}"
 
-# LIBERO's resource path
+# LIBERO's resource path + redirect config off /home (NFS, quota-limited).
+# IMPORTANT: libero/libero/__init__.py calls input() at import time if
+# $LIBERO_CONFIG_PATH/config.yaml is missing, asking whether the user wants
+# a custom dataset folder. When run under uv-run with redirected stdin this
+# blocks forever. We pre-create the config to avoid that trap.
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-$WORKSPACE/.libero}"
 export PYTHONPATH="${PYTHONPATH:-}:$OPENPI_DIR/third_party/libero"
 
 mkdir -p "$EXPERIMENT_DIR"/{results,plots} \
-         "$UV_CACHE_DIR" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR"
+         "$UV_CACHE_DIR" "$XDG_DATA_HOME" "$XDG_CACHE_HOME" "$PIP_CACHE_DIR" \
+         "$LIBERO_CONFIG_PATH"
+
+# Pre-create the LIBERO config so its __init__.py never prompts for input.
+if [ ! -f "$LIBERO_CONFIG_PATH/config.yaml" ]; then
+    LIBERO_SRC="$OPENPI_DIR/third_party/libero/libero/libero"
+    cat > "$LIBERO_CONFIG_PATH/config.yaml" << EOF
+benchmark_root: $LIBERO_SRC
+bddl_files: $LIBERO_SRC/bddl_files
+init_states: $LIBERO_SRC/init_files
+datasets: $LIBERO_SRC/datasets
+assets: $LIBERO_SRC/assets
+EOF
+    echo "  wrote LIBERO config to $LIBERO_CONFIG_PATH/config.yaml"
+fi
 
 banner() {
     echo ""

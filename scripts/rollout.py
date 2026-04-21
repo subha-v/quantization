@@ -34,6 +34,20 @@ if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 import utils  # sets MUJOCO_GL, TORCHDYNAMO_DISABLE, paths, logging
 
+# ---------------------------------------------------------------------------
+# PyTorch 2.6 flipped torch.load's weights_only default from False to True.
+# LIBERO stores its task init-states as legacy numpy-pickled .pruned_init
+# files (GLOBAL numpy.core.multiarray._reconstruct) that fail the new safe
+# loader. Since the init files are shipped with LIBERO source (trusted), we
+# restore the pre-2.6 behavior on this file only.
+# ---------------------------------------------------------------------------
+import torch as _torch
+_ORIG_TORCH_LOAD = _torch.load
+def _legacy_torch_load(*args, **kwargs):
+    kwargs.setdefault("weights_only", False)
+    return _ORIG_TORCH_LOAD(*args, **kwargs)
+_torch.load = _legacy_torch_load
+
 
 # ---------------------------------------------------------------------------
 # Suite naming
