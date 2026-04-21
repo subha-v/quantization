@@ -586,6 +586,16 @@ def main():
     utils.log(f"[exp5]   X={X.shape} y={y.shape} "
               f"Easy={int((y==0).sum())} Hard={int((y==1).sum())}")
 
+    # Require at least 5 rollouts per class for 5-fold CV to be meaningful
+    if (y == 0).sum() < 5 or (y == 1).sum() < 5:
+        utils.log("[exp5] Fewer than 5 rollouts per class — skipping classifier "
+                  "(need at least 5 Easy and 5 Hard).")
+        # Still write per-rollout summary + layer stats tables
+        per_layer_stats = per_layer_easy_vs_hard(rollouts_summary) if (y == 0).sum() and (y == 1).sum() else {}
+        tables_path = os.path.join(utils.RESULTS_DIR, "exp5_tables.md")
+        write_tables(rollouts_summary, [], per_layer_stats, tables_path)
+        return 0
+
     # Ablation: static-only (mean) vs dynamics-only (std/max/range/acorr) vs all
     static_mask  = np.array(["||mean" in k for k in feat_keys])
     dynamic_mask = np.array([any(x in k for x in ("||std", "||max", "||range", "||acorr1")) for k in feat_keys])

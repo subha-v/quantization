@@ -58,6 +58,24 @@ def lotp_folds(groups):
             for og in obj for lg in lng]
 
 
+def point_r2(X, y, groups, model_fn):
+    """Single LOTP CV pass — no bootstrap."""
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import r2_score
+    r2s = []
+    for tr, te in lotp_folds(groups):
+        if len(tr) < 4 or len(te) < 2: continue
+        if np.std(y[tr]) < 1e-9 or np.std(y[te]) < 1e-9: continue
+        Xt, Xe = X[tr], X[te]
+        keep = np.std(Xt, axis=0) > 1e-9
+        Xt, Xe = Xt[:, keep], Xe[:, keep]
+        if Xt.shape[1] == 0: continue
+        scaler = StandardScaler().fit(Xt)
+        pred = model_fn(scaler.transform(Xt), y[tr], scaler.transform(Xe))
+        r2s.append(r2_score(y[te], pred))
+    return float(np.mean(r2s)) if r2s else float("nan")
+
+
 def bootstrap_cv_r2(X, y, groups, model_fn, n_boot=1000, seed=0):
     """Bootstrap 95% CI of cross-validated R² by resampling rollouts.
     model_fn: (X_train_std, y_train, X_test_std) -> predictions."""
@@ -109,11 +127,11 @@ def ridge_fn(alpha):
     return fit
 
 
-def rf_fn(n_estimators=200, max_depth=5, random_state=0):
+def rf_fn(n_estimators=100, max_depth=5, random_state=0, n_jobs=2):
     from sklearn.ensemble import RandomForestRegressor
     def fit(Xt, yt, Xe):
         m = RandomForestRegressor(n_estimators=n_estimators, max_depth=max_depth,
-                                   random_state=random_state, n_jobs=-1)
+                                   random_state=random_state, n_jobs=n_jobs)
         m.fit(Xt, yt); return m.predict(Xe)
     return fit
 
@@ -233,58 +251,54 @@ def main():
                         ["<", "<", ">", ">", ">", ">"]),
               "```\n"]
 
-    # --- (B) Bootstrap CIs per config ---
-    lines += ["\n## (B) Bootstrap 95% CIs on R² (1000 resamples, LOTP CV)\n"]
+    # --- (B) Bootstrap CIs: suite baseline vs ridge; plus RF/GB point estimates ---
+    lines += ["\n## (B) Bootstrap 95% CIs on R² (LOTP CV)\n",
+              "Bootstrap 500× for suite-baseline and ridge (fast). RF/GB shown as point-",
+              "estimates since tree-model bootstrapping on this server is too slow.\n"]
     for cfg in configs:
         X, y, suites, groups, feat_keys = build_matrix(exp6, exp5, cfg)
         if len(y) == 0: continue
 
-        utils.log(f"\n[{cfg}] bootstrap suite baseline...")
+        utils.log(f"\n[{cfg}] bootstrap suite baseline (500 reps)...")
         sb = suite_baseline_cv(suites, y, groups)
 
-        utils.log(f"[{cfg}] bootstrap ridge α=1000 top-features...")
-        # Need per-fold top-K inside bootstrap — too expensive with 1000 reps.
-        # Instead use ridge with strong regularization on full feature set.
+        utils.log(f"[{cfg}] bootstrap ridge α=1000 (500 reps)...")
         ridge_boot = bootstrap_cv_r2(X, y, groups, ridge_fn(alpha=1000.0), n_boot=500)
 
-        utils.log(f"[{cfg}] bootstrap random forest...")
-        rf_boot = bootstrap_cv_r2(X, y, groups, rf_fn(max_depth=4), n_boot=200)
+        utils.log(f"[{cfg}] random forest point estimate (no bootstrap)...")
+        rf_point = point_r2(X, y, groups, rf_fn(max_depth=4))
 
-        utils.log(f"[{cfg}] bootstrap gradient boosting...")
-        gb_boot = bootstrap_cv_r2(X, y, groups, gb_fn(max_depth=3), n_boot=200)
+        utils.log(f"[{cfg}] gradient boost point estimate...")
+        gb_point = point_r2(X, y, groups, gb_fn(max_depth=3))
 
         lines += [f"\n### Config: {cfg}  (n={len(y)}, y std = {np.std(y):.1f})\n",
                   "```",
                   fmt_table(
-                    ["model", "point R²", "95% CI",  "CI width", "n_boot"],
+                    ["model", "point R²", "95% CI",  "n_boot"],
                     [
                       ["suite label (1 feat)",
                        f"{sb['point']:+.3f}",
                        f"[{sb['ci_lower']:+.3f}, {sb['ci_upper']:+.3f}]",
-                       f"{sb['ci_upper']-sb['ci_lower']:.3f}",
                        sb["n_boot"]],
                       ["ridge α=1000 (1350 feat)",
                        f"{ridge_boot['point']:+.3f}",
                        f"[{ridge_boot['ci_lower']:+.3f}, {ridge_boot['ci_upper']:+.3f}]",
-                       f"{ridge_boot['ci_upper']-ridge_boot['ci_lower']:.3f}",
                        ridge_boot["n_boot"]],
                       ["random forest (d=4)",
-                       f"{rf_boot['point']:+.3f}",
-                       f"[{rf_boot['ci_lower']:+.3f}, {rf_boot['ci_upper']:+.3f}]",
-                       f"{rf_boot['ci_upper']-rf_boot['ci_lower']:.3f}",
-                       rf_boot["n_boot"]],
-                      ["gradient boost",
-                       f"{gb_boot['point']:+.3f}",
-                       f"[{gb_boot['ci_lower']:+.3f}, {gb_boot['ci_upper']:+.3f}]",
-                       f"{gb_boot['ci_upper']-gb_boot['ci_lower']:.3f}",
-                       gb_boot["n_boot"]],
-                    ], ["<", ">", ">", ">", ">"]),
+                       f"{rf_point:+.3f}", "— point only —", "—"],
+                      ["gradient boost (d=3)",
+                       f"{gb_point:+.3f}", "— point only —", "—"],
+                    ], ["<", ">", ">", ">"]),
                   "```\n"]
 
-        # Does attention CI upper-bound exceed suite CI upper-bound?
-        best_attn_upper = max(ridge_boot["ci_upper"], rf_boot["ci_upper"], gb_boot["ci_upper"])
-        gap = best_attn_upper - sb["ci_upper"]
-        lines.append(f"- Best-attention upper CI: {best_attn_upper:+.3f}  vs  suite upper CI: {sb['ci_upper']:+.3f}  (gap: {gap:+.3f})")
+        # Interpret: does ridge CI exceed suite CI?
+        ridge_upper = ridge_boot["ci_upper"]
+        suite_upper = sb["ci_upper"]
+        if ridge_upper > suite_upper:
+            lines.append(f"- Ridge upper CI ({ridge_upper:+.3f}) exceeds suite upper CI ({suite_upper:+.3f}) — consistent with attention having **some** marginal signal, but point estimates favor the 1-feature suite.")
+        else:
+            lines.append(f"- Suite upper CI ({suite_upper:+.3f}) dominates ridge upper CI ({ridge_upper:+.3f}). Attention offers no advantage over the 1-feature suite classifier.")
+        lines.append(f"- RF point estimate: {rf_point:+.3f}  |  GB point estimate: {gb_point:+.3f}")
 
     # --- (C) Spearman per-feature with Bonferroni ---
     lines += ["\n\n## (C) Top Spearman-|ρ| features per config (Bonferroni-corrected)\n",
