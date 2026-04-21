@@ -23,13 +23,38 @@ Studying how weight quantization of the VLM backbone in flow-matching VLAs (pi0,
 ├── papers/                   — Reference papers (QVLA, BlockDialect, KVQuant, etc.)
 └── scripts/                  — Overnight experiment scripts for H100
     ├── setup_env.sh          — GCP environment setup (clone openpi, install deps, convert checkpoint)
-    ├── utils.py              — Shared utilities (model loading, data, quantization, hooks, I/O)
+    ├── setup_libero.sh       — LIBERO install helper (third_party/libero → openpi venv)
+    ├── run_phase0.sh         — One-shot Phase 0 orchestrator (sync + install + smokes + full run)
+    ├── utils.py              — Shared utilities (model loading, data, quantization, hooks, I/O, MUJOCO_GL)
+    ├── rollout.py            — LIBERO closed-loop rollout harness (in-process, callback seams)
     ├── setup_and_verify.py   — Go/no-go verification gate
+    ├── exp0_rollout_reproduce.py — FP16 pi0.5 LIBERO reproduction check (18 rollouts)
     ├── exp1_activation_stats.py  — Cross-suite activation statistics
     ├── exp2_layer_sensitivity.py — Per-layer sensitivity probe with per-sample metadata
     ├── exp3_flow_step_sensitivity.py — Per-denoising-step sensitivity (novel)
     └── run_all.py            — Orchestrator for overnight runs
 ```
+
+## Phase 0 — LIBERO Rollout Infrastructure (2026-04-20)
+
+Pivoted from single-frame attention analysis to **trajectory-level** attention dynamics, which requires closed-loop rollouts. Phase 0 builds that infrastructure and validates it reproduces pi0.5's published LIBERO success rates on a subset.
+
+New pieces:
+- `scripts/rollout.py` — in-process LIBERO rollout harness with callback seams for Phase 1's attention hooks. Lifted from openpi's `examples/libero/main.py` but restructured so quantization/attention experiments can monkey-patch the model in the same process.
+- `scripts/exp0_rollout_reproduce.py` — 18-rollout FP16 reproduction check (3 tasks × 3 seeds × {Object, Long}). Emits a 4-table markdown summary (`results/exp0_rollout_tables.md`) with per-rollout detail, per-task success, per-suite vs QuantVLA-published, and error diagnostics.
+- `scripts/setup_libero.sh` — idempotent LIBERO installer for the openpi venv.
+- `scripts/run_phase0.sh` — single orchestrator: syncs scripts from the repo to `$EXPERIMENT_DIR`, installs LIBERO, runs both smoke tests (headless render + 1 rollout end-to-end), then the full 18-rollout sweep. EGL → osmesa → glx fallback for MuJoCo rendering.
+- `scripts/utils.py` — added `MUJOCO_GL=egl` env default alongside the existing `TORCHDYNAMO_DISABLE` block.
+
+### Running Phase 0
+```bash
+# On tambe-server-1, after git pull:
+cd /data/subha2/quantization
+tmux new -s phase0
+bash scripts/run_phase0.sh
+```
+
+Phase 1 (trajectory attention analysis) is planned conditional on Phase 0 passing.
 
 ## Overnight Experiments (2026-04-15)
 
