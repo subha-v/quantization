@@ -419,3 +419,110 @@ Headline contributions remain exp2 (layer-sensitivity map) and exp3 (step-asymme
 - **2026-04-15 (overnight):** exp1, exp2, broken exp3 (fresh noise bug).
 - **2026-04-16:** redesigned exp3 with seeded noise; findings documented above.
 - **2026-04-20:** Phase 0 (exp0 rollout infra) + Phase 1 (exp5 trajectory attention) + Phase 2 (exp6 attention-vs-quant + reanalysis) + Phase 2b (exp7 per-frame regression). Research direction evolved from "attention-as-online-controller" to "static temporal + spatial schedule with attention as supplementary signal."
+- **2026-04-21:** Three follow-ups (D1/D2/D3) after mentor critique that the exp7 null verdict was overconfident at n=50 with coarse target. D1 hit big (W2 raises within-Object R² to 0.333), D2 localized signal to language_model layer 12 head 2, D3 was falsified (decoupling hurt not helped). Attention story strengthens from "weak supplementary" to "quant-aggressiveness-specific predictor of per-frame sensitivity."
+
+---
+
+## Experiments 8a + 8b — D1/D2/D3 follow-ups to exp7 (2026-04-21)
+
+Three independent follow-ups to exp7 after a methodological critique that "attention dead" was an overconfident read of a coarse per-rollout regression at n=50. Each tested a different alternative explanation for exp7's weak R²=0.032.
+
+### Context
+
+Exp7 measured per-frame W4 action MSE across 1984 frames drawn from 50 LIBERO rollouts, regressed against per-call FP16 attention features head-averaged by layer. Got within-Object R²=0.125, with 32 of 90 features Bonferroni-significant at p<0.05, localized to `language_model` decoder layers. Honest read was "real but weak signal." Three follow-ups:
+
+- **D1 — Stronger quantization.** Exp7 used W4 on VLM+expert (mild). Under W2 with exp2-protection the target variance should spread out and any genuine signal should rise.
+- **D2 — Per-head deep dive.** Exp7 head-averaged, collapsing ~8 heads into 1 per layer. If the signal lives in specific heads, averaging diluted it. Compute Spearman at per-(layer, head, metric) granularity.
+- **D3 — Decoupled target.** Exp7's W4 MSE target mixed VLM-side error with expert-side error. VLM attention can only plausibly predict VLM-side sensitivity. Isolate via `w4_vlm` (VLM-only) vs `w4_expert` (expert-only) configs.
+
+All three use the exp7 fixture unchanged: same 50 rollouts, same attention-feature extraction from `exp5_per_call.jsonl`, just different per-frame MSE targets and finer feature granularity. New scripts: `exp8_compare_configs.py` (cross-config R² table + per-frame MSE correlations), `exp8_per_head_analysis.py` (per-(layer, head, metric) Spearman with Bonferroni over ~2800 tests).
+
+### Cross-config comparison (exp8a)
+
+| config | n | y_std | suite R² | ridge R² | within-Obj R² | within-Long R² | n_sig / 90 |
+|---|---|---|---|---|---|---|---|
+| w4_both (exp7 baseline) | 1879 | 3.05e-2 | +0.000 | +0.032 | **+0.125** | +0.007 | 32 |
+| w4_vlm (D3 run 1) | 1896 | 3.46e-2 | −0.026 | −0.017 | **−0.207** | −0.087 | 37 |
+| w4_expert (D3 run 2) | 1910 | 3.52e-2 | −0.013 | −0.026 | **−0.183** | −0.089 | 35 |
+| **w2_vlm_protect (D1)** | 1901 | **2.01e-1** | −0.020 | **+0.111** | **+0.333** | −0.062 | 37 |
+
+**Per-frame MSE correlations (Spearman) between configs:**
+
+| A × B | Spearman ρ | interpretation |
+|---|---|---|
+| w4_both × w4_vlm | +0.331 | moderate: joint target partly driven by VLM error |
+| w4_both × w4_expert | +0.253 | moderate: joint target partly driven by expert error |
+| w4_vlm × w4_expert | +0.247 | moderate: some frames hard under both (shared difficulty) |
+| w4_both × w2_vlm_protect | **+0.046** | **near-zero: W4 and W2 sensitivity patterns are essentially unrelated** |
+| w4_vlm × w2_vlm_protect | +0.043 | near-zero |
+| w4_expert × w2_vlm_protect | +0.059 | near-zero |
+
+### D1 verdict — HIT, large effect
+
+Under W2-with-protection, within-Object R² jumps from 0.125 to **0.333** — a 2.7× gain. Target variance increased 6.6× (y_std 3.0e-2 → 2.0e-1), and attention features converted the extra spread into genuine predictive power. Random forest (0.158 overall) now beats ridge (0.111) — nonlinear structure is relevant at this scale. The w4_both signal was real but noise-limited; the W2 signal clears the threshold for meaningful prediction.
+
+**Critical detail:** w2_vlm_protect sensitivity is **uncorrelated** (Spearman ~0.05) with any W4 config's sensitivity. It's not measuring "generic frame difficulty" — it's specifically measuring which frames break under aggressive quantization. The top Spearman features also shifted to earlier layers (1, 3, 4, 5, 12) versus W4's (8, 11, 15, 17). Different signal, not just a louder version of the same signal.
+
+### D2 verdict — HIT, mechanistically localized
+
+Per-head analysis on w2_vlm_protect data: **225 of 2754** (layer, head, metric) triples survive Bonferroni correction at p<0.05. The strongest single feature is `language_model.layers.12.self_attn` head 2, entropy — Spearman ρ = −0.294, Bonferroni-p = 6.9e-36. Same (layer, head) appears in top 3 features across three different metrics (entropy, top5, sparsity), confirming a specific computational unit rather than a metric-wide pattern.
+
+**Top-5 per-head features:**
+
+| rank | layer | head | metric | ρ | mean(top-MSE-decile) | mean(bot-MSE-decile) |
+|---|---|---|---|---|---|---|
+| 1 | language_model.layers.12 | 2 | entropy | −0.294 | 4.58 | 4.76 |
+| 2 | language_model.layers.12 | 2 | top5 | +0.294 | 0.363 | 0.322 |
+| 3 | language_model.layers.12 | 2 | sparsity | +0.284 | 0.522 | 0.516 |
+| 4 | language_model.layers.9 | 2 | top5 | +0.277 | 0.416 | 0.402 |
+| 5 | language_model.layers.9 | 2 | entropy | −0.268 | 4.32 | 4.39 |
+
+**Concrete mechanistic claim:** when `language_model.layers.12.self_attn` head 2 shows lower entropy (more concentrated attention distribution on fewer tokens), the frame is more sensitive to W2 quantization. Higher top-5 mass (attention concentrated on few positions) correlates positively with sensitivity. This is the first mechanistically specific claim linking attention pattern to quant sensitivity in a VLA.
+
+**Pattern breakdown across all 225 Bonferroni-significant features:**
+- **By component:** 225/225 (100%) in `language_model`, 0/225 in `vision_tower`. Reconfirms the two-signals-in-two-parts finding from exp7.
+- **By metric:** entropy (55, 24%), top5 (51, 23%), top1 (47, 21%), sparsity (42, 19%), sink (30, 13%). Well-distributed across all five metrics.
+- **By head:** head 7 (38), head 4 (33), head 2 (30), head 6 (28), head 3 (27), head 5 (26). Distributed across all 8 heads with slight concentration in head 7.
+- **By layer:** layer 15 (23), layers 1/3/4 (18 each), layer 5 (17), layer 12 (16). **Spans the full decoder depth (layers 1 to 17)**, not just late layers.
+
+**Per-suite split:** the signal is stronger in Object than Long. E.g., top feature (layer 12 head 2 entropy) has Object-ρ = −0.38 vs Long-ρ = −0.23. Layer 17 head 4 top1: Object −0.42 vs Long −0.14. The Within-Long regression R² stays negative across all configs — Long rollouts have their per-frame sensitivity poorly predicted from FP16 attention even under W2. Plausible reason: Long rollouts visit a wider range of sim states as sub-goals change, so attention-pattern-vs-sensitivity gets weaker.
+
+### D3 verdict — FALSIFIED
+
+Target decoupling HURT, not helped. Within-Object R² for VLM-only target was −0.207 (vs w4_both +0.125 — a 0.33 R² loss). Expert-only target gave similar −0.183. Top features under both decoupled configs were the SAME `language_model` layers (8, 11, 15, 17) that appeared under w4_both, with nearly identical rank order and ρ magnitudes.
+
+**Implication:** the w4_both signal wasn't "attention predicting VLM-side error that got masked by expert noise." Attention features correlate with expert-side and VLM-side MSE approximately equally — so they're tracking a shared frame-level property ("which frames are more sensitive to any W4 perturbation"), not a mechanism-specific signal. The joint (w4_both) target was *easier* to predict than either single-source target because combining two noisy sources smooths per-frame stochasticity, making the shared difficulty signal more visible.
+
+This rules out a particular kind of adaptive controller: you cannot use VLM attention to decide "spend precision on VLM here vs expert here" — the same features flag both kinds of sensitivity. You can only use it as a frame-level gate for overall precision allocation.
+
+### Revised synthesis
+
+Updated the exp5 + exp6 + exp7 section of this document: the "attention as controller" hypothesis is no longer "too weak to matter" but **quant-aggressiveness-specific**. Restated:
+
+1. **Under mild quantization (W4)**, attention features carry a shared per-frame difficulty signal with modest multivariate R² (0.125 within-Object). Individual features are weakly correlated with target (|ρ| ≤ 0.17). Not enough for an adaptive controller.
+
+2. **Under aggressive quantization (W2 with exp2-protection)**, attention predicts per-frame sensitivity with within-Object R² = 0.333. Signal is mechanistically localized to specific `language_model` (layer, head) combinations — notably layer 12 head 2. Nonlinear interactions are real (RF > Ridge). Bonferroni-significant correlations jump to 225/2754 per-head features from 32/90 head-averaged features.
+
+3. **The W4 and W2 sensitivity patterns are uncorrelated** (cross-config Spearman ~0.05). Attention isn't tracking a universal "difficulty" property; it's tracking config-specific sensitivity. Different heads predict different precisions.
+
+4. **D3 is falsified.** Attention features predict VLM-side and expert-side MSE equally (|ρ| ~0.18-0.20 for both), so they're not mechanism-specific. They flag frames that are broadly sensitive.
+
+**Paper implications:**
+- Headline stays on exp2 + exp3 — the static temporal schedule is still the deployable, clean contribution against QuantVLA's uniform bitwidth.
+- Exp7 + D1/D2/D3 become a stronger supplementary section: "aggressive-quantization sensitivity is per-frame predictable from specific language-model attention heads; signal requires ≥W2 to clear noise." This is a mechanistic finding with a concrete predictor, not just a statistical note.
+- Open direction: build an adaptive precision controller that uses attention features to drop selected frames to higher precision when running the W2 schedule. Unclear if the R²=0.33 is high enough for deployable gating — would require rollout-level validation (Phase 3).
+
+### Files of record
+
+**New scripts (2026-04-21):**
+- `scripts/exp8_compare_configs.py` — cross-config R² table + per-frame MSE correlation matrix
+- `scripts/exp8_per_head_analysis.py` — per-(layer, head, metric) Spearman with Bonferroni + high/low-decile distributional comparison
+- `scripts/exp7_analyze.py` — patched so output includes config suffix (`exp7_analysis__{config}.md`)
+
+**New data (server):**
+- `results/exp7_per_frame__w4_vlm.jsonl` (1896 per-frame records, VLM-only target)
+- `results/exp7_per_frame__w4_expert.jsonl` (1910 records, expert-only target)
+- `results/exp7_per_frame__w2_vlm_protect.jsonl` (1901 records, W2 target)
+- `results/exp7_analysis__{w4_both,w4_vlm,w4_expert,w2_vlm_protect}.md`
+- `results/exp8_compare_configs.md` — unified cross-config comparison
+- `results/exp8_per_head__w2_vlm_protect.md` — per-head deep dive on winning config

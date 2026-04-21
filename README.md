@@ -80,7 +80,17 @@ Two distinct attention signals in two parts of the VLM:
 - `vision_tower` → suite/scene fingerprinting (exp5 AUC=1.0 confound)
 - `language_model` → per-frame W4 sensitivity (weak but statistically robust)
 
-Paper headline remains exp2 (layer-sensitivity) + exp3 (step-asymmetric expert) as the strong, clean findings; exp7 is a supplementary section.
+## Phase 2 follow-ups D1/D2/D3 (2026-04-21)
+
+After a methodological critique that exp7's "null" verdict was overconfident, ran three follow-ups:
+
+- **D1 — Stronger quantization (w2_vlm_protect): HIT.** Within-Object R² jumped from 0.125 (W4) to **0.333** (W2 with layer 0 + vision tower protected). Peak Spearman |ρ| rose from 0.17 to 0.29 (Bonferroni-p = 6.9e-36). Random forest now beats ridge — nonlinear structure matters at W2.
+- **D2 — Per-head deep dive: HIT.** 225 of 2754 per-(layer, head, metric) features survive Bonferroni. Strongest signal: `language_model.layers.12.self_attn` head 2, where lower entropy (more concentrated attention) predicts higher W2 sensitivity. Same head appears in top 3 features across three metrics (entropy, top5, sparsity).
+- **D3 — Decouple VLM vs expert target: FALSIFIED.** Decoupling hurt, not helped. VLM-only R² and expert-only R² are both strongly negative; attention features correlate with VLM-side and expert-side error equally (|ρ| ~0.18–0.20 for both), meaning they track a shared frame-level property, not a mechanism-specific signal.
+
+**Revised story:** attention features **do** predict per-frame quantization sensitivity, but only clearly under aggressive quantization (W2+). Under mild W4 the signal is noise-limited. The W4 and W2 sensitivity patterns are uncorrelated (cross-config Spearman ~0.05), so attention isn't tracking universal difficulty — it's tracking config-specific sensitivity.
+
+Paper headline remains exp2 (layer-sensitivity) + exp3 (step-asymmetric expert); exp7+D1/D2/D3 becomes a stronger supplementary section with a concrete mechanistic predictor (layer 12 head 2) rather than just a statistical note.
 
 Full write-up with tables in `EXPERIMENT_FINDINGS.md`.
 
