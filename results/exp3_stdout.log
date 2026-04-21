@@ -1,0 +1,413 @@
+============================================================
+EXPERIMENT 3: Flow-Step Sensitivity (deterministic, redesigned)
+============================================================
+[load_policy] config=pi05_libero
+[checkpoint] Found PyTorch: /data/subha2/pi05_libero_pytorch
+[load_policy] checkpoint_dir=/data/subha2/pi05_libero_pytorch
+[load_policy] policy type: Policy
+[load_policy] model at ._model: PI0Pytorch
+[timer] Model loading: 60.2s
+[exp3] Device: cuda:0
+[data] 40 task prompts loaded from /data/subha2/libero_raw/meta/tasks.jsonl
+[data] Found 1089 parquet files in /data/subha2/libero_raw/data
+[data] Long: 379 episodes, Object: 282 episodes
+[data] Sampling 128 hard (Long) + 128 easy (Object)...
+[data] Done. 256 observations with real images (128 Long + 128 Object).
+[timer] Data loading: 2.8s
+[exp3] Action shape: (10, 32)
+[exp3] Pre-generating 256 seeded noise tensors...
+  seed range: [1000, 1255]
+[exp3] Computing FP16 reference with SEEDED noise (256 obs)...
+  ref 0/256
+  ref 50/256
+  ref 100/256
+  ref 150/256
+  ref 200/256
+  ref 250/256
+  Reference took 56.0s
+[exp3] Action expert: paligemma_with_expert.gemma_expert  (GemmaForCausalLM, 164 linears)
+[exp3] Pre-computing W4 weights for action expert...
+  164 linear layers in expert
+[exp3] Validating deterministic step control...
+  all-FP16 vs ref:        MSE ~ 0 (passed)
+  all-W4  vs ref (mean):  MSE = 1.120897e-05
+
+[exp3] Smoke test: timing 1 config x 256 observations...
+  1 config: 55.8s  |  estimated total (32 configs): 0.50h
+
+[exp3] Sweep A: per-step probing (10 configs)...
+    step=0   32/256 ( 12.5%)  elapsed=  7.0s  eta= 49.1s  running-mean=1.4870e-07
+    step=0   64/256 ( 25.0%)  elapsed= 14.2s  eta= 42.5s  running-mean=1.4639e-07
+    step=0   96/256 ( 37.5%)  elapsed= 21.0s  eta= 35.1s  running-mean=1.4763e-07
+    step=0  128/256 ( 50.0%)  elapsed= 28.0s  eta= 28.0s  running-mean=1.5431e-07
+    step=0  160/256 ( 62.5%)  elapsed= 34.8s  eta= 20.9s  running-mean=1.5396e-07
+    step=0  192/256 ( 75.0%)  elapsed= 41.9s  eta= 14.0s  running-mean=1.6192e-07
+    step=0  224/256 ( 87.5%)  elapsed= 49.0s  eta=  7.0s  running-mean=1.6348e-07
+    step=0  256/256 (100.0%)  elapsed= 55.7s  eta=  0.0s  running-mean=1.6167e-07
+  [A] step  0: 55.7s  |  mean=1.6167e-07 std=1.239e-07 min=5.671e-08 max=1.887e-06  easy=1.6902e-07 (n=128) hard=1.5431e-07 (n=128) Δ(h-e)=-1.471e-08
+       running per-step means so far: k=0:1.617e-07
+    step=1   32/256 ( 12.5%)  elapsed=  6.7s  eta= 47.2s  running-mean=1.6053e-07
+    step=1   64/256 ( 25.0%)  elapsed= 13.6s  eta= 40.8s  running-mean=1.4631e-07
+    step=1   96/256 ( 37.5%)  elapsed= 20.6s  eta= 34.4s  running-mean=1.4740e-07
+    step=1  128/256 ( 50.0%)  elapsed= 27.6s  eta= 27.6s  running-mean=1.6392e-07
+    step=1  160/256 ( 62.5%)  elapsed= 34.6s  eta= 20.8s  running-mean=1.6265e-07
+    step=1  192/256 ( 75.0%)  elapsed= 41.4s  eta= 13.8s  running-mean=1.6449e-07
+    step=1  224/256 ( 87.5%)  elapsed= 48.3s  eta=  6.9s  running-mean=1.6738e-07
+    step=1  256/256 (100.0%)  elapsed= 55.4s  eta=  0.0s  running-mean=1.6532e-07
+  [A] step  1: 55.4s  |  mean=1.6532e-07 std=1.379e-07 min=5.024e-08 max=2.008e-06  easy=1.6671e-07 (n=128) hard=1.6392e-07 (n=128) Δ(h-e)=-2.787e-09
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07
+    step=2   32/256 ( 12.5%)  elapsed=  6.8s  eta= 47.4s  running-mean=1.6534e-07
+    step=2   64/256 ( 25.0%)  elapsed= 14.0s  eta= 42.0s  running-mean=1.5580e-07
+    step=2   96/256 ( 37.5%)  elapsed= 20.9s  eta= 34.8s  running-mean=1.5289e-07
+    step=2  128/256 ( 50.0%)  elapsed= 27.9s  eta= 27.9s  running-mean=1.7303e-07
+    step=2  160/256 ( 62.5%)  elapsed= 35.3s  eta= 21.2s  running-mean=1.7255e-07
+    step=2  192/256 ( 75.0%)  elapsed= 42.3s  eta= 14.1s  running-mean=1.7958e-07
+    step=2  224/256 ( 87.5%)  elapsed= 49.2s  eta=  7.0s  running-mean=1.8045e-07
+    step=2  256/256 (100.0%)  elapsed= 56.6s  eta=  0.0s  running-mean=1.7643e-07
+  [A] step  2: 56.6s  |  mean=1.7643e-07 std=1.844e-07 min=4.737e-08 max=2.220e-06  easy=1.7983e-07 (n=128) hard=1.7303e-07 (n=128) Δ(h-e)=-6.804e-09
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07
+    step=3   32/256 ( 12.5%)  elapsed=  7.5s  eta= 52.8s  running-mean=1.4541e-07
+    step=3   64/256 ( 25.0%)  elapsed= 14.7s  eta= 44.2s  running-mean=1.4118e-07
+    step=3   96/256 ( 37.5%)  elapsed= 21.9s  eta= 36.6s  running-mean=1.4846e-07
+    step=3  128/256 ( 50.0%)  elapsed= 28.7s  eta= 28.7s  running-mean=1.6901e-07
+    step=3  160/256 ( 62.5%)  elapsed= 35.7s  eta= 21.4s  running-mean=1.6752e-07
+    step=3  192/256 ( 75.0%)  elapsed= 42.7s  eta= 14.2s  running-mean=1.7353e-07
+    step=3  224/256 ( 87.5%)  elapsed= 49.7s  eta=  7.1s  running-mean=1.7478e-07
+    step=3  256/256 (100.0%)  elapsed= 56.8s  eta=  0.0s  running-mean=1.7294e-07
+  [A] step  3: 56.8s  |  mean=1.7294e-07 std=1.536e-07 min=4.397e-08 max=2.152e-06  easy=1.7688e-07 (n=128) hard=1.6901e-07 (n=128) Δ(h-e)=-7.871e-09
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07, k=3:1.729e-07
+    step=4   32/256 ( 12.5%)  elapsed=  7.1s  eta= 49.5s  running-mean=1.8002e-07
+    step=4   64/256 ( 25.0%)  elapsed= 14.0s  eta= 42.1s  running-mean=1.6569e-07
+    step=4   96/256 ( 37.5%)  elapsed= 20.9s  eta= 34.9s  running-mean=1.7068e-07
+    step=4  128/256 ( 50.0%)  elapsed= 27.8s  eta= 27.8s  running-mean=1.9628e-07
+    step=4  160/256 ( 62.5%)  elapsed= 34.3s  eta= 20.6s  running-mean=1.9087e-07
+    step=4  192/256 ( 75.0%)  elapsed= 41.4s  eta= 13.8s  running-mean=1.9657e-07
+    step=4  224/256 ( 87.5%)  elapsed= 48.1s  eta=  6.9s  running-mean=1.9771e-07
+    step=4  256/256 (100.0%)  elapsed= 55.1s  eta=  0.0s  running-mean=1.9288e-07
+  [A] step  4: 55.1s  |  mean=1.9288e-07 std=2.432e-07 min=4.844e-08 max=3.292e-06  easy=1.8949e-07 (n=128) hard=1.9628e-07 (n=128) Δ(h-e)=+6.791e-09
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07, k=3:1.729e-07, k=4:1.929e-07
+    step=5   32/256 ( 12.5%)  elapsed=  6.8s  eta= 47.7s  running-mean=1.9855e-07
+    step=5   64/256 ( 25.0%)  elapsed= 14.0s  eta= 41.9s  running-mean=1.8698e-07
+    step=5   96/256 ( 37.5%)  elapsed= 20.6s  eta= 34.4s  running-mean=1.9684e-07
+    step=5  128/256 ( 50.0%)  elapsed= 27.5s  eta= 27.5s  running-mean=2.1996e-07
+    step=5  160/256 ( 62.5%)  elapsed= 34.4s  eta= 20.6s  running-mean=2.1175e-07
+    step=5  192/256 ( 75.0%)  elapsed= 41.1s  eta= 13.7s  running-mean=2.1661e-07
+    step=5  224/256 ( 87.5%)  elapsed= 47.9s  eta=  6.8s  running-mean=2.1528e-07
+    step=5  256/256 (100.0%)  elapsed= 54.7s  eta=  0.0s  running-mean=2.0990e-07
+  [A] step  5: 54.7s  |  mean=2.0990e-07 std=2.394e-07 min=6.564e-08 max=3.123e-06  easy=1.9984e-07 (n=128) hard=2.1996e-07 (n=128) Δ(h-e)=+2.012e-08
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07, k=3:1.729e-07, k=4:1.929e-07, k=5:2.099e-07
+    step=6   32/256 ( 12.5%)  elapsed=  6.7s  eta= 46.6s  running-mean=2.4447e-07
+    step=6   64/256 ( 25.0%)  elapsed= 13.3s  eta= 40.0s  running-mean=2.2516e-07
+    step=6   96/256 ( 37.5%)  elapsed= 20.2s  eta= 33.6s  running-mean=2.3892e-07
+    step=6  128/256 ( 50.0%)  elapsed= 26.9s  eta= 26.9s  running-mean=2.4740e-07
+    step=6  160/256 ( 62.5%)  elapsed= 33.8s  eta= 20.3s  running-mean=2.4292e-07
+    step=6  192/256 ( 75.0%)  elapsed= 40.6s  eta= 13.5s  running-mean=2.3904e-07
+    step=6  224/256 ( 87.5%)  elapsed= 47.6s  eta=  6.8s  running-mean=2.3969e-07
+    step=6  256/256 (100.0%)  elapsed= 54.5s  eta=  0.0s  running-mean=2.3633e-07
+  [A] step  6: 54.5s  |  mean=2.3633e-07 std=1.406e-07 min=6.684e-08 max=1.677e-06  easy=2.2526e-07 (n=128) hard=2.4740e-07 (n=128) Δ(h-e)=+2.214e-08
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07, k=3:1.729e-07, k=4:1.929e-07, k=5:2.099e-07, k=6:2.363e-07
+    step=7   32/256 ( 12.5%)  elapsed=  6.7s  eta= 46.9s  running-mean=3.3300e-07
+    step=7   64/256 ( 25.0%)  elapsed= 13.3s  eta= 39.9s  running-mean=3.1142e-07
+    step=7   96/256 ( 37.5%)  elapsed= 19.8s  eta= 33.0s  running-mean=3.4432e-07
+    step=7  128/256 ( 50.0%)  elapsed= 26.4s  eta= 26.4s  running-mean=3.3507e-07
+    step=7  160/256 ( 62.5%)  elapsed= 33.0s  eta= 19.8s  running-mean=3.2268e-07
+    step=7  192/256 ( 75.0%)  elapsed= 39.7s  eta= 13.2s  running-mean=3.1437e-07
+    step=7  224/256 ( 87.5%)  elapsed= 46.9s  eta=  6.7s  running-mean=3.1991e-07
+    step=7  256/256 (100.0%)  elapsed= 54.5s  eta=  0.0s  running-mean=3.1904e-07
+  [A] step  7: 54.5s  |  mean=3.1904e-07 std=1.821e-07 min=8.103e-08 max=1.320e-06  easy=3.0301e-07 (n=128) hard=3.3507e-07 (n=128) Δ(h-e)=+3.206e-08
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07, k=3:1.729e-07, k=4:1.929e-07, k=5:2.099e-07, k=6:2.363e-07, k=7:3.190e-07
+    step=8   32/256 ( 12.5%)  elapsed=  7.3s  eta= 51.3s  running-mean=7.4362e-07
+    step=8   64/256 ( 25.0%)  elapsed= 14.6s  eta= 43.7s  running-mean=6.8045e-07
+    step=8   96/256 ( 37.5%)  elapsed= 21.9s  eta= 36.5s  running-mean=7.6022e-07
+    step=8  128/256 ( 50.0%)  elapsed= 29.6s  eta= 29.6s  running-mean=7.5439e-07
+    step=8  160/256 ( 62.5%)  elapsed= 36.8s  eta= 22.1s  running-mean=7.1553e-07
+    step=8  192/256 ( 75.0%)  elapsed= 43.4s  eta= 14.5s  running-mean=6.9133e-07
+    step=8  224/256 ( 87.5%)  elapsed= 50.2s  eta=  7.2s  running-mean=6.8954e-07
+    step=8  256/256 (100.0%)  elapsed= 57.1s  eta=  0.0s  running-mean=6.8255e-07
+  [A] step  8: 57.1s  |  mean=6.8255e-07 std=4.492e-07 min=1.380e-07 max=3.060e-06  easy=6.1071e-07 (n=128) hard=7.5439e-07 (n=128) Δ(h-e)=+1.437e-07
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07, k=3:1.729e-07, k=4:1.929e-07, k=5:2.099e-07, k=6:2.363e-07, k=7:3.190e-07, k=8:6.826e-07
+    step=9   32/256 ( 12.5%)  elapsed=  6.7s  eta= 46.9s  running-mean=1.1358e-05
+    step=9   64/256 ( 25.0%)  elapsed= 13.8s  eta= 41.3s  running-mean=1.2907e-05
+    step=9   96/256 ( 37.5%)  elapsed= 20.4s  eta= 34.0s  running-mean=1.2763e-05
+    step=9  128/256 ( 50.0%)  elapsed= 27.2s  eta= 27.2s  running-mean=1.3121e-05
+    step=9  160/256 ( 62.5%)  elapsed= 34.1s  eta= 20.5s  running-mean=1.2598e-05
+    step=9  192/256 ( 75.0%)  elapsed= 40.8s  eta= 13.6s  running-mean=1.2617e-05
+    step=9  224/256 ( 87.5%)  elapsed= 47.6s  eta=  6.8s  running-mean=1.2394e-05
+    step=9  256/256 (100.0%)  elapsed= 54.2s  eta=  0.0s  running-mean=1.2062e-05
+  [A] step  9: 54.2s  |  mean=1.2062e-05 std=7.821e-06 min=2.482e-06 max=3.973e-05  easy=1.1002e-05 (n=128) hard=1.3121e-05 (n=128) Δ(h-e)=+2.119e-06
+       running per-step means so far: k=0:1.617e-07, k=1:1.653e-07, k=2:1.764e-07, k=3:1.729e-07, k=4:1.929e-07, k=5:2.099e-07, k=6:2.363e-07, k=7:3.190e-07, k=8:6.826e-07, k=9:1.206e-05
+
+[exp3] Sweep B: first-k-FP16 (11 configs)...
+    B k=0   32/256 ( 12.5%)  elapsed=  6.8s  eta= 47.5s  running-mean=1.8918e-05
+    B k=0   64/256 ( 25.0%)  elapsed= 13.6s  eta= 40.9s  running-mean=1.9717e-05
+    B k=0   96/256 ( 37.5%)  elapsed= 20.4s  eta= 34.0s  running-mean=2.0832e-05
+    B k=0  128/256 ( 50.0%)  elapsed= 27.2s  eta= 27.2s  running-mean=2.1347e-05
+    B k=0  160/256 ( 62.5%)  elapsed= 34.1s  eta= 20.5s  running-mean=2.0239e-05
+    B k=0  192/256 ( 75.0%)  elapsed= 41.0s  eta= 13.7s  running-mean=1.9880e-05
+    B k=0  224/256 ( 87.5%)  elapsed= 48.0s  eta=  6.9s  running-mean=1.9743e-05
+    B k=0  256/256 (100.0%)  elapsed= 54.9s  eta=  0.0s  running-mean=1.9281e-05
+  [B] k= 0 (FP16[0:0]+W4[0:10]): 54.9s  |  mean=1.9281e-05 std=1.153e-05 min=3.026e-06 max=6.733e-05  easy=1.7215e-05 (n=128) hard=2.1347e-05 (n=128) Δ(h-e)=+4.132e-06
+       B curve so far: k=0:1.928e-05
+    B k=1   32/256 ( 12.5%)  elapsed=  7.0s  eta= 49.0s  running-mean=1.8615e-05
+    B k=1   64/256 ( 25.0%)  elapsed= 14.0s  eta= 41.9s  running-mean=1.9459e-05
+    B k=1   96/256 ( 37.5%)  elapsed= 21.0s  eta= 35.0s  running-mean=2.0489e-05
+    B k=1  128/256 ( 50.0%)  elapsed= 28.2s  eta= 28.2s  running-mean=2.1076e-05
+    B k=1  160/256 ( 62.5%)  elapsed= 35.0s  eta= 21.0s  running-mean=1.9976e-05
+    B k=1  192/256 ( 75.0%)  elapsed= 41.7s  eta= 13.9s  running-mean=1.9658e-05
+    B k=1  224/256 ( 87.5%)  elapsed= 48.5s  eta=  6.9s  running-mean=1.9481e-05
+    B k=1  256/256 (100.0%)  elapsed= 55.2s  eta=  0.0s  running-mean=1.9032e-05
+  [B] k= 1 (FP16[0:1]+W4[1:10]): 55.2s  |  mean=1.9032e-05 std=1.122e-05 min=2.988e-06 max=6.365e-05  easy=1.6987e-05 (n=128) hard=2.1076e-05 (n=128) Δ(h-e)=+4.089e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05
+    B k=2   32/256 ( 12.5%)  elapsed=  6.7s  eta= 46.6s  running-mean=1.8392e-05
+    B k=2   64/256 ( 25.0%)  elapsed= 13.3s  eta= 40.0s  running-mean=1.9225e-05
+    B k=2   96/256 ( 37.5%)  elapsed= 20.4s  eta= 34.0s  running-mean=2.0220e-05
+    B k=2  128/256 ( 50.0%)  elapsed= 27.4s  eta= 27.4s  running-mean=2.0713e-05
+    B k=2  160/256 ( 62.5%)  elapsed= 34.1s  eta= 20.4s  running-mean=1.9673e-05
+    B k=2  192/256 ( 75.0%)  elapsed= 40.9s  eta= 13.6s  running-mean=1.9381e-05
+    B k=2  224/256 ( 87.5%)  elapsed= 47.8s  eta=  6.8s  running-mean=1.9182e-05
+    B k=2  256/256 (100.0%)  elapsed= 54.9s  eta=  0.0s  running-mean=1.8752e-05
+  [B] k= 2 (FP16[0:2]+W4[2:10]): 54.9s  |  mean=1.8752e-05 std=1.101e-05 min=3.155e-06 max=6.296e-05  easy=1.6791e-05 (n=128) hard=2.0713e-05 (n=128) Δ(h-e)=+3.922e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05
+    B k=3   32/256 ( 12.5%)  elapsed=  6.6s  eta= 46.3s  running-mean=1.8030e-05
+    B k=3   64/256 ( 25.0%)  elapsed= 13.3s  eta= 39.8s  running-mean=1.8968e-05
+    B k=3   96/256 ( 37.5%)  elapsed= 20.3s  eta= 33.9s  running-mean=1.9906e-05
+    B k=3  128/256 ( 50.0%)  elapsed= 27.0s  eta= 27.0s  running-mean=2.0382e-05
+    B k=3  160/256 ( 62.5%)  elapsed= 33.9s  eta= 20.4s  running-mean=1.9355e-05
+    B k=3  192/256 ( 75.0%)  elapsed= 40.7s  eta= 13.6s  running-mean=1.9085e-05
+    B k=3  224/256 ( 87.5%)  elapsed= 47.5s  eta=  6.8s  running-mean=1.8903e-05
+    B k=3  256/256 (100.0%)  elapsed= 54.5s  eta=  0.0s  running-mean=1.8479e-05
+  [B] k= 3 (FP16[0:3]+W4[3:10]): 54.5s  |  mean=1.8479e-05 std=1.082e-05 min=3.035e-06 max=6.246e-05  easy=1.6575e-05 (n=128) hard=2.0382e-05 (n=128) Δ(h-e)=+3.807e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05
+    B k=4   32/256 ( 12.5%)  elapsed=  6.9s  eta= 48.2s  running-mean=1.7766e-05
+    B k=4   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.1s  running-mean=1.8634e-05
+    B k=4   96/256 ( 37.5%)  elapsed= 20.6s  eta= 34.3s  running-mean=1.9481e-05
+    B k=4  128/256 ( 50.0%)  elapsed= 27.9s  eta= 27.9s  running-mean=1.9980e-05
+    B k=4  160/256 ( 62.5%)  elapsed= 34.7s  eta= 20.8s  running-mean=1.8979e-05
+    B k=4  192/256 ( 75.0%)  elapsed= 41.7s  eta= 13.9s  running-mean=1.8685e-05
+    B k=4  224/256 ( 87.5%)  elapsed= 48.4s  eta=  6.9s  running-mean=1.8503e-05
+    B k=4  256/256 (100.0%)  elapsed= 55.4s  eta=  0.0s  running-mean=1.8105e-05
+  [B] k= 4 (FP16[0:4]+W4[4:10]): 55.4s  |  mean=1.8105e-05 std=1.062e-05 min=2.729e-06 max=6.233e-05  easy=1.6231e-05 (n=128) hard=1.9980e-05 (n=128) Δ(h-e)=+3.750e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05, k=4:1.811e-05
+    B k=5   32/256 ( 12.5%)  elapsed=  6.7s  eta= 47.1s  running-mean=1.7247e-05
+    B k=5   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.0s  running-mean=1.8206e-05
+    B k=5   96/256 ( 37.5%)  elapsed= 20.4s  eta= 34.0s  running-mean=1.8961e-05
+    B k=5  128/256 ( 50.0%)  elapsed= 27.2s  eta= 27.2s  running-mean=1.9438e-05
+    B k=5  160/256 ( 62.5%)  elapsed= 33.9s  eta= 20.3s  running-mean=1.8484e-05
+    B k=5  192/256 ( 75.0%)  elapsed= 40.5s  eta= 13.5s  running-mean=1.8224e-05
+    B k=5  224/256 ( 87.5%)  elapsed= 47.2s  eta=  6.7s  running-mean=1.8012e-05
+    B k=5  256/256 (100.0%)  elapsed= 54.5s  eta=  0.0s  running-mean=1.7610e-05
+  [B] k= 5 (FP16[0:5]+W4[5:10]): 54.5s  |  mean=1.7610e-05 std=1.035e-05 min=2.979e-06 max=6.054e-05  easy=1.5783e-05 (n=128) hard=1.9438e-05 (n=128) Δ(h-e)=+3.655e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05, k=4:1.811e-05, k=5:1.761e-05
+    B k=6   32/256 ( 12.5%)  elapsed=  6.7s  eta= 47.0s  running-mean=1.6637e-05
+    B k=6   64/256 ( 25.0%)  elapsed= 13.5s  eta= 40.6s  running-mean=1.7621e-05
+    B k=6   96/256 ( 37.5%)  elapsed= 20.6s  eta= 34.4s  running-mean=1.8253e-05
+    B k=6  128/256 ( 50.0%)  elapsed= 27.4s  eta= 27.4s  running-mean=1.8787e-05
+    B k=6  160/256 ( 62.5%)  elapsed= 34.1s  eta= 20.5s  running-mean=1.7879e-05
+    B k=6  192/256 ( 75.0%)  elapsed= 40.9s  eta= 13.6s  running-mean=1.7650e-05
+    B k=6  224/256 ( 87.5%)  elapsed= 48.2s  eta=  6.9s  running-mean=1.7430e-05
+    B k=6  256/256 (100.0%)  elapsed= 55.0s  eta=  0.0s  running-mean=1.7043e-05
+  [B] k= 6 (FP16[0:6]+W4[6:10]): 55.0s  |  mean=1.7043e-05 std=1.002e-05 min=3.006e-06 max=5.904e-05  easy=1.5300e-05 (n=128) hard=1.8787e-05 (n=128) Δ(h-e)=+3.487e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05, k=4:1.811e-05, k=5:1.761e-05, k=6:1.704e-05
+    B k=7   32/256 ( 12.5%)  elapsed=  7.0s  eta= 48.9s  running-mean=1.5620e-05
+    B k=7   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.0s  running-mean=1.6750e-05
+    B k=7   96/256 ( 37.5%)  elapsed= 20.6s  eta= 34.4s  running-mean=1.7178e-05
+    B k=7  128/256 ( 50.0%)  elapsed= 27.6s  eta= 27.6s  running-mean=1.7734e-05
+    B k=7  160/256 ( 62.5%)  elapsed= 34.3s  eta= 20.6s  running-mean=1.6923e-05
+    B k=7  192/256 ( 75.0%)  elapsed= 41.3s  eta= 13.8s  running-mean=1.6722e-05
+    B k=7  224/256 ( 87.5%)  elapsed= 48.3s  eta=  6.9s  running-mean=1.6494e-05
+    B k=7  256/256 (100.0%)  elapsed= 55.2s  eta=  0.0s  running-mean=1.6136e-05
+  [B] k= 7 (FP16[0:7]+W4[7:10]): 55.2s  |  mean=1.6136e-05 std=9.584e-06 min=3.024e-06 max=5.610e-05  easy=1.4538e-05 (n=128) hard=1.7734e-05 (n=128) Δ(h-e)=+3.196e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05, k=4:1.811e-05, k=5:1.761e-05, k=6:1.704e-05, k=7:1.614e-05
+    B k=8   32/256 ( 12.5%)  elapsed=  7.0s  eta= 49.0s  running-mean=1.3986e-05
+    B k=8   64/256 ( 25.0%)  elapsed= 13.9s  eta= 41.7s  running-mean=1.5247e-05
+    B k=8   96/256 ( 37.5%)  elapsed= 20.8s  eta= 34.7s  running-mean=1.5440e-05
+    B k=8  128/256 ( 50.0%)  elapsed= 28.2s  eta= 28.2s  running-mean=1.6014e-05
+    B k=8  160/256 ( 62.5%)  elapsed= 34.8s  eta= 20.9s  running-mean=1.5314e-05
+    B k=8  192/256 ( 75.0%)  elapsed= 41.7s  eta= 13.9s  running-mean=1.5217e-05
+    B k=8  224/256 ( 87.5%)  elapsed= 48.8s  eta=  7.0s  running-mean=1.4999e-05
+    B k=8  256/256 (100.0%)  elapsed= 56.0s  eta=  0.0s  running-mean=1.4663e-05
+  [B] k= 8 (FP16[0:8]+W4[8:10]): 56.0s  |  mean=1.4663e-05 std=8.883e-06 min=2.776e-06 max=4.691e-05  easy=1.3312e-05 (n=128) hard=1.6014e-05 (n=128) Δ(h-e)=+2.703e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05, k=4:1.811e-05, k=5:1.761e-05, k=6:1.704e-05, k=7:1.614e-05, k=8:1.466e-05
+    B k=9   32/256 ( 12.5%)  elapsed=  6.9s  eta= 48.3s  running-mean=1.1358e-05
+    B k=9   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.2s  running-mean=1.2907e-05
+    B k=9   96/256 ( 37.5%)  elapsed= 20.5s  eta= 34.2s  running-mean=1.2763e-05
+    B k=9  128/256 ( 50.0%)  elapsed= 27.3s  eta= 27.3s  running-mean=1.3121e-05
+    B k=9  160/256 ( 62.5%)  elapsed= 34.1s  eta= 20.5s  running-mean=1.2598e-05
+    B k=9  192/256 ( 75.0%)  elapsed= 40.9s  eta= 13.6s  running-mean=1.2617e-05
+    B k=9  224/256 ( 87.5%)  elapsed= 47.8s  eta=  6.8s  running-mean=1.2394e-05
+    B k=9  256/256 (100.0%)  elapsed= 54.8s  eta=  0.0s  running-mean=1.2062e-05
+  [B] k= 9 (FP16[0:9]+W4[9:10]): 54.8s  |  mean=1.2062e-05 std=7.821e-06 min=2.482e-06 max=3.973e-05  easy=1.1002e-05 (n=128) hard=1.3121e-05 (n=128) Δ(h-e)=+2.119e-06
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05, k=4:1.811e-05, k=5:1.761e-05, k=6:1.704e-05, k=7:1.614e-05, k=8:1.466e-05, k=9:1.206e-05
+    B k=10   32/256 ( 12.5%)  elapsed=  6.7s  eta= 47.1s  running-mean=0.0000e+00
+    B k=10   64/256 ( 25.0%)  elapsed= 13.6s  eta= 40.9s  running-mean=0.0000e+00
+    B k=10   96/256 ( 37.5%)  elapsed= 20.8s  eta= 34.7s  running-mean=0.0000e+00
+    B k=10  128/256 ( 50.0%)  elapsed= 28.0s  eta= 28.0s  running-mean=0.0000e+00
+    B k=10  160/256 ( 62.5%)  elapsed= 35.0s  eta= 21.0s  running-mean=0.0000e+00
+    B k=10  192/256 ( 75.0%)  elapsed= 42.1s  eta= 14.0s  running-mean=0.0000e+00
+    B k=10  224/256 ( 87.5%)  elapsed= 49.0s  eta=  7.0s  running-mean=0.0000e+00
+    B k=10  256/256 (100.0%)  elapsed= 56.1s  eta=  0.0s  running-mean=0.0000e+00
+  [B] k=10 (all-FP16): 56.1s  |  mean=0.0000e+00 std=0.000e+00 min=0.000e+00 max=0.000e+00  easy=0.0000e+00 (n=128) hard=0.0000e+00 (n=128) Δ(h-e)=+0.000e+00
+       B curve so far: k=0:1.928e-05, k=1:1.903e-05, k=2:1.875e-05, k=3:1.848e-05, k=4:1.811e-05, k=5:1.761e-05, k=6:1.704e-05, k=7:1.614e-05, k=8:1.466e-05, k=9:1.206e-05, k=10:0.000e+00
+
+[exp3] Sweep C: first-k-W4 (11 configs)...
+    C k=0   32/256 ( 12.5%)  elapsed=  6.9s  eta= 48.3s  running-mean=0.0000e+00
+    C k=0   64/256 ( 25.0%)  elapsed= 13.9s  eta= 41.7s  running-mean=0.0000e+00
+    C k=0   96/256 ( 37.5%)  elapsed= 21.0s  eta= 35.0s  running-mean=0.0000e+00
+    C k=0  128/256 ( 50.0%)  elapsed= 27.9s  eta= 27.9s  running-mean=0.0000e+00
+    C k=0  160/256 ( 62.5%)  elapsed= 34.8s  eta= 20.9s  running-mean=0.0000e+00
+    C k=0  192/256 ( 75.0%)  elapsed= 41.8s  eta= 13.9s  running-mean=0.0000e+00
+    C k=0  224/256 ( 87.5%)  elapsed= 48.8s  eta=  7.0s  running-mean=0.0000e+00
+    C k=0  256/256 (100.0%)  elapsed= 55.8s  eta=  0.0s  running-mean=0.0000e+00
+  [C] k= 0 (all-FP16): 55.8s  |  mean=0.0000e+00 std=0.000e+00 min=0.000e+00 max=0.000e+00  easy=0.0000e+00 (n=128) hard=0.0000e+00 (n=128) Δ(h-e)=+0.000e+00
+       C curve so far: k=0:0.000e+00
+    C k=1   32/256 ( 12.5%)  elapsed=  6.9s  eta= 48.3s  running-mean=1.4870e-07
+    C k=1   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.1s  running-mean=1.4639e-07
+    C k=1   96/256 ( 37.5%)  elapsed= 20.5s  eta= 34.2s  running-mean=1.4763e-07
+    C k=1  128/256 ( 50.0%)  elapsed= 27.3s  eta= 27.3s  running-mean=1.5431e-07
+    C k=1  160/256 ( 62.5%)  elapsed= 34.3s  eta= 20.6s  running-mean=1.5396e-07
+    C k=1  192/256 ( 75.0%)  elapsed= 41.1s  eta= 13.7s  running-mean=1.6192e-07
+    C k=1  224/256 ( 87.5%)  elapsed= 47.9s  eta=  6.8s  running-mean=1.6348e-07
+    C k=1  256/256 (100.0%)  elapsed= 54.7s  eta=  0.0s  running-mean=1.6167e-07
+  [C] k= 1 (W4[0:1]+FP16[1:10]): 54.7s  |  mean=1.6167e-07 std=1.239e-07 min=5.671e-08 max=1.887e-06  easy=1.6902e-07 (n=128) hard=1.5431e-07 (n=128) Δ(h-e)=-1.471e-08
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07
+    C k=2   32/256 ( 12.5%)  elapsed=  6.7s  eta= 46.9s  running-mean=1.8726e-07
+    C k=2   64/256 ( 25.0%)  elapsed= 13.4s  eta= 40.3s  running-mean=1.6674e-07
+    C k=2   96/256 ( 37.5%)  elapsed= 20.2s  eta= 33.7s  running-mean=1.7358e-07
+    C k=2  128/256 ( 50.0%)  elapsed= 27.2s  eta= 27.2s  running-mean=1.9334e-07
+    C k=2  160/256 ( 62.5%)  elapsed= 34.0s  eta= 20.4s  running-mean=1.8639e-07
+    C k=2  192/256 ( 75.0%)  elapsed= 40.7s  eta= 13.6s  running-mean=2.0006e-07
+    C k=2  224/256 ( 87.5%)  elapsed= 47.5s  eta=  6.8s  running-mean=2.0026e-07
+    C k=2  256/256 (100.0%)  elapsed= 54.3s  eta=  0.0s  running-mean=1.9447e-07
+  [C] k= 2 (W4[0:2]+FP16[2:10]): 54.3s  |  mean=1.9447e-07 std=2.685e-07 min=5.028e-08 max=3.382e-06  easy=1.9560e-07 (n=128) hard=1.9334e-07 (n=128) Δ(h-e)=-2.258e-09
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07
+    C k=3   32/256 ( 12.5%)  elapsed=  6.7s  eta= 46.8s  running-mean=1.9148e-07
+    C k=3   64/256 ( 25.0%)  elapsed= 13.4s  eta= 40.2s  running-mean=1.9359e-07
+    C k=3   96/256 ( 37.5%)  elapsed= 20.2s  eta= 33.7s  running-mean=2.0629e-07
+    C k=3  128/256 ( 50.0%)  elapsed= 26.9s  eta= 26.9s  running-mean=2.3838e-07
+    C k=3  160/256 ( 62.5%)  elapsed= 33.9s  eta= 20.3s  running-mean=2.2928e-07
+    C k=3  192/256 ( 75.0%)  elapsed= 40.7s  eta= 13.6s  running-mean=2.4313e-07
+    C k=3  224/256 ( 87.5%)  elapsed= 47.4s  eta=  6.8s  running-mean=2.4960e-07
+    C k=3  256/256 (100.0%)  elapsed= 54.1s  eta=  0.0s  running-mean=2.4221e-07
+  [C] k= 3 (W4[0:3]+FP16[3:10]): 54.1s  |  mean=2.4221e-07 std=4.100e-07 min=6.737e-08 max=4.674e-06  easy=2.4603e-07 (n=128) hard=2.3838e-07 (n=128) Δ(h-e)=-7.645e-09
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07
+    C k=4   32/256 ( 12.5%)  elapsed=  6.8s  eta= 47.9s  running-mean=2.3557e-07
+    C k=4   64/256 ( 25.0%)  elapsed= 13.9s  eta= 41.6s  running-mean=2.3478e-07
+    C k=4   96/256 ( 37.5%)  elapsed= 20.6s  eta= 34.3s  running-mean=2.6556e-07
+    C k=4  128/256 ( 50.0%)  elapsed= 27.4s  eta= 27.4s  running-mean=3.1779e-07
+    C k=4  160/256 ( 62.5%)  elapsed= 34.3s  eta= 20.6s  running-mean=2.9987e-07
+    C k=4  192/256 ( 75.0%)  elapsed= 41.3s  eta= 13.8s  running-mean=3.2683e-07
+    C k=4  224/256 ( 87.5%)  elapsed= 48.0s  eta=  6.9s  running-mean=3.4517e-07
+    C k=4  256/256 (100.0%)  elapsed= 54.8s  eta=  0.0s  running-mean=3.2960e-07
+  [C] k= 4 (W4[0:4]+FP16[4:10]): 54.8s  |  mean=3.2960e-07 std=7.478e-07 min=7.548e-08 max=7.853e-06  easy=3.4140e-07 (n=128) hard=3.1779e-07 (n=128) Δ(h-e)=-2.361e-08
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07, k=4:3.296e-07
+    C k=5   32/256 ( 12.5%)  elapsed=  7.0s  eta= 48.7s  running-mean=3.3985e-07
+    C k=5   64/256 ( 25.0%)  elapsed= 13.8s  eta= 41.3s  running-mean=3.2915e-07
+    C k=5   96/256 ( 37.5%)  elapsed= 20.5s  eta= 34.2s  running-mean=3.7954e-07
+    C k=5  128/256 ( 50.0%)  elapsed= 27.4s  eta= 27.4s  running-mean=4.8723e-07
+    C k=5  160/256 ( 62.5%)  elapsed= 34.3s  eta= 20.6s  running-mean=4.4439e-07
+    C k=5  192/256 ( 75.0%)  elapsed= 41.2s  eta= 13.7s  running-mean=4.6230e-07
+    C k=5  224/256 ( 87.5%)  elapsed= 48.2s  eta=  6.9s  running-mean=5.1510e-07
+    C k=5  256/256 (100.0%)  elapsed= 55.3s  eta=  0.0s  running-mean=4.8505e-07
+  [C] k= 5 (W4[0:5]+FP16[5:10]): 55.3s  |  mean=4.8505e-07 std=1.513e-06 min=9.797e-08 max=1.713e-05  easy=4.8287e-07 (n=128) hard=4.8723e-07 (n=128) Δ(h-e)=+4.368e-09
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07, k=4:3.296e-07, k=5:4.851e-07
+    C k=6   32/256 ( 12.5%)  elapsed=  6.7s  eta= 46.8s  running-mean=4.5843e-07
+    C k=6   64/256 ( 25.0%)  elapsed= 13.8s  eta= 41.5s  running-mean=4.5699e-07
+    C k=6   96/256 ( 37.5%)  elapsed= 21.1s  eta= 35.1s  running-mean=5.5645e-07
+    C k=6  128/256 ( 50.0%)  elapsed= 28.0s  eta= 28.0s  running-mean=7.4132e-07
+    C k=6  160/256 ( 62.5%)  elapsed= 34.8s  eta= 20.9s  running-mean=6.6210e-07
+    C k=6  192/256 ( 75.0%)  elapsed= 41.8s  eta= 13.9s  running-mean=6.6459e-07
+    C k=6  224/256 ( 87.5%)  elapsed= 48.4s  eta=  6.9s  running-mean=7.2212e-07
+    C k=6  256/256 (100.0%)  elapsed= 55.2s  eta=  0.0s  running-mean=6.8048e-07
+  [C] k= 6 (W4[0:6]+FP16[6:10]): 55.2s  |  mean=6.8048e-07 std=2.228e-06 min=1.067e-07 max=2.970e-05  easy=6.1963e-07 (n=128) hard=7.4132e-07 (n=128) Δ(h-e)=+1.217e-07
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07, k=4:3.296e-07, k=5:4.851e-07, k=6:6.805e-07
+    C k=7   32/256 ( 12.5%)  elapsed=  7.0s  eta= 48.7s  running-mean=7.2636e-07
+    C k=7   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.0s  running-mean=7.3137e-07
+    C k=7   96/256 ( 37.5%)  elapsed= 20.7s  eta= 34.5s  running-mean=8.9119e-07
+    C k=7  128/256 ( 50.0%)  elapsed= 28.0s  eta= 28.0s  running-mean=1.1473e-06
+    C k=7  160/256 ( 62.5%)  elapsed= 34.8s  eta= 20.9s  running-mean=1.0271e-06
+    C k=7  192/256 ( 75.0%)  elapsed= 41.6s  eta= 13.9s  running-mean=9.9606e-07
+    C k=7  224/256 ( 87.5%)  elapsed= 48.3s  eta=  6.9s  running-mean=1.0473e-06
+    C k=7  256/256 (100.0%)  elapsed= 55.4s  eta=  0.0s  running-mean=9.9027e-07
+  [C] k= 7 (W4[0:7]+FP16[7:10]): 55.4s  |  mean=9.9027e-07 std=3.064e-06 min=1.440e-07 max=4.408e-05  easy=8.3322e-07 (n=128) hard=1.1473e-06 (n=128) Δ(h-e)=+3.141e-07
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07, k=4:3.296e-07, k=5:4.851e-07, k=6:6.805e-07, k=7:9.903e-07
+    C k=8   32/256 ( 12.5%)  elapsed=  6.9s  eta= 48.0s  running-mean=1.3794e-06
+    C k=8   64/256 ( 25.0%)  elapsed= 13.5s  eta= 40.5s  running-mean=1.3671e-06
+    C k=8   96/256 ( 37.5%)  elapsed= 20.4s  eta= 33.9s  running-mean=1.6717e-06
+    C k=8  128/256 ( 50.0%)  elapsed= 27.3s  eta= 27.3s  running-mean=1.8523e-06
+    C k=8  160/256 ( 62.5%)  elapsed= 34.2s  eta= 20.5s  running-mean=1.6677e-06
+    C k=8  192/256 ( 75.0%)  elapsed= 41.0s  eta= 13.7s  running-mean=1.5778e-06
+    C k=8  224/256 ( 87.5%)  elapsed= 47.8s  eta=  6.8s  running-mean=1.5890e-06
+    C k=8  256/256 (100.0%)  elapsed= 54.8s  eta=  0.0s  running-mean=1.5215e-06
+  [C] k= 8 (W4[0:8]+FP16[8:10]): 54.8s  |  mean=1.5215e-06 std=3.320e-06 min=1.986e-07 max=4.605e-05  easy=1.1907e-06 (n=128) hard=1.8523e-06 (n=128) Δ(h-e)=+6.616e-07
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07, k=4:3.296e-07, k=5:4.851e-07, k=6:6.805e-07, k=7:9.903e-07, k=8:1.522e-06
+    C k=9   32/256 ( 12.5%)  elapsed=  6.8s  eta= 47.5s  running-mean=3.1949e-06
+    C k=9   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.1s  running-mean=3.0112e-06
+    C k=9   96/256 ( 37.5%)  elapsed= 20.6s  eta= 34.3s  running-mean=3.6000e-06
+    C k=9  128/256 ( 50.0%)  elapsed= 27.7s  eta= 27.7s  running-mean=3.6497e-06
+    C k=9  160/256 ( 62.5%)  elapsed= 34.5s  eta= 20.7s  running-mean=3.3189e-06
+    C k=9  192/256 ( 75.0%)  elapsed= 41.4s  eta= 13.8s  running-mean=3.1329e-06
+    C k=9  224/256 ( 87.5%)  elapsed= 48.3s  eta=  6.9s  running-mean=3.1417e-06
+    C k=9  256/256 (100.0%)  elapsed= 55.0s  eta=  0.0s  running-mean=3.0461e-06
+  [C] k= 9 (W4[0:9]+FP16[9:10]): 55.0s  |  mean=3.0461e-06 std=4.032e-06 min=2.655e-07 max=4.016e-05  easy=2.4425e-06 (n=128) hard=3.6497e-06 (n=128) Δ(h-e)=+1.207e-06
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07, k=4:3.296e-07, k=5:4.851e-07, k=6:6.805e-07, k=7:9.903e-07, k=8:1.522e-06, k=9:3.046e-06
+    C k=10   32/256 ( 12.5%)  elapsed=  6.8s  eta= 47.3s  running-mean=1.8918e-05
+    C k=10   64/256 ( 25.0%)  elapsed= 13.7s  eta= 41.0s  running-mean=1.9717e-05
+    C k=10   96/256 ( 37.5%)  elapsed= 20.5s  eta= 34.2s  running-mean=2.0832e-05
+    C k=10  128/256 ( 50.0%)  elapsed= 27.2s  eta= 27.2s  running-mean=2.1347e-05
+    C k=10  160/256 ( 62.5%)  elapsed= 34.2s  eta= 20.5s  running-mean=2.0239e-05
+    C k=10  192/256 ( 75.0%)  elapsed= 40.8s  eta= 13.6s  running-mean=1.9880e-05
+    C k=10  224/256 ( 87.5%)  elapsed= 47.6s  eta=  6.8s  running-mean=1.9743e-05
+    C k=10  256/256 (100.0%)  elapsed= 54.4s  eta=  0.0s  running-mean=1.9281e-05
+  [C] k=10 (W4[0:10]+FP16[10:10]): 54.4s  |  mean=1.9281e-05 std=1.153e-05 min=3.026e-06 max=6.733e-05  easy=1.7215e-05 (n=128) hard=2.1347e-05 (n=128) Δ(h-e)=+4.132e-06
+       C curve so far: k=0:0.000e+00, k=1:1.617e-07, k=2:1.945e-07, k=3:2.422e-07, k=4:3.296e-07, k=5:4.851e-07, k=6:6.805e-07, k=7:9.903e-07, k=8:1.522e-06, k=9:3.046e-06, k=10:1.928e-05
+
+============================================================
+EXP3 FINAL SUMMARY (mean action MSE vs FP16 reference)
+============================================================
+[A] Per-step (W4 at step k only, FP16 elsewhere):
+    step  0:  1.616655e-07
+    step  1:  1.653163e-07
+    step  2:  1.764290e-07
+    step  3:  1.729431e-07
+    step  4:  1.928848e-07
+    step  5:  2.099000e-07
+    step  6:  2.363294e-07
+    step  7:  3.190394e-07
+    step  8:  6.825508e-07
+    step  9:  1.206188e-05
+
+[B] First k steps FP16, rest W4:
+    k= 0:    1.928102e-05
+    k= 1:    1.903194e-05
+    k= 2:    1.875173e-05
+    k= 3:    1.847871e-05
+    k= 4:    1.810541e-05
+    k= 5:    1.761037e-05
+    k= 6:    1.704345e-05
+    k= 7:    1.613648e-05
+    k= 8:    1.466309e-05
+    k= 9:    1.206188e-05
+    k=10:    0.000000e+00
+
+[C] First k steps W4, rest FP16:
+    k= 0:    0.000000e+00
+    k= 1:    1.616655e-07
+    k= 2:    1.944739e-07
+    k= 3:    2.422066e-07
+    k= 4:    3.295972e-07
+    k= 5:    4.850506e-07
+    k= 6:    6.804751e-07
+    k= 7:    9.902680e-07
+    k= 8:    1.521520e-06
+    k= 9:    3.046093e-06
+    k=10:    1.928102e-05
+============================================================
+
+[exp3] Generating plots...
+  exp3_per_step_sensitivity.png
+  exp3_per_step_easy_vs_hard.png
+  exp3_cumulative_first_k_fp16.png
+  exp3_cumulative_first_k_w4.png
+  exp3_cumulative_sweep.png
+
+Experiment 3 complete.

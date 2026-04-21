@@ -30,6 +30,14 @@ os.environ.setdefault("CUDA_VISIBLE_DEVICES", "0")
 os.environ["TORCHDYNAMO_DISABLE"] = "1"
 
 # ---------------------------------------------------------------------------
+# Headless MuJoCo rendering for LIBERO closed-loop rollouts.
+# EGL is the preferred path on NVIDIA GPUs; fall back to osmesa if EGL fails.
+# Must be set BEFORE mujoco is imported anywhere.
+# ---------------------------------------------------------------------------
+os.environ.setdefault("MUJOCO_GL", "egl")
+os.environ.setdefault("PYOPENGL_PLATFORM", "egl")
+
+# ---------------------------------------------------------------------------
 # Redirect caches off NFS home (shared server: /home is quota-limited)
 # ---------------------------------------------------------------------------
 _WORKSPACE = os.environ.get("WORKSPACE", "/data/subha2")
