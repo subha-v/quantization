@@ -374,7 +374,7 @@ def main():
         lines.append("Adaptive-controller direction definitively dead; static-schedule paper is the story.")
 
     out = "\n".join(lines) + "\n"
-    out_path = os.path.join(utils.RESULTS_DIR, "exp7_analysis.md")
+    out_path = os.path.join(utils.RESULTS_DIR, f"exp7_analysis__{args.config}.md")
     Path(out_path).parent.mkdir(parents=True, exist_ok=True)
     with open(out_path, "w") as f:
         f.write(out)
