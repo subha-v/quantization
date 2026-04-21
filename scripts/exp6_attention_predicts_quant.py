@@ -137,6 +137,11 @@ def install_quant(model, config_name):
     elif cfg == "w4_both":
         _quantize_linears_in(vlm, vlm_name, bits=4)
         _quantize_linears_in(expert, expert_name, bits=4)
+    elif cfg == "w4_vlm_protect":
+        # Protect layer 0 + vision tower per exp2; W4 the rest of VLM
+        protect = _get_bottleneck_protect_modules(model)
+        protect_names = [n for n, _ in protect]
+        _quantize_linears_in(vlm, vlm_name, bits=4, exclude_prefixes=protect_names)
     elif cfg == "w2_vlm_protect":
         # Protect layer 0 + vision tower per exp2; W2 the rest of VLM
         protect = _get_bottleneck_protect_modules(model)

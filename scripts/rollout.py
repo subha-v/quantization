@@ -233,6 +233,7 @@ def run_rollout(
     task_description=None,     # if env is provided, pass its description
     obs_callback=None,         # fn(step_idx, libero_obs, openpi_obs_dict) -> None
     action_callback=None,      # fn(step_idx, action_chunk_np) -> None
+    pre_infer_callback=None,   # fn(step_idx) -> None, fires right before policy.infer()
     verbose: bool = False,
 ) -> RolloutRecord:
     """Run one LIBERO rollout with pi0.5 FP16 (or whatever state `policy` is in).
@@ -289,6 +290,12 @@ def run_rollout(
                         obs_callback(t, obs, openpi_obs)
                     except Exception as cb_e:
                         utils.log(f"[rollout] obs_callback error at t={t}: {cb_e}")
+
+                if pre_infer_callback is not None:
+                    try:
+                        pre_infer_callback(t)
+                    except Exception as cb_e:
+                        utils.log(f"[rollout] pre_infer_callback error at t={t}: {cb_e}")
 
                 with __import__("torch").no_grad():
                     result = policy.infer(openpi_obs)
