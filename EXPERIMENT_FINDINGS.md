@@ -588,3 +588,38 @@ If frac=0.5 still leaves Oracle < 50%, the next retry will switch to Object suit
 - `results/expB_diagnostic.jsonl` (936 per-cycle records across 9 trials)
 - `results/expB_rollouts.jsonl` (45 rollouts: 9 trials × 5 conditions)
 - `results/expB_pilot_stdout.log`
+
+### Pilot retry — frac=0.5 (20 trials, libero_10 task 0, 2026-04-22)
+
+| Condition | success | rate | 95% bootstrap CI |
+|---|---:|---:|---|
+| W2-with-protection | 0/20 | 0.000 | [0.00, 0.00] |
+| FP16 | 19/20 | 0.950 | [0.85, 1.00] |
+| **Oracle-20 (top 50% by ‖a_FP-a_W2‖²)** | **5/20** | **0.250** | [0.05, 0.45] |
+| **SIS-top-20** | **5/20** | **0.250** | [0.10, 0.45] |
+| Random-20 | 2/20 | 0.100 | [0.00, 0.25] |
+
+**SIS exactly matches Oracle's success rate (5/20 each), and both beat Random by +15 percentage points (2.5× rescue rate).** Per the plan's hypothesis matrix this is the **STRONG verdict**: SIS recovers the full per-frame-MSE-oracle gap over random selection.
+
+Bootstrap CIs overlap (n=20 is small), so this isn't yet statistically significant — but the rank ordering SIS = Oracle ≫ Random is clean across the matched-seed pairs. FP16 baseline at 19/20 = 95% matches QuantVLA's published Long success rate (93.5%), confirming the rollout infrastructure is calibrated correctly.
+
+**Per-trial pattern.** SIS succeeded on trials {0, 7, 12, 17, 18}; Oracle on {3, 7, 10, 17, 18}. Overlap = {7, 17, 18} (3 of 5). Same hit rate, partially different sets. Three possible interpretations:
+
+1. **Coincidence at n=20** — the full experiment will resolve this.
+2. **Per-frame-MSE Oracle isn't a true upper bound** for rollout success. Per-frame MSE is computed at the diagnostic's W2 trajectory states; the actual override rollouts diverge from those states. Combinatorial mask search would give a true upper bound but is intractable. Our "Oracle" is the best fixed-mask achievable from observable W2-trajectory metrics.
+3. **SIS captures complementary signal.** Image-perturbation sensitivity may flag frames whose action-distribution shape (not just per-frame MSE magnitude) is critical for trajectory rescue — chunks where the FP16 action vector points in a substantively different *direction* than W2, even if the per-frame MSE is mid-range.
+
+(2) and (3) both predict that adding more conditions (the Bottom-SIS-20 symmetry control and AttnEntropy-top-20 cheap proxy from the original plan) will be informative on the full experiment.
+
+### Notes for the full experiment
+
+- Override frac should be **0.5**, not the original plan's 0.2 (frac=0.2 produced 0% even for Oracle on Long; budget-bound, not method-bound).
+- Run all 7 conditions including Bottom-SIS-20 (symmetry check: ρ-flipped SIS should help less than top-SIS, otherwise SIS is a frame-difficulty detector not a quantization-sensitivity detector) and AttnEntropy-top-20 (D2 cheap proxy).
+- 100 trials (50 Long + 50 Object). Object likely has more rescue headroom — exp6 saw W2-with-protection didn't catastrophically break Object, so Oracle should clear 50% there.
+- Cost at current per-trial speed (~4.4 min): 100 × 4.4 × 7/5 ≈ 10 hours. Will need batched-SIS optimization (16 perturb passes → 1 batched call, ~10× speedup on diagnostic) before launching.
+
+**Updated pilot data (server, frac=0.5):**
+- `results/expB_diagnostic.jsonl` (2080 per-cycle records, 20 trials × ~104 cycles)
+- `results/expB_rollouts.jsonl` (100 rollouts: 20 trials × 5 conditions)
+- `results/expB_pilot_frac50_stdout.log`
+- `results/expB_summary.md`

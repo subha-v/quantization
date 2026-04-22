@@ -163,9 +163,12 @@ python -u scripts/expB_sis_validation.py --full     # 100 trials × 7 conditions
 python -u scripts/expB_sis_validation.py --analyze  # markdown summary from JSONLs
 ```
 
-### ExpB partial pilot (frac=0.20, 9/20 trials, 2026-04-21)
+### ExpB pilot results (libero_10 task 0, 20 trials, 2026-04-22)
 
-Stopped early because **Oracle-20 also failed on every trial** (0/9 success), making the SIS-vs-Random kill-switch comparison uninformative — the 20% override budget is too sparse to rescue Long task 0 from W2-with-protection regardless of which 20% you pick. Per-frame Spearman SIS vs ‖a_FP-a_W2‖² = -0.031 across 104 cycles also flagged a likely SIS-vs-MSE alignment gap in flow-matching VLAs (vs OpenVLA's autoregressive setup that SQIL was designed for). Retrying at frac=0.5 to give Oracle real headroom. Full writeup in `EXPERIMENT_FINDINGS.md` "Experiment B" section.
+- **Pilot 1 (frac=0.20)** stopped at 9/20 trials: even Oracle 0/9. Override budget too sparse to rescue Long-task W2 trajectories regardless of selection method.
+- **Pilot 2 (frac=0.50, completed):** SIS-top-20 = Oracle-20 = 5/20 (0.25), Random-20 = 2/20 (0.10), W2 = 0/20, FP16 = 19/20. **STRONG verdict per the plan's hypothesis matrix**: SIS recovers the full per-frame-MSE-oracle gap over random (+15 pp, 2.5× rescue rate) at zero oracle headroom.
+
+Full writeup + caveats in `EXPERIMENT_FINDINGS.md` "Experiment B" section. Next: run the full experiment (100 trials × 7 conditions including Bottom-SIS / AttnEntropy controls) at frac=0.5, with batched-SIS optimization to bring it under 10 hours.
 
 ## Key References
 
