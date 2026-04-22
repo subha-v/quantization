@@ -697,3 +697,57 @@ Per matched (task, seed, ep), the signed deltas (1 if condition succeeded and an
 - `results/expB_rollouts.jsonl` (800 rollouts)
 - `results/expB_summary.md` (auto-generated bootstrap-CI table)
 - `results/expB_full_stdout.log`
+
+### Frac sweep — AttnEntropy vs Random at frac ∈ {0.3, 0.4} (2026-04-22)
+
+Reused the existing 100-trial diagnostic data (no new diagnostic passes — the per-cycle attention entropy was already in `expB_diagnostic.jsonl`). Ran AttnEntropy + Random override rollouts at two new fracs to characterize the precision-savings vs success curve. 400 rollouts in ~2.3 hours on H100.
+
+#### Combined precision-savings curve (Random as baseline)
+
+| frac | AttnEntropy | Random | gap (pp) | ratio |
+|---:|---:|---:|---:|---:|
+| 0.3 | 0.02 | 0.01 | +1 | 2× |
+| 0.4 | 0.28 | 0.06 | +22 | 4.7× |
+| 0.5 | 0.68 | 0.39 | +29 | 1.7× |
+
+**Per-suite:**
+
+| frac | Long: AttnEntropy / Random | Object: AttnEntropy / Random |
+|---:|---:|---:|
+| 0.3 | 0.00 / 0.00 | 0.04 / 0.02 |
+| 0.4 | 0.18 / 0.02 | 0.38 / 0.10 |
+| 0.5 | 0.56 / 0.20 | 0.80 / 0.58 |
+
+#### Three observations
+
+1. **frac=0.3 is below the budget threshold.** Long is 0% / 0% (no method rescues at 30% override). Object barely separates (4% / 2%). Same dynamic as the pre-pilot frac=0.2 result — too few FP16 chunks injected to keep the W2 trajectory on path.
+
+2. **frac=0.4 is the maximum-detector-leverage point.** Overall AttnEntropy 0.28 vs Random 0.06 = 4.7× ratio. On Long specifically: 0.18 vs 0.02 = 9× ratio. This is where *which* frames you pick matters most — at frac=0.5 most reasonable selections rescue, at frac=0.3 nothing does, at frac=0.4 the detector earns its keep.
+
+3. **The 0.4 → 0.5 jump is a budget effect, not a detector effect.** AttnEntropy gains +40 pp; Random gains +33 pp. Both methods get a ~30+ pp boost from the extra 10% override budget. So we're crossing a structural threshold in trajectory rescuability between 0.4 and 0.5, on top of any detector advantage.
+
+#### What this implies for deployment
+
+The precision-savings vs success tradeoff is now characterizable:
+
+- **60% W2 weights (frac=0.4): ~28% rescue rate, AttnEntropy chosen frames**
+- **50% W2 weights (frac=0.5): ~68% rescue rate**
+- **0% W2 weights (FP16): 94% rescue rate**
+
+If the deployment target is "high reliability," frac=0.5 is the operating point — recovers most of FP16's success at half the inference cost. If the deployment target is "max savings while maintaining some rescue capability," frac=0.4 with AttnEntropy is the choice.
+
+#### Caveat — these comparisons need more baselines
+
+The sweep so far compares only AttnEntropy vs Random. To make the result publishable we need (at the same fracs):
+
+- **AttnEntropy-flipped** (high-entropy = predicted-low-sensitivity): symmetry control. If AttnEntropy ≈ AttnEntropy-flipped, the direction has no signal.
+- **SIS-top**: detector comparison. Confirms AttnEntropy isn't just one of many proxies that work.
+- **MSE-W2traj**: heuristic ceiling. Tells us how much oracle headroom remains.
+
+A follow-up sweep adding these three is queued (estimated ~3.5h, reusing the same diagnostic data).
+
+#### Files of record (frac sweep)
+
+- `results/expB_frac_sweep.jsonl` (400 rollouts: 100 trials × 2 fracs × 2 conditions)
+- `results/expB_frac_sweep_summary.md` (auto-generated)
+- `results/expB_sweep_stdout.log`
