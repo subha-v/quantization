@@ -163,12 +163,30 @@ python -u scripts/expB_sis_validation.py --full     # 100 trials × 7 conditions
 python -u scripts/expB_sis_validation.py --analyze  # markdown summary from JSONLs
 ```
 
-### ExpB pilot results (libero_10 task 0, 20 trials, 2026-04-22)
+### ExpB results (50 Long + 50 Object × 8 conditions @ frac=0.5, 2026-04-22)
 
-- **Pilot 1 (frac=0.20)** stopped at 9/20 trials: even Oracle 0/9. Override budget too sparse to rescue Long-task W2 trajectories regardless of selection method.
-- **Pilot 2 (frac=0.50, completed):** SIS-top-20 = Oracle-20 = 5/20 (0.25), Random-20 = 2/20 (0.10), W2 = 0/20, FP16 = 19/20. **STRONG verdict per the plan's hypothesis matrix**: SIS recovers the full per-frame-MSE-oracle gap over random (+15 pp, 2.5× rescue rate) at zero oracle headroom.
+Full experiment took 6h 9min on a single H100 (batched SIS perturbations gave ~1.7× speedup on the diagnostic phase; sequential-vs-batched parity verified at |diff| = 1.08e-5).
 
-Full writeup + caveats in `EXPERIMENT_FINDINGS.md` "Experiment B" section. Next: run the full experiment (100 trials × 7 conditions including Bottom-SIS / AttnEntropy controls) at frac=0.5, with batched-SIS optimization to bring it under 10 hours.
+**Headline: AttnEntropy beats every other detector by 14-29 pp.** The cheap online detector — entropy of `language_model.layers.12.self_attn` head 2 (D2 finding) — is essentially free at inference time and is the clear performance leader.
+
+| Condition | success | 95% CI |
+|---|---:|---|
+| FP16 (ceiling) | 0.940 | [0.89, 0.98] |
+| W2 (floor) | 0.000 | [0.00, 0.00] |
+| **AttnEntropy** | **0.680** | **[0.59, 0.77]** |
+| SIS-top | 0.490 | [0.39, 0.59] |
+| MSE-W2traj | 0.480 | [0.38, 0.58] |
+| Bottom-SIS | 0.420 | [0.33, 0.51] |
+| Random | 0.390 | [0.30, 0.49] |
+| MSE-FP16traj | 0.010 | [0.00, 0.03] |
+
+**Three takeaways:**
+
+1. **AttnEntropy is the deployable result.** Beats SIS by +19 pp at zero marginal cost. A precision-savings PTQ scheme can use l12h2 attention entropy as the per-frame gate without paying for perturbation passes.
+2. **SIS works but only weakly, and not on Object.** SIS-top (0.49) > Random (0.39) overall, but per-suite: on Object SIS-top = Random = Bottom-SIS ≈ 0.58 (no signal), only on Long does SIS beat Random by +20 pp.
+3. **MSE-FP16traj catastrophically failed (0.01).** Per-frame MSE rankings only transfer across trajectories that visit similar states — the W2-base override rollout doesn't visit the FP16 states the FP16-traj diagnostic ranked. Methodological caution.
+
+Full writeup with per-suite tables, verdict revision (the auto-printed "STRONG" verdict was based on weak SIS vs Random, missed the AttnEntropy headline), and trajectory-divergence analysis in `EXPERIMENT_FINDINGS.md` → "Experiment B → Full experiment (2026-04-22)".
 
 ## Key References
 

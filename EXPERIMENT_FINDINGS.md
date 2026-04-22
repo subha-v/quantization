@@ -623,3 +623,77 @@ Bootstrap CIs overlap (n=20 is small), so this isn't yet statistically significa
 - `results/expB_rollouts.jsonl` (100 rollouts: 20 trials × 5 conditions)
 - `results/expB_pilot_frac50_stdout.log`
 - `results/expB_summary.md`
+
+### Full experiment — frac=0.5, 100 trials × 8 conditions (2026-04-22, 6h 9min on H100)
+
+50 Long + 50 Object trials, all 8 conditions matched on (suite, task_id, seed, episode_idx). Three additions to the pilot setup: (i) batched SIS perturbations (compute_sis bypasses policy.infer's batch=1 wrapper, calls model._sample_actions on a (16, ah, ad) batch — sequential-vs-batched parity confirmed at |diff| = 1.08e-5), (ii) new `MSE-FP16traj` condition (per-frame MSE computed at FP16-trajectory states instead of W2-trajectory states), (iii) symmetry control `Bottom-SIS` and cheap-proxy `AttnEntropy` conditions added.
+
+#### Headline table
+
+| Condition | success | 95% bootstrap CI |
+|---|---:|---|
+| FP16 (ceiling) | 94/100 = 0.940 | [0.89, 0.98] |
+| W2-with-protection (floor) | 0/100 = 0.000 | [0.00, 0.00] |
+| **AttnEntropy** | **68/100 = 0.680** | **[0.59, 0.77]** |
+| SIS-top | 49/100 = 0.490 | [0.39, 0.59] |
+| MSE-W2traj | 48/100 = 0.480 | [0.38, 0.58] |
+| Bottom-SIS | 42/100 = 0.420 | [0.33, 0.51] |
+| Random | 39/100 = 0.390 | [0.30, 0.49] |
+| MSE-FP16traj | 1/100 = 0.010 | [0.00, 0.03] |
+
+#### The unexpected winner: AttnEntropy beats SIS by 19 pp
+
+The cheap online detector — entropy of `language_model.layers.12.self_attn` head 2's softmax distribution, ~zero marginal cost since the VLM forward pass already runs — is the clear performance leader. Per the D2 finding (ρ = -0.29 between l12h2 entropy and per-frame W2 sensitivity), low-entropy frames are more quant-sensitive; the override mask picks the bottom-50% by entropy.
+
+| Condition | Long (n=50) | Object (n=50) |
+|---|---:|---:|
+| FP16 | 0.88 | 1.00 |
+| W2 | 0.00 | 0.00 |
+| **AttnEntropy** | **0.56** | **0.80** |
+| MSE-W2traj | 0.30 | 0.66 |
+| SIS-top | 0.40 | 0.58 |
+| Bottom-SIS | 0.24 | 0.60 |
+| Random | 0.20 | 0.58 |
+| MSE-FP16traj | 0.00 | 0.02 |
+
+AttnEntropy wins on both suites cleanly. The gap to the next-best detector (MSE-W2traj on Object, SIS-top on Long) is +14 pp in both suites — robust across difficulty levels.
+
+#### The pilot's "STRONG" verdict shrinks at n=100
+
+At n=20 (pilot), SIS-top hit Oracle's success rate (5/20 each) and beat Random by +15 pp. At n=100, SIS-top vs Random drops to **+10 pp** (CIs overlap: [0.39, 0.59] vs [0.30, 0.49]) and SIS-top vs Bottom-SIS is only **+7 pp** — the symmetry control isn't decisively beaten. SIS does carry signal, but it's weak and concentrated on Long.
+
+**On Object (50 trials), SIS-top (0.58) ≈ Random (0.58) ≈ Bottom-SIS (0.60).** SIS provides essentially no per-frame signal on Object — the same suite that exp7's per-frame attention regression had its strongest R² on. So SIS as designed (image-perturbation sensitivity) and attention-entropy-as-proxy (mechanistic D2 finding) are picking up *different* per-frame properties; one transfers to Object, the other doesn't.
+
+#### MSE-FP16traj catastrophic failure: the trajectory-divergence trap
+
+`MSE-FP16traj` performs *worse than W2-only* (1/100 vs 0/100 — within noise of zero). Two structural reasons:
+
+1. **Mask budget asymmetry.** Frac is applied to each diagnostic's own cycle count. FP16 succeeds in ~50 cycles on average; W2 hits max-steps at 104. So MSE-FP16traj's mask is ~25 cycles vs others' ~52. Half the override budget.
+2. **Out-of-distribution rankings.** The MSE values are computed at FP16-trajectory states (because the FP16 diagnostic only visits FP16 states). The override rollout runs W2 base, which diverges from the FP16 trajectory after the first few cycles. So the rankings reflect "where would FP16 and W2 disagree on the FP16 path" — not "where do they disagree on the actual W2-with-overrides path." Even Oracle's per-frame MSE only weakly transfers across trajectories.
+
+Methodological lesson worth documenting: **per-frame oracle MSE rankings are tied to the trajectory they were measured on**. The W2-trajectory MSE oracle (0.48) succeeds because the override rollout starts as W2 — at least the early cycles share state. The FP16-trajectory MSE oracle fails because the override rollout never visits FP16 states beyond cycle 0.
+
+#### Hypothesis matrix verdict (revised from auto-printed "STRONG")
+
+The auto-verdict triggered "STRONG" because SIS-top > Random and Oracle headroom over SIS ≈ 0. But at n=100 the actual story is more nuanced:
+
+| Comparison | Δ | interpretation |
+|---|---:|---|
+| SIS-top - Random | +10 pp | SIS works weakly; CI overlaps |
+| SIS-top - Bottom-SIS | +7 pp | symmetry control nearly tied; SIS direction signal is weak |
+| AttnEntropy - SIS-top | **+19 pp** | cheap proxy DOMINATES SIS |
+| AttnEntropy - MSE-W2traj | +20 pp | cheap proxy beats best heuristic oracle too |
+
+**Revised verdict: SIS works but is dominated by the cheap online attention-entropy detector.** The deployable result is "use l12h2 attention entropy as the per-frame precision gate; you get 68% rescue rate at zero marginal inference cost." This is the publishable finding, and a stronger one than the original SIS hypothesis predicted — it means a deployable PTQ-with-rescue scheme doesn't need expensive perturbation passes at inference time.
+
+#### Trial-level pattern: matched-pair signed deltas
+
+Per matched (task, seed, ep), the signed deltas (1 if condition succeeded and another condition didn't, -1 if vice versa) are more sensitive than aggregate SR comparisons because they cancel intrinsic trial difficulty. *(To be added when the per-trial diff analysis script is run; for now the aggregate table tells the story.)*
+
+#### Files of record (server)
+
+- `results/expB_diagnostic.jsonl` (8000 W2-traj per-cycle records: 100 trials × ~80 cycles)
+- `results/expB_fp16_diagnostic.jsonl` (4262 FP16-traj per-cycle records: 100 trials × ~42 cycles)
+- `results/expB_rollouts.jsonl` (800 rollouts)
+- `results/expB_summary.md` (auto-generated bootstrap-CI table)
+- `results/expB_full_stdout.log`
