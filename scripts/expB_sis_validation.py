@@ -7,14 +7,15 @@ adapted for our PTQ setup: instead of using SIS to weight a QAT loss, we use
 it as a per-frame precision gate that overrides W2-with-protection inference
 with FP16 inference at high-SIS frames.
 
-Seven matched conditions per (suite, task_id, seed, episode_idx):
-  1. W2-only         — pure w2_vlm_protect (lower bound)
-  2. FP16-only       — pure FP16 (upper bound, = exp0)
-  3. SIS-top-20      — W2 base + FP16 override at top-20% inference cycles by SIS
-  4. Random-20       — W2 base + FP16 override at random 20%
-  5. Oracle-20       — W2 base + FP16 override at top-20% by ground-truth ||a_FP-a_W2||²
-  6. Bottom-SIS-20   — W2 base + FP16 override at bottom-20% by SIS (symmetry control)
-  7. AttnEntropy-top-20 — W2 base + FP16 override at top-20% by 1/entropy at l12h2
+Eight matched conditions per (suite, task_id, seed, episode_idx) at frac=0.5:
+  1. FP16          — pure FP16 (ceiling, = exp0)
+  2. W2            — pure w2_vlm_protect (floor)
+  3. SIS-top       — W2 base + FP16 override at top-50% by SIS
+  4. Random        — W2 base + FP16 override at random 50% (per-rollout seeded)
+  5. Bottom-SIS    — W2 base + FP16 override at bottom-50% by SIS (symmetry control)
+  6. MSE-W2traj    — W2 base + FP16 override at top-50% by ‖a_FP-a_W2‖² on W2 trajectory states
+  7. MSE-FP16traj  — W2 base + FP16 override at top-50% by ‖a_FP-a_W2‖² on FP16 trajectory states (NEW)
+  8. AttnEntropy   — W2 base + FP16 override at bottom-50% by l12h2 entropy (low entropy → high sensitivity per D2 ρ=-0.29)
 
 Phase D: pilot (20 seeds × {1,2,3,4,5} on libero_10 task 0) — kill switch on SR(3) ≤ SR(4).
 Phase E: full (100 seeds × all 7) — 50 Long + 50 Object.
@@ -58,22 +59,26 @@ from sis_utils import (
 # ---------------------------------------------------------------------------
 RESULTS_DIR = Path(utils.RESULTS_DIR)
 DIAG_PATH = RESULTS_DIR / "expB_diagnostic.jsonl"
+FP16_DIAG_PATH = RESULTS_DIR / "expB_fp16_diagnostic.jsonl"
 ROLLOUT_PATH = RESULTS_DIR / "expB_rollouts.jsonl"
 SUMMARY_PATH = RESULTS_DIR / "expB_summary.md"
 
 # ---------------------------------------------------------------------------
-# Conditions
+# Conditions (post-pilot: 8 conditions; renamed Oracle-20 → MSE-W2traj for
+# symmetry with new MSE-FP16traj; dropped "-20" suffix since frac is configurable)
 # ---------------------------------------------------------------------------
 ALL_CONDITIONS = [
-    "W2",                  # 1
-    "FP16",                # 2
-    "SIS-top-20",          # 3
-    "Random-20",           # 4
-    "Oracle-20",           # 5
-    "Bottom-SIS-20",       # 6
-    "AttnEntropy-top-20",  # 7
+    "FP16",          # 1 — full mask, ceiling
+    "W2",            # 2 — empty mask, floor
+    "SIS-top",       # 3 — top-frac% by SIS
+    "Random",        # 4 — random frac% (per-rollout seeded), null
+    "Bottom-SIS",    # 5 — bottom-frac% by SIS, symmetry control
+    "MSE-W2traj",    # 6 — top-frac% by ‖a_FP-a_W2‖² on W2-traj states
+    "MSE-FP16traj",  # 7 — top-frac% by ‖a_FP-a_W2‖² on FP16-traj states (NEW)
+    "AttnEntropy",   # 8 — bottom-frac% by l12h2 entropy (low entropy = high sensitivity per D2 ρ=-0.29)
 ]
-PILOT_CONDITIONS = ["W2", "FP16", "SIS-top-20", "Random-20", "Oracle-20"]
+# Legacy pilot conditions (frac=0.5 results live under old labels in the previous JSONLs)
+PILOT_CONDITIONS = ["FP16", "W2", "SIS-top", "Random", "MSE-W2traj"]
 
 
 # ---------------------------------------------------------------------------
@@ -223,6 +228,81 @@ def diagnostic_rollout(
 
 
 # ---------------------------------------------------------------------------
+# FP16 diagnostic — pure FP16 rollout that ALSO records ‖a_FP - a_W2‖²
+# at FP16-trajectory states (the mask source for MSE-FP16traj condition)
+# ---------------------------------------------------------------------------
+def fp16_diagnostic_rollout(
+    policy,
+    model,
+    ctrl: PrecisionController,
+    suite: str,
+    task_id: int,
+    seed: int,
+    episode_idx: int,
+    verbose: bool = False,
+):
+    """Run a pure FP16 rollout AND, at each cycle, also run a W2 forward pass
+    at the same state with the same noise to record ‖a_FP - a_W2‖². The
+    rollout's executed trajectory is condition `FP16` (= condition 1); the
+    per-cycle MSE records are the mask source for `MSE-FP16traj` (= condition 7).
+
+    No SIS or attention-entropy is computed here — those come from the W2
+    diagnostic (which has the W2-trajectory states the SIS/attn metrics were
+    designed for in the per-rollout 80th-percentile calibration).
+    """
+    per_cycle = []
+    cycle_idx = [-1]
+
+    def obs_callback(t, libero_obs, openpi_obs):
+        cycle_idx[0] += 1
+        sis_noise_seed = seeded.peek_next_seed()
+        ah, ad = get_action_shape(model)
+        device = next(model.parameters()).device
+        noise_t = make_noise(ah, ad, seed=sis_noise_seed, device=device)
+        noise_np = noise_t.cpu().numpy().astype(np.float32)
+
+        # FP16 forward (matches the rollout's actual call below — we just need
+        # a_FP for the MSE; the rollout will also call FP16 with same noise).
+        ctrl.use_fp16()
+        a_FP = infer_with_noise(policy, openpi_obs, noise_np)
+
+        # W2 forward at the SAME FP16-trajectory state and SAME noise → MSE.
+        ctrl.use_quant()
+        a_W2 = infer_with_noise(policy, openpi_obs, noise_np)
+        mse = float(np.mean((a_FP - a_W2) ** 2))
+
+        per_cycle.append({
+            "cycle_idx": cycle_idx[0],
+            "env_step": int(t),
+            "mse_fp_w2_fp16traj": mse,
+        })
+        if verbose:
+            utils.log(
+                f"[fp16-diag] seed={seed} ep={episode_idx} cyc={cycle_idx[0]:3d} "
+                f"t={t:4d} mse={mse:.5f}"
+            )
+
+    def pre_infer_callback(t):
+        # Actual rollout step uses FP16 (this is the FP16 condition).
+        ctrl.use_fp16()
+
+    seeded = SeededInferContext(policy, model, base_seed=seed)
+    with seeded:
+        ctrl.use_fp16()
+        rec = rollout_mod.run_rollout(
+            policy,
+            task_id=task_id,
+            suite=suite,
+            seed=seed,
+            episode_idx=episode_idx,
+            obs_callback=obs_callback,
+            pre_infer_callback=pre_infer_callback,
+            verbose=False,
+        )
+    return rec, per_cycle
+
+
+# ---------------------------------------------------------------------------
 # Override rollout — replays seed with W2 base + FP16 override mask
 # ---------------------------------------------------------------------------
 def override_rollout(
@@ -279,28 +359,46 @@ def _topk_indices(scores, k: int, largest: bool = True) -> set:
     return {i for i, _ in valid[:k]}
 
 
-def build_masks(per_cycle, frac: float, seed: int) -> dict:
-    """Build the override frame-index masks for the 5 score-based conditions
-    plus the trivial FP16-all mask."""
-    n = len(per_cycle)
-    k = max(1, int(round(frac * n)))
+def build_masks(per_cycle_w2, per_cycle_fp16, frac: float, seed: int) -> dict:
+    """Build the override-frame-index masks from the W2 + FP16 diagnostic data.
 
-    sis = [c["sis"] for c in per_cycle]
-    mse = [c["mse_fp_w2"] for c in per_cycle]
-    attn = [c["attn_entropy_l12h2"] for c in per_cycle]
+    `per_cycle_w2` provides SIS, attn entropy, and MSE-W2traj scores (cycles
+    indexed in the W2 trajectory). `per_cycle_fp16` provides MSE-FP16traj
+    scores (cycles indexed in the FP16 trajectory). The two trajectories
+    diverge so cycle counts may differ; each mask is sized as `frac` of its
+    own diagnostic's cycle count, and reflects indices within THAT diagnostic
+    — which align with override-rollout cycle indices since all rollouts share
+    the same starting state.
+
+    Cycle indices in the override mask that aren't reached during a particular
+    rollout simply have no effect.
+    """
+    n_w2 = len(per_cycle_w2)
+    k_w2 = max(1, int(round(frac * n_w2)))
+
+    sis  = [c["sis"] for c in per_cycle_w2]
+    mse  = [c["mse_fp_w2"] for c in per_cycle_w2]
+    attn = [c["attn_entropy_l12h2"] for c in per_cycle_w2]
 
     rng = _random.Random(seed)
-    rand_indices = set(rng.sample(range(n), k))
 
-    return {
-        "FP16":                set(range(n)),
-        "SIS-top-20":          _topk_indices(sis, k, largest=True),
-        "Random-20":           rand_indices,
-        "Oracle-20":           _topk_indices(mse, k, largest=True),
-        "Bottom-SIS-20":       _topk_indices(sis, k, largest=False),
+    masks = {
+        "FP16":         set(range(n_w2)),
+        "SIS-top":      _topk_indices(sis, k_w2, largest=True),
+        "Random":       set(rng.sample(range(n_w2), k_w2)),
+        "Bottom-SIS":   _topk_indices(sis, k_w2, largest=False),
+        "MSE-W2traj":   _topk_indices(mse, k_w2, largest=True),
         # Low entropy → high sensitivity (D2 finding ρ=-0.294); pick smallest entropy.
-        "AttnEntropy-top-20":  _topk_indices(attn, k, largest=False),
+        "AttnEntropy":  _topk_indices(attn, k_w2, largest=False),
     }
+
+    if per_cycle_fp16 is not None and len(per_cycle_fp16) > 0:
+        n_fp = len(per_cycle_fp16)
+        k_fp = max(1, int(round(frac * n_fp)))
+        mse_fp = [c["mse_fp_w2_fp16traj"] for c in per_cycle_fp16]
+        masks["MSE-FP16traj"] = _topk_indices(mse_fp, k_fp, largest=True)
+
+    return masks
 
 
 # ---------------------------------------------------------------------------
@@ -323,38 +421,64 @@ def run_seed(
         "seed": int(seed), "episode_idx": int(episode_idx),
     }
 
-    diag_rec, per_cycle = None, None
-    if "W2" in conditions or any(c in conditions for c in
-                                 ["SIS-top-20", "Random-20", "Oracle-20",
-                                  "Bottom-SIS-20", "AttnEntropy-top-20"]):
-        utils.log(f"[expB] DIAG seed={seed} task={task_id} ep={episode_idx}")
+    # Conditions that need the W2 diagnostic (SIS, attn entropy, MSE-W2traj scores)
+    NEEDS_W2_DIAG = {"W2", "SIS-top", "Random", "Bottom-SIS", "MSE-W2traj", "AttnEntropy"}
+    # Conditions that need the FP16 diagnostic (MSE-FP16traj scores)
+    NEEDS_FP16_DIAG = {"FP16", "MSE-FP16traj"}
+
+    w2_rec, w2_per_cycle = None, None
+    if any(c in conditions for c in NEEDS_W2_DIAG):
+        utils.log(f"[expB] W2-DIAG seed={seed} task={task_id} ep={episode_idx}")
         t0 = time.time()
-        diag_rec, per_cycle = diagnostic_rollout(
+        w2_rec, w2_per_cycle = diagnostic_rollout(
             policy, model, ctrl, attn_hook,
             suite, task_id, seed, episode_idx,
             n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
             verbose=verbose,
         )
         utils.log(
-            f"[expB] DIAG done seed={seed} success={diag_rec.success} "
-            f"steps={diag_rec.steps} cycles={len(per_cycle)} wall={time.time()-t0:.1f}s"
+            f"[expB] W2-DIAG done seed={seed} success={w2_rec.success} "
+            f"steps={w2_rec.steps} cycles={len(w2_per_cycle)} wall={time.time()-t0:.1f}s"
         )
-        # Persist diagnostic
-        for c in per_cycle:
+        for c in w2_per_cycle:
             utils.append_jsonl({**rollout_key, **c}, DIAG_PATH)
 
-    masks = build_masks(per_cycle, frac=frac, seed=seed) if per_cycle else {}
+    fp16_rec, fp16_per_cycle = None, None
+    if any(c in conditions for c in NEEDS_FP16_DIAG):
+        utils.log(f"[expB] FP16-DIAG seed={seed} task={task_id} ep={episode_idx}")
+        t0 = time.time()
+        fp16_rec, fp16_per_cycle = fp16_diagnostic_rollout(
+            policy, model, ctrl,
+            suite, task_id, seed, episode_idx,
+            verbose=verbose,
+        )
+        utils.log(
+            f"[expB] FP16-DIAG done seed={seed} success={fp16_rec.success} "
+            f"steps={fp16_rec.steps} cycles={len(fp16_per_cycle)} wall={time.time()-t0:.1f}s"
+        )
+        for c in fp16_per_cycle:
+            utils.append_jsonl({**rollout_key, **c}, FP16_DIAG_PATH)
+
+    masks = build_masks(w2_per_cycle, fp16_per_cycle, frac=frac, seed=seed) \
+        if w2_per_cycle else {}
+    n_cycles_w2 = len(w2_per_cycle) if w2_per_cycle else 0
 
     for cond in conditions:
         if cond == "W2":
-            rec = diag_rec
+            rec = w2_rec
             mask = set()
+        elif cond == "FP16":
+            rec = fp16_rec
+            mask = masks.get("FP16", set())  # informational only; FP16 diag IS the FP16 rollout
         else:
+            if cond not in masks:
+                utils.log(f"[expB] WARN: skipping {cond} — mask not available")
+                continue
             mask = masks[cond]
             t0 = time.time()
             utils.log(
                 f"[expB] {cond} seed={seed} task={task_id} ep={episode_idx} "
-                f"|mask|={len(mask)}/{len(per_cycle) if per_cycle else 0}"
+                f"|mask|={len(mask)}/{n_cycles_w2}"
             )
             rec = override_rollout(
                 policy, model, ctrl,
@@ -376,7 +500,8 @@ def run_seed(
             "termination_reason": rec.termination_reason,
             "n_overrides": len(mask),
             "override_indices": sorted(mask),
-            "n_cycles": len(per_cycle) if per_cycle else None,
+            "n_cycles_w2": n_cycles_w2,
+            "n_cycles_fp16": len(fp16_per_cycle) if fp16_per_cycle else None,
         }
         utils.append_jsonl(entry, ROLLOUT_PATH)
         out.append(entry)
@@ -488,28 +613,36 @@ def analyze():
             lines.append("| " + " | ".join(cells) + " |")
 
     # Hypothesis matrix interpretation (only if all key conditions present)
-    needed = {"W2", "FP16", "SIS-top-20", "Random-20", "Oracle-20"}
+    needed = {"W2", "FP16", "SIS-top", "Random", "MSE-W2traj"}
     if needed.issubset(by_cond.keys()):
         sr = {c: float(np.mean(by_cond[c])) for c in ALL_CONDITIONS if c in by_cond}
         lines.append("\n## Hypothesis matrix\n")
-        lines.append(f"- SR(W2) = {sr['W2']:.3f}")
-        lines.append(f"- SR(FP16) = {sr['FP16']:.3f}")
-        lines.append(f"- SR(Oracle-20) = {sr['Oracle-20']:.3f}")
-        lines.append(f"- SR(SIS-top-20) = {sr['SIS-top-20']:.3f}")
-        lines.append(f"- SR(Random-20) = {sr['Random-20']:.3f}")
-        if "Bottom-SIS-20" in sr:
-            lines.append(f"- SR(Bottom-SIS-20) = {sr['Bottom-SIS-20']:.3f}")
-        if "AttnEntropy-top-20" in sr:
-            lines.append(f"- SR(AttnEntropy-top-20) = {sr['AttnEntropy-top-20']:.3f}")
+        for c in ALL_CONDITIONS:
+            if c in sr:
+                lines.append(f"- SR({c}) = {sr[c]:.3f}")
 
-        delta_sis_rand = sr["SIS-top-20"] - sr["Random-20"]
-        delta_sis_oracle = sr["Oracle-20"] - sr["SIS-top-20"]
+        # Pick the "oracle" — prefer max(MSE-W2traj, MSE-FP16traj) since both are heuristic ceilings
+        oracle_w2 = sr.get("MSE-W2traj", float("nan"))
+        oracle_fp = sr.get("MSE-FP16traj", float("nan"))
+        oracle = max(o for o in (oracle_w2, oracle_fp) if o == o) if (oracle_w2 == oracle_w2 or oracle_fp == oracle_fp) else float("nan")
+
+        delta_sis_rand = sr["SIS-top"] - sr["Random"]
+        delta_sis_oracle = oracle - sr["SIS-top"]
         lines.append("")
         lines.append(f"- SIS over Random = {delta_sis_rand:+.3f}")
-        lines.append(f"- Oracle headroom over SIS = {delta_sis_oracle:+.3f}")
+        lines.append(f"- Oracle headroom over SIS (best of MSE-W2traj, MSE-FP16traj) = {delta_sis_oracle:+.3f}")
+
+        if "Bottom-SIS" in sr:
+            delta_top_bottom = sr["SIS-top"] - sr["Bottom-SIS"]
+            lines.append(f"- SIS-top over Bottom-SIS (symmetry) = {delta_top_bottom:+.3f}")
+        if "AttnEntropy" in sr:
+            delta_attn_sis = sr["AttnEntropy"] - sr["SIS-top"]
+            lines.append(f"- AttnEntropy vs SIS (cheap proxy gap) = {delta_attn_sis:+.3f}")
 
         if delta_sis_rand <= 0:
-            verdict = "**KILL**: SR(SIS-top-20) ≤ SR(Random-20). SIS does not carry quant-specific signal at this quantization level."
+            verdict = "**KILL**: SR(SIS-top) ≤ SR(Random). SIS does not carry quant-specific signal at this quantization level."
+        elif "Bottom-SIS" in sr and sr["SIS-top"] <= sr["Bottom-SIS"]:
+            verdict = "**KILL**: SR(SIS-top) ≤ SR(Bottom-SIS). SIS rank direction has no signal — failed symmetry control."
         elif delta_sis_oracle > 0.10:
             verdict = "**PARTIAL**: SIS beats random but leaves significant oracle headroom. Detector has signal but misses sensitive frames."
         else:
@@ -549,11 +682,11 @@ def main():
     p = argparse.ArgumentParser()
     g = p.add_mutually_exclusive_group()
     g.add_argument("--smoke", action="store_true",
-                   help="1 trial, all 7 conditions — verifies plumbing")
+                   help="1 trial, all 8 conditions — verifies plumbing")
     g.add_argument("--pilot", action="store_true",
-                   help="20 trials × {W2,FP16,SIS,Random,Oracle} on libero_10 task 0")
+                   help="20 trials × {FP16,W2,SIS-top,Random,MSE-W2traj} on libero_10 task 0")
     g.add_argument("--full", action="store_true",
-                   help="100 trials (50 Long + 50 Object) × all 7 conditions")
+                   help="100 trials (50 Long + 50 Object) × all 8 conditions @ frac=0.5")
     g.add_argument("--analyze", action="store_true",
                    help="produce summary markdown from existing JSONL")
 
@@ -569,7 +702,8 @@ def main():
     p.add_argument("--sigma", type=float, default=8.0)
     p.add_argument("--sis-stride", type=int, default=4,
                    help="recompute SIS every k cycles, reuse last value in between (paper §3 table 12)")
-    p.add_argument("--frac", type=float, default=0.20)
+    p.add_argument("--frac", type=float, default=0.5,
+                   help="override fraction; default 0.5 (pilot showed 0.2 was budget-bound)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--reset", action="store_true",
                    help="delete existing JSONLs before running")
@@ -577,7 +711,7 @@ def main():
     args = p.parse_args()
 
     if args.reset:
-        for f in (DIAG_PATH, ROLLOUT_PATH):
+        for f in (DIAG_PATH, FP16_DIAG_PATH, ROLLOUT_PATH):
             if f.exists():
                 utils.log(f"[expB] removing {f}")
                 f.unlink()
