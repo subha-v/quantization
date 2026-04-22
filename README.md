@@ -163,6 +163,10 @@ python -u scripts/expB_sis_validation.py --full     # 100 trials × 7 conditions
 python -u scripts/expB_sis_validation.py --analyze  # markdown summary from JSONLs
 ```
 
+### ExpB partial pilot (frac=0.20, 9/20 trials, 2026-04-21)
+
+Stopped early because **Oracle-20 also failed on every trial** (0/9 success), making the SIS-vs-Random kill-switch comparison uninformative — the 20% override budget is too sparse to rescue Long task 0 from W2-with-protection regardless of which 20% you pick. Per-frame Spearman SIS vs ‖a_FP-a_W2‖² = -0.031 across 104 cycles also flagged a likely SIS-vs-MSE alignment gap in flow-matching VLAs (vs OpenVLA's autoregressive setup that SQIL was designed for). Retrying at frac=0.5 to give Oracle real headroom. Full writeup in `EXPERIMENT_FINDINGS.md` "Experiment B" section.
+
 ## Key References
 
 - **QVLA** (ICLR 2026) — Action-centric channel-wise quantization for AR VLAs

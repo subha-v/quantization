@@ -526,3 +526,65 @@ Updated the exp5 + exp6 + exp7 section of this document: the "attention as contr
 - `results/exp7_analysis__{w4_both,w4_vlm,w4_expert,w2_vlm_protect}.md`
 - `results/exp8_compare_configs.md` — unified cross-config comparison
 - `results/exp8_per_head__w2_vlm_protect.md` — per-head deep dive on winning config
+
+---
+
+## Experiment B — SIS-gated PTQ validation (partial pilot, 2026-04-21)
+
+**Question.** Does the SQIL paper's State Importance Score (SIS) — perturbation-based action sensitivity, designed for QAT loss weighting — work as a frame-level precision gate for our PTQ setting? Concretely: run W2-with-protection as the cheap default and override with FP16 inference at top-SIS frames. Does that recover the rollout-level success gap?
+
+**Method.** Seven matched conditions per (task, seed, episode_idx): pure W2, pure FP16, SIS-top-20% override, Random-20% (null), Oracle-20% (top-20% by ground-truth ‖a_FP-a_W2‖² on the W2 trajectory), Bottom-SIS-20%, AttnEntropy-top-20% (bottom-20% by `language_model.layers.12.self_attn` head 2 entropy from D2). All conditions share noise schedule per (seed, cycle); only the precision schedule differs. SIS computed with 4×4 Gaussian-blur grid on the base camera, stride k=4, σ=8 — paper-faithful but amortized for inference-time cost. Code in `scripts/sis_utils.py` and `scripts/expB_sis_validation.py`.
+
+**Pilot setup.** 20 seeds on libero_10 task 0, conditions {W2, FP16, SIS-top-20, Random-20, Oracle-20}. Decision rule from the plan: kill if SR(SIS) ≤ SR(Random); proceed otherwise.
+
+### Pilot result — partial (9 of 20 trials before stopping)
+
+| Condition | success | n |
+|---|---:|---:|
+| W2-with-protection | 0/9 | 9 |
+| FP16 | 8/9 | 9 |
+| SIS-top-20 | 0/9 | 9 |
+| Random-20 | 0/9 | 9 |
+| **Oracle-20** | **0/9** | **9** |
+
+Stopped early (9 of 20 planned) because the pattern was already informative for a different reason: **the Oracle baseline failed on every trial too.** That rules out the SIS-vs-Random comparison cleanly — the override-fraction itself (20%) is too sparse to rescue a failed W2-with-protection trajectory on Long task 0. We can't tell whether SIS "works" because no method was given enough overrides to demonstrate signal.
+
+### Per-frame Spearman from the smoke trial (n=104 cycles, libero_10 task 0 ep 0)
+
+| pair | ρ |
+|---|---:|
+| SIS vs ‖a_FP − a_W2‖² (Oracle target) | **−0.031** |
+| SIS vs −entropy at l12h2 (D2 target) | +0.274 |
+| ‖a_FP − a_W2‖² vs −entropy at l12h2 | +0.014 |
+| Top-5 SIS frames ∩ Top-5 MSE frames | 0/5 |
+
+SIS *does* detect something — it tracks layer-12 head-2 attention concentration as expected. But that something is essentially uncorrelated with per-frame quantization MSE in this flow-matching pi0.5 setup. Possibly a real adaptation gap: SQIL's logic assumes input-perturbation sensitivity ≈ quantization sensitivity, which holds for autoregressive OpenVLA where errors propagate through next-token generation; in flow matching, quantization affects the action expert through the cached prefix, decoupled from the image-perturbation pathway.
+
+### Diagnosis
+
+Two independent issues conflated in this pilot:
+
+1. **Override sparsity issue (method-agnostic).** Even Oracle at 20% can't rescue Long task 0. The W2 trajectory diverges fast enough that one-in-five FP16 chunks can't put it back on path. The hypothesis matrix needs Oracle ≥ 50% to give SIS any chance of demonstrating value below it.
+
+2. **SIS-vs-MSE alignment issue (method-specific).** Even before the rollout-level test, the per-frame Spearman is near zero. SIS picks frames that are sensitive to image perturbation; MSE-top-20 picks frames where W2's action diverges from FP16's. These appear to be different sets in pi0.5. Whether higher override frac changes this is empirical — possible that SIS would still beat random at 50% even with weak per-frame correlation, because rollout-level rescue depends on chunk-level dynamics not pure per-frame MSE.
+
+### Next step — frac=0.5 retry
+
+Re-running the pilot at frac=0.5 (50% override). This:
+- gives Oracle a real chance to rescue (4× the override budget)
+- preserves a meaningful precision-savings story (50% W2)
+- keeps the SIS-vs-Random kill switch test intact
+- if Oracle ≈ 80% and SIS only ≈ 30%, that's still a real signal about SIS quality
+
+If frac=0.5 still leaves Oracle < 50%, the next retry will switch to Object suite (easier task; W2 should have non-zero baseline success there per exp6).
+
+### Files of record
+
+**New scripts (2026-04-21):**
+- `scripts/sis_utils.py` — perturbation-based SIS, FP16↔W2 PrecisionController, l12h2 attention-entropy hook
+- `scripts/expB_sis_validation.py` — diagnostic + override rollouts, per-rollout 80th-percentile threshold, bootstrap-CI summary
+
+**Partial pilot data (server, frac=0.20):**
+- `results/expB_diagnostic.jsonl` (936 per-cycle records across 9 trials)
+- `results/expB_rollouts.jsonl` (45 rollouts: 9 trials × 5 conditions)
+- `results/expB_pilot_stdout.log`
