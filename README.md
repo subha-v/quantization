@@ -38,6 +38,8 @@ Studying how weight quantization of the VLM backbone in flow-matching VLAs (pi0,
     ├── exp6_diagnostics.py   — Bootstrap CIs, Spearman + Bonferroni, RF/GB nonlinear comparison
     ├── exp7_per_frame_sensitivity.py — Per-call (obs, FP16, W4) capture for per-frame MSE
     ├── exp7_analyze.py       — Per-frame regression (n=1879, LOTP, ridge/RF, Spearman)
+    ├── sis_utils.py          — SIS computation, FP16/W2 PrecisionController, layer-12-h2 attn hook
+    ├── expB_sis_validation.py — ExpB: counterfactual SIS frame-selection test (7 conditions)
     └── run_all.py            — Orchestrator for overnight runs
 ```
 
@@ -137,6 +139,28 @@ The redesigned `scripts/exp3_flow_step_sensitivity.py`:
 # pick an idle GPU (check `nvidia-smi` first) and run unbuffered:
 CUDA_VISIBLE_DEVICES=1 python -u scripts/exp3_flow_step_sensitivity.py \
   2>&1 | tee /data/<user>/experiments/results/exp3_stdout.log
+```
+
+## ExpB — Saliency-Aware PTQ Validation (2026-04-21)
+
+After mixed evidence from D1/D2/D3 that attention features predict per-frame W2 sensitivity (within-Object R²=0.333), set up a decisive counterfactual test based on the SQIL paper's perturbation-based State Importance Score: SIS(s_t) = E_k ‖π(s_t) − π(φ(s_t,k))‖² where φ Gaussian-blurs an N×N grid cell. SQIL itself is QAT; we adapt the *detector* for PTQ-time precision selection — run W2-with-protection as the cheap default, override with FP16 at top-SIS frames.
+
+Seven matched conditions on (suite, task_id, seed, episode_idx): pure W2, pure FP16, SIS-top-20 override, Random-20 (null), Oracle-20 (top-20% by ground-truth ‖a_FP−a_W2‖²), Bottom-SIS-20 (symmetry control), AttnEntropy-top-20 (cheap-proxy via D2 finding's layer-12 head-2 entropy).
+
+Decision rule from a 20-seed Long-task pilot: if SR(SIS-top-20) ≤ SR(Random-20), kill the project; if SR(SIS-top-20) ≈ SR(Oracle-20) ≫ SR(Random-20), publish.
+
+New code:
+- `scripts/sis_utils.py` — `compute_sis()` with seeded flow-matching noise (otherwise noise variance dominates SIS), `PrecisionController` for O(1) FP16↔W2 weight-pointer swaps, `L12H2EntropyHook` for the attention-entropy probe.
+- `scripts/expB_sis_validation.py` — diagnostic rollout (one pass collects SIS + attn entropy + oracle MSE per cycle), override rollout (replays seed with W2 base + FP16 at masked cycles), per-rollout 80th-percentile threshold, bootstrap-CI markdown summary.
+
+### Running ExpB
+```bash
+# On tambe-server-1 after git pull:
+cd /data/subha2/quantization
+python -u scripts/expB_sis_validation.py --smoke    # 1 trial, all 7 conditions — verifies plumbing
+python -u scripts/expB_sis_validation.py --pilot    # 20 trials × 5 conditions (kill switch)
+python -u scripts/expB_sis_validation.py --full     # 100 trials × 7 conditions
+python -u scripts/expB_sis_validation.py --analyze  # markdown summary from JSONLs
 ```
 
 ## Key References
