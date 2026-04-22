@@ -510,6 +510,157 @@ def run_seed(
 
 
 # ---------------------------------------------------------------------------
+# Frac sweep — reuse existing diagnostic JSONL, run only override rollouts at
+# the requested fracs. Output to a separate JSONL so the main results aren't
+# polluted.
+# ---------------------------------------------------------------------------
+SWEEP_PATH = RESULTS_DIR / "expB_frac_sweep.jsonl"
+
+
+def _load_diagnostic_by_trial():
+    """Group expB_diagnostic.jsonl rows by (suite, task_id, seed, episode_idx).
+    Returns dict[trial_key] = sorted list of per-cycle records."""
+    if not DIAG_PATH.exists():
+        return {}
+    rows = utils.load_jsonl(DIAG_PATH)
+    from collections import defaultdict
+    by_trial = defaultdict(list)
+    for r in rows:
+        key = (r["suite"], int(r["task_id"]), int(r["seed"]), int(r["episode_idx"]))
+        by_trial[key].append(r)
+    for k in by_trial:
+        by_trial[k].sort(key=lambda r: r["cycle_idx"])
+    return dict(by_trial)
+
+
+def run_frac_sweep(fracs, conditions, verbose=False):
+    """For each (frac, condition, trial) combo, build mask from existing W2
+    diagnostic data and run an override rollout. Cheap because we skip both
+    diagnostic passes entirely.
+    """
+    diag_by_trial = _load_diagnostic_by_trial()
+    if not diag_by_trial:
+        utils.log(f"[sweep] no diagnostic data at {DIAG_PATH}; cannot sweep")
+        return
+
+    utils.log(f"[sweep] {len(diag_by_trial)} trials × {len(fracs)} fracs × "
+              f"{len(conditions)} conditions = {len(diag_by_trial)*len(fracs)*len(conditions)} rollouts")
+    utils.log(f"[sweep] fracs: {fracs}")
+    utils.log(f"[sweep] conditions: {conditions}")
+
+    utils.log("[sweep] loading policy + model...")
+    policy, model = utils.load_policy()
+    utils.log("[sweep] building PrecisionController (W2 + protect)...")
+    ctrl = PrecisionController(model, bits=2, group_size=128)
+    ctrl.use_fp16()
+
+    try:
+        for trial_key in sorted(diag_by_trial.keys()):
+            suite, task_id, seed, episode_idx = trial_key
+            per_cycle_w2 = diag_by_trial[trial_key]
+            n_cycles = len(per_cycle_w2)
+
+            for frac in fracs:
+                masks = build_masks(per_cycle_w2, None, frac=frac, seed=seed)
+
+                for cond in conditions:
+                    if cond not in masks:
+                        utils.log(f"[sweep] skip {cond}: not in masks {list(masks.keys())}")
+                        continue
+                    mask = masks[cond]
+                    t0 = time.time()
+                    utils.log(
+                        f"[sweep] frac={frac} {cond} seed={seed} task={task_id} "
+                        f"ep={episode_idx} |mask|={len(mask)}/{n_cycles}"
+                    )
+                    try:
+                        rec = override_rollout(
+                            policy, model, ctrl,
+                            suite, task_id, seed, episode_idx,
+                            override_set=mask,
+                            verbose=verbose,
+                        )
+                    except Exception as e:
+                        utils.log(f"[sweep] FAILED frac={frac} {cond} trial={trial_key}: {e}")
+                        import traceback
+                        traceback.print_exc()
+                        continue
+                    utils.log(
+                        f"[sweep] frac={frac} {cond} done success={rec.success} "
+                        f"steps={rec.steps} wall={time.time()-t0:.1f}s"
+                    )
+                    entry = {
+                        "suite": suite, "task_id": int(task_id),
+                        "seed": int(seed), "episode_idx": int(episode_idx),
+                        "condition": cond, "frac": float(frac),
+                        "success": bool(rec.success), "steps": int(rec.steps),
+                        "wall_time_s": float(rec.wall_time_s),
+                        "termination_reason": rec.termination_reason,
+                        "n_overrides": len(mask),
+                        "n_cycles_w2": n_cycles,
+                    }
+                    utils.append_jsonl(entry, SWEEP_PATH)
+    finally:
+        ctrl.use_fp16()
+
+
+def analyze_sweep():
+    """Per-frac × per-condition success-rate table (overall + per-suite)."""
+    if not SWEEP_PATH.exists():
+        utils.log(f"[sweep] no sweep data at {SWEEP_PATH}")
+        return
+    rows = utils.load_jsonl(SWEEP_PATH)
+    if not rows:
+        return
+    from collections import defaultdict
+    by_frac_cond = defaultdict(list)
+    by_suite_frac_cond = defaultdict(list)
+    for r in rows:
+        by_frac_cond[(r["frac"], r["condition"])].append(r["success"])
+        by_suite_frac_cond[(r["suite"], r["frac"], r["condition"])].append(r["success"])
+
+    fracs = sorted({f for (f, _) in by_frac_cond})
+    conds = sorted({c for (_, c) in by_frac_cond})
+
+    lines = ["# ExpB Frac Sweep Summary\n", f"_n rollouts = {len(rows)}_\n"]
+
+    lines.append("## Overall success rate by (condition, frac)\n")
+    lines.append("| Condition | " + " | ".join(f"frac={f}" for f in fracs) + " |")
+    lines.append("|---|" + "---:|" * len(fracs))
+    for c in conds:
+        cells = [c]
+        for f in fracs:
+            vals = by_frac_cond.get((f, c), [])
+            if vals:
+                m, lo, hi = _bootstrap_ci(vals, n_boot=2000)
+                cells.append(f"{m:.3f} [{lo:.2f},{hi:.2f}] (n={len(vals)})")
+            else:
+                cells.append("—")
+        lines.append("| " + " | ".join(cells) + " |")
+
+    suites = sorted({r["suite"] for r in rows})
+    for s in suites:
+        lines.append(f"\n## {s} success rate by (condition, frac)\n")
+        lines.append("| Condition | " + " | ".join(f"frac={f}" for f in fracs) + " |")
+        lines.append("|---|" + "---:|" * len(fracs))
+        for c in conds:
+            cells = [c]
+            for f in fracs:
+                vals = by_suite_frac_cond.get((s, f, c), [])
+                if vals:
+                    m, lo, hi = _bootstrap_ci(vals, n_boot=2000)
+                    cells.append(f"{m:.3f} [{lo:.2f},{hi:.2f}] (n={len(vals)})")
+                else:
+                    cells.append("—")
+            lines.append("| " + " | ".join(cells) + " |")
+
+    sweep_summary = RESULTS_DIR / "expB_frac_sweep_summary.md"
+    sweep_summary.write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    utils.log(f"[sweep] wrote {sweep_summary}")
+
+
+# ---------------------------------------------------------------------------
 # Multi-seed driver
 # ---------------------------------------------------------------------------
 def run_trials(trials, conditions, n_grid=4, sigma=8.0, sis_stride=4, frac=0.20, verbose=False):
@@ -689,6 +840,11 @@ def main():
                    help="100 trials (50 Long + 50 Object) × all 8 conditions @ frac=0.5")
     g.add_argument("--analyze", action="store_true",
                    help="produce summary markdown from existing JSONL")
+    g.add_argument("--frac-sweep", nargs="+", type=float, default=None,
+                   help="sweep over given fracs, reusing existing W2 diagnostic; "
+                        "writes to expB_frac_sweep.jsonl")
+    g.add_argument("--analyze-sweep", action="store_true",
+                   help="produce per-frac × per-condition table from sweep JSONL")
 
     p.add_argument("--suite", default=None)
     p.add_argument("--task-id", type=int, default=None)
@@ -704,6 +860,9 @@ def main():
                    help="recompute SIS every k cycles, reuse last value in between (paper §3 table 12)")
     p.add_argument("--frac", type=float, default=0.5,
                    help="override fraction; default 0.5 (pilot showed 0.2 was budget-bound)")
+    p.add_argument("--sweep-conditions", nargs="+",
+                   default=["AttnEntropy", "Random"],
+                   help="conditions to run in --frac-sweep mode (default: AttnEntropy Random)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--reset", action="store_true",
                    help="delete existing JSONLs before running")
@@ -711,13 +870,29 @@ def main():
     args = p.parse_args()
 
     if args.reset:
-        for f in (DIAG_PATH, FP16_DIAG_PATH, ROLLOUT_PATH):
-            if f.exists():
-                utils.log(f"[expB] removing {f}")
-                f.unlink()
+        # Sweep mode: only reset the sweep file, never the main diagnostic JSONLs
+        # (we depend on them as input).
+        if args.frac_sweep is not None:
+            if SWEEP_PATH.exists():
+                utils.log(f"[expB] removing {SWEEP_PATH}")
+                SWEEP_PATH.unlink()
+        else:
+            for f in (DIAG_PATH, FP16_DIAG_PATH, ROLLOUT_PATH):
+                if f.exists():
+                    utils.log(f"[expB] removing {f}")
+                    f.unlink()
 
     if args.analyze:
         analyze()
+        return
+
+    if args.analyze_sweep:
+        analyze_sweep()
+        return
+
+    if args.frac_sweep is not None:
+        run_frac_sweep(args.frac_sweep, args.sweep_conditions, verbose=args.verbose)
+        analyze_sweep()
         return
 
     # Build trial set
