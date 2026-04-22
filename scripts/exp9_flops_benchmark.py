@@ -102,32 +102,41 @@ def find_pw_expert(model):
     return "paligemma_with_expert", pw
 
 
+def classify_module(name):
+    """Canonical name-prefix classifier used for both param and FLOPs buckets."""
+    if "vision_tower" in name:
+        return "vision_tower"
+    if "gemma_expert" in name and "lm_head" in name:
+        return "gemma_expert_lm_head_unused"
+    if "gemma_expert" in name:
+        return "gemma_expert"
+    if "language_model" in name:
+        return "paligemma_language_model"
+    if "multi_modal_projector" in name:
+        return "paligemma_projector"
+    if any(k in name for k in ("action_in_proj", "action_out_proj",
+                               "time_mlp_in", "time_mlp_out", "state_proj")):
+        return "action_proj"
+    return "other"
+
+
+BUCKET_ORDER = [
+    "vision_tower",
+    "paligemma_language_model",
+    "paligemma_projector",
+    "gemma_expert",
+    "gemma_expert_lm_head_unused",
+    "action_proj",
+    "other",
+]
+
+
 def module_param_counts(model):
     """Return a flat dict of {role: n_params} for the major components."""
-    buckets = {
-        "vision_tower": 0,
-        "paligemma_language_model": 0,
-        "paligemma_projector_other": 0,
-        "gemma_expert": 0,
-        "action_in_out_proj": 0,
-        "other": 0,
-    }
+    buckets = {k: 0 for k in BUCKET_ORDER}
     for name, p in model.named_parameters():
-        n = p.numel()
-        if "vision_tower" in name:
-            buckets["vision_tower"] += n
-        elif "gemma_expert" in name:
-            buckets["gemma_expert"] += n
-        elif "paligemma_with_expert.paligemma.language_model" in name:
-            buckets["paligemma_language_model"] += n
-        elif "paligemma_with_expert.paligemma" in name:
-            buckets["paligemma_projector_other"] += n
-        elif "action_in_proj" in name or "action_out_proj" in name or "action_time_mlp" in name \
-             or "state_proj" in name:
-            buckets["action_in_out_proj"] += n
-        else:
-            buckets["other"] += n
-    buckets["total"] = sum(v for k, v in buckets.items() if k != "total")
+        buckets[classify_module(name)] += p.numel()
+    buckets["total"] = sum(buckets.values())
     return buckets
 
 
@@ -309,14 +318,7 @@ def analytical_flops(model, seq_lens):
     SeqLenRecorder sees; for a faithful analytical count, capture seq_lens over
     BOTH a prefix pass and a denoise pass (see main).
     """
-    by_bucket = {
-        "vision_tower": 0.0,
-        "paligemma_language_model": 0.0,
-        "paligemma_other": 0.0,
-        "gemma_expert": 0.0,
-        "action_proj": 0.0,
-        "other": 0.0,
-    }
+    by_bucket = {k: 0.0 for k in BUCKET_ORDER}
     unmapped = []
     for name, m in model.named_modules():
         if not isinstance(m, torch.nn.Linear):
@@ -326,19 +328,9 @@ def analytical_flops(model, seq_lens):
             continue
         out_f, in_f = m.weight.shape
         flops = 2.0 * seq * in_f * out_f
-        if "vision_tower" in name:
-            by_bucket["vision_tower"] += flops
-        elif "gemma_expert" in name:
-            by_bucket["gemma_expert"] += flops
-        elif "paligemma_with_expert.paligemma.language_model" in name:
-            by_bucket["paligemma_language_model"] += flops
-        elif "paligemma_with_expert.paligemma" in name:
-            by_bucket["paligemma_other"] += flops
-        elif "action_in_proj" in name or "action_out_proj" in name \
-             or "action_time_mlp" in name or "state_proj" in name:
-            by_bucket["action_proj"] += flops
-        else:
-            by_bucket["other"] += flops
+        bucket = classify_module(name)
+        by_bucket[bucket] += flops
+        if bucket == "other":
             unmapped.append(name)
     return by_bucket, unmapped
 
@@ -594,10 +586,12 @@ def write_markdown(md_path, cfg, gpu, params, timing_summary, flops_summary, bat
     lines.append("")
     lines.append("| component | params | FP16 MiB |")
     lines.append("|---|---:|---:|")
-    for k, v in params.items():
-        if k == "total":
+    for k in BUCKET_ORDER:
+        v = params.get(k, 0)
+        if v == 0:
             continue
-        lines.append(f"| {k} | {v:,} | {v * 2 / 1024 / 1024:.1f} |")
+        label = k + ("  *(loaded but not called during inference)*" if k == "gemma_expert_lm_head_unused" else "")
+        lines.append(f"| {label} | {v:,} | {v * 2 / 1024 / 1024:.1f} |")
     lines.append(f"| **total** | **{params['total']:,}** | **{params['total'] * 2 / 1024 / 1024:.1f}** |")
     lines.append("")
 
@@ -634,10 +628,11 @@ def write_markdown(md_path, cfg, gpu, params, timing_summary, flops_summary, bat
     lines.append("")
     lines.append("| bucket | prefix | per-expert-step | 10-step expert |")
     lines.append("|---|---:|---:|---:|")
-    for k in ["vision_tower", "paligemma_language_model", "paligemma_other",
-              "gemma_expert", "action_proj", "other"]:
+    for k in BUCKET_ORDER:
         p = a["prefix_by_bucket_gflops"].get(k, 0.0)
         e = a["expert_per_step_by_bucket_gflops"].get(k, 0.0)
+        if p == 0 and e == 0:
+            continue
         lines.append(f"| {k} | {p:.2f} | {e:.2f} | {10*e:.2f} |")
     lines.append("")
     lines.append(f"- torch.profiler total (sanity cross-check, one infer): **{flops_summary['profiler_total_gflops']:.1f} GFLOPs**")
