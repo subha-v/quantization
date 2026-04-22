@@ -135,43 +135,52 @@ def diagnostic_rollout(
     task_id: int,
     seed: int,
     episode_idx: int,
-    n_grid: int = 8,
+    n_grid: int = 4,
     sigma: float = 8.0,
+    sis_stride: int = 4,
     verbose: bool = False,
 ):
     """Run a W2-base rollout that also collects per-cycle SIS, l12h2 attention
     entropy, and ||a_FP - a_W2||² (oracle MSE) for every inference cycle.
 
+    SIS perturbation passes are the dominant cost (n_grid² FP16 forwards).
+    `sis_stride` amortizes them: SIS is fully recomputed every `sis_stride`
+    cycles and reused (with the most recent value) for the in-between cycles
+    — same trick as the SQIL paper's k=4 in supplementary §3, table 12.
+    Per-cycle a_FP / attn entropy / a_W2 / oracle MSE are still computed every
+    cycle (cheap: 2 forward passes).
+
     Returns (rollout_record, per_cycle_records). The rollout's executed
     trajectory is condition-1 (pure W2-with-protection).
     """
-    per_cycle = []  # list of dicts, one per inference cycle
-    cycle_idx = [-1]  # closure-mutable
+    per_cycle = []
+    cycle_idx = [-1]
+    last_sis = [float("nan")]
 
     def obs_callback(t, libero_obs, openpi_obs):
         cycle_idx[0] += 1
         i = cycle_idx[0]
-        # Use the seed the patched policy.infer is about to use, so the diagnostic
-        # FP16/W2 measurements share noise with the executed W2 chunk.
         sis_noise_seed = seeded.peek_next_seed()
         ah, ad = get_action_shape(model)
         device = next(model.parameters()).device
         noise_t = make_noise(ah, ad, seed=sis_noise_seed, device=device)
         noise_np = noise_t.cpu().numpy().astype(np.float32)
 
-        # FP16 forward pass: a_clean = a_FP for diagnostic
         ctrl.use_fp16()
         attn_hook.reset()
         a_FP = infer_with_noise(policy, openpi_obs, noise_np)
         attn_e = attn_hook.get_last_entropy_h2()
 
-        # SIS perturbations (still on FP16, reuses a_FP as the clean reference)
-        sis, _ = compute_sis(
-            policy, openpi_obs, noise_np,
-            n_grid=n_grid, sigma=sigma, a_clean=a_FP,
-        )
+        # SIS only on stride-aligned cycles; reuse last value otherwise.
+        is_stride_cycle = (i % sis_stride == 0)
+        if is_stride_cycle:
+            sis, _ = compute_sis(
+                policy, openpi_obs, noise_np,
+                n_grid=n_grid, sigma=sigma, a_clean=a_FP,
+            )
+            last_sis[0] = float(sis)
+        sis_value = last_sis[0]
 
-        # W2 forward pass at the SAME state with the SAME noise → oracle MSE
         ctrl.use_quant()
         a_W2 = infer_with_noise(policy, openpi_obs, noise_np)
         mse = float(np.mean((a_FP - a_W2) ** 2))
@@ -179,14 +188,16 @@ def diagnostic_rollout(
         per_cycle.append({
             "cycle_idx": i,
             "env_step": int(t),
-            "sis": float(sis),
+            "sis": sis_value,
+            "sis_recomputed": bool(is_stride_cycle),
             "attn_entropy_l12h2": float(attn_e) if attn_e == attn_e else None,
             "mse_fp_w2": mse,
         })
         if verbose:
+            tag = "S" if is_stride_cycle else "."
             utils.log(
-                f"[diag] seed={seed} ep={episode_idx} cyc={i:3d} t={t:4d} "
-                f"sis={sis:.5f} attn_e={attn_e:.4f} mse={mse:.5f}"
+                f"[diag {tag}] seed={seed} ep={episode_idx} cyc={i:3d} t={t:4d} "
+                f"sis={sis_value:.5f} attn_e={attn_e:.4f} mse={mse:.5f}"
             )
 
     def pre_infer_callback(t):
@@ -299,7 +310,8 @@ def run_seed(
     policy, model, ctrl, attn_hook,
     suite: str, task_id: int, seed: int, episode_idx: int,
     conditions,
-    n_grid: int = 8, sigma: float = 8.0,
+    n_grid: int = 4, sigma: float = 8.0,
+    sis_stride: int = 4,
     frac: float = 0.20,
     verbose: bool = False,
 ) -> list:
@@ -320,7 +332,8 @@ def run_seed(
         diag_rec, per_cycle = diagnostic_rollout(
             policy, model, ctrl, attn_hook,
             suite, task_id, seed, episode_idx,
-            n_grid=n_grid, sigma=sigma, verbose=verbose,
+            n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
+            verbose=verbose,
         )
         utils.log(
             f"[expB] DIAG done seed={seed} success={diag_rec.success} "
@@ -374,7 +387,7 @@ def run_seed(
 # ---------------------------------------------------------------------------
 # Multi-seed driver
 # ---------------------------------------------------------------------------
-def run_trials(trials, conditions, n_grid=8, sigma=8.0, frac=0.20, verbose=False):
+def run_trials(trials, conditions, n_grid=4, sigma=8.0, sis_stride=4, frac=0.20, verbose=False):
     """trials: list of (suite, task_id, seed, episode_idx) tuples."""
     utils.log(f"[expB] loading policy + model...")
     policy, model = utils.load_policy()
@@ -393,7 +406,8 @@ def run_trials(trials, conditions, n_grid=8, sigma=8.0, frac=0.20, verbose=False
                     policy, model, ctrl, attn_hook,
                     suite, task_id, seed, episode_idx,
                     conditions=conditions,
-                    n_grid=n_grid, sigma=sigma, frac=frac, verbose=verbose,
+                    n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
+                    frac=frac, verbose=verbose,
                 )
             except Exception as e:
                 utils.log(f"[expB] FAILED trial {(suite, task_id, seed, episode_idx)}: {e}")
@@ -550,8 +564,11 @@ def main():
     p.add_argument("--conditions", nargs="+", default=None,
                    help='subset of conditions, or "all" / "pilot"')
 
-    p.add_argument("--n-grid", type=int, default=8)
+    p.add_argument("--n-grid", type=int, default=4,
+                   help="SIS perturbation grid (NxN patches); default 4 for ~10x speedup over paper's 8")
     p.add_argument("--sigma", type=float, default=8.0)
+    p.add_argument("--sis-stride", type=int, default=4,
+                   help="recompute SIS every k cycles, reuse last value in between (paper §3 table 12)")
     p.add_argument("--frac", type=float, default=0.20)
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--reset", action="store_true",
@@ -599,8 +616,8 @@ def main():
     utils.log(f"[expB] conditions: {conditions}")
 
     run_trials(trials, conditions,
-               n_grid=args.n_grid, sigma=args.sigma, frac=args.frac,
-               verbose=args.verbose)
+               n_grid=args.n_grid, sigma=args.sigma, sis_stride=args.sis_stride,
+               frac=args.frac, verbose=args.verbose)
     analyze()
 
 
