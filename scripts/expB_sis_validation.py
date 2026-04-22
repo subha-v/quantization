@@ -383,13 +383,16 @@ def build_masks(per_cycle_w2, per_cycle_fp16, frac: float, seed: int) -> dict:
     rng = _random.Random(seed)
 
     masks = {
-        "FP16":         set(range(n_w2)),
-        "SIS-top":      _topk_indices(sis, k_w2, largest=True),
-        "Random":       set(rng.sample(range(n_w2), k_w2)),
-        "Bottom-SIS":   _topk_indices(sis, k_w2, largest=False),
-        "MSE-W2traj":   _topk_indices(mse, k_w2, largest=True),
-        # Low entropy → high sensitivity (D2 finding ρ=-0.294); pick smallest entropy.
-        "AttnEntropy":  _topk_indices(attn, k_w2, largest=False),
+        "FP16":                 set(range(n_w2)),
+        "SIS-top":              _topk_indices(sis, k_w2, largest=True),
+        "Random":               set(rng.sample(range(n_w2), k_w2)),
+        "Bottom-SIS":           _topk_indices(sis, k_w2, largest=False),
+        "MSE-W2traj":           _topk_indices(mse, k_w2, largest=True),
+        # Low entropy → predicted high sensitivity (D2 finding ρ=-0.294); pick smallest entropy.
+        "AttnEntropy":          _topk_indices(attn, k_w2, largest=False),
+        # Symmetry control: high entropy → predicted LOW sensitivity. If
+        # AttnEntropy ≈ AttnEntropy-flipped, the direction has no signal.
+        "AttnEntropy-flipped":  _topk_indices(attn, k_w2, largest=True),
     }
 
     if per_cycle_fp16 is not None and len(per_cycle_fp16) > 0:
