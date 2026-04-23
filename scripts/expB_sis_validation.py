@@ -59,13 +59,27 @@ from sis_utils import (
 # ---------------------------------------------------------------------------
 RESULTS_DIR = Path(utils.RESULTS_DIR)
 DIAG_PATH = RESULTS_DIR / "expB_diagnostic.jsonl"
+DIAG_V2_PATH = RESULTS_DIR / "expB_diagnostic_v2.jsonl"   # NEW: augmented with W2-pass entropy
 FP16_DIAG_PATH = RESULTS_DIR / "expB_fp16_diagnostic.jsonl"
 ROLLOUT_PATH = RESULTS_DIR / "expB_rollouts.jsonl"
+SCHEMES_ROLLOUT_PATH = RESULTS_DIR / "expB_schemes_rollouts.jsonl"  # NEW: S1/S2 conditions
 SUMMARY_PATH = RESULTS_DIR / "expB_summary.md"
+SCHEMES_SUMMARY_PATH = RESULTS_DIR / "expB_schemes_summary.md"
 
 # ---------------------------------------------------------------------------
-# Conditions (post-pilot: 8 conditions; renamed Oracle-20 → MSE-W2traj for
-# symmetry with new MSE-FP16traj; dropped "-20" suffix since frac is configurable)
+# Conditions
+# Original 8 (binary, FP16-pass entropy or oracle):
+# Plus 5 deployable Scheme 1 / Scheme 2 conditions added 2026-04-22.
+#
+# Scheme 1 (S1): one-frame-lag — at cycle t, decision uses W2-pass entropy from
+#   cycle t-1; cycle 0 defaults to FP16. Zero extra forward passes vs W2 baseline.
+# Scheme 2 (S2): speculative — at cycle t, decision uses W2-pass entropy from
+#   cycle t itself; if non-W2 chosen, deployed system pays a re-run on that cycle
+#   (we measure rescue rate; the bandwidth tax is reported separately).
+#
+# Granularities:
+#   binary  — {W2, FP16} at frac=0.5 (50% FP16, avg ≈ 9 bits)
+#   ternary — {W2, W4, FP16} at 50/30/20 (50% W2, 30% W4, 20% FP16, avg ≈ 5.4 bits)
 # ---------------------------------------------------------------------------
 ALL_CONDITIONS = [
     "FP16",          # 1 — full mask, ceiling
@@ -74,11 +88,24 @@ ALL_CONDITIONS = [
     "Random",        # 4 — random frac% (per-rollout seeded), null
     "Bottom-SIS",    # 5 — bottom-frac% by SIS, symmetry control
     "MSE-W2traj",    # 6 — top-frac% by ‖a_FP-a_W2‖² on W2-traj states
-    "MSE-FP16traj",  # 7 — top-frac% by ‖a_FP-a_W2‖² on FP16-traj states (NEW)
-    "AttnEntropy",   # 8 — bottom-frac% by l12h2 entropy (low entropy = high sensitivity per D2 ρ=-0.29)
+    "MSE-FP16traj",  # 7 — top-frac% by ‖a_FP-a_W2‖² on FP16-traj states
+    "AttnEntropy",   # 8 — bottom-frac% by FP16-pass l12h2 entropy (legacy oracle-deployable)
+    # ---- 2026-04-22: deployable schemes (W2-pass entropy, three-tier optional) ----
+    "S1-Bin",        # 9 — Scheme 1 lag-1 binary {W2, FP16} from W2-pass entropy
+    "S2-Bin",        # 10 — Scheme 2 speculative binary {W2, FP16} from W2-pass entropy
+    "S1-Tern",       # 11 — Scheme 1 lag-1 ternary {W2, W4, FP16} from W2-pass entropy
+    "S2-Tern",       # 12 — Scheme 2 speculative ternary {W2, W4, FP16} from W2-pass entropy
+    "Random-Tern",   # 13 — random ternary partition (matches S1/S2-Tern fractions), null
 ]
 # Legacy pilot conditions (frac=0.5 results live under old labels in the previous JSONLs)
 PILOT_CONDITIONS = ["FP16", "W2", "SIS-top", "Random", "MSE-W2traj"]
+# Deployable-schemes conditions (the 2026-04-22 plan); diagnostic must capture W2-pass entropy.
+SCHEMES_CONDITIONS = ["S1-Bin", "S2-Bin", "S1-Tern", "S2-Tern", "Random-Tern"]
+# Conditions that require attn_entropy_l12h2_w2 in the diagnostic (the augmented field).
+NEEDS_W2_PASS_ENTROPY = {"S1-Bin", "S2-Bin", "S1-Tern", "S2-Tern", "Random-Tern"}
+
+# Bits per param for cost reporting; FP16 = 16, W4 = 4, W2 = 2.
+BITS_BY_PRECISION = {"fp16": 16, "w4": 4, "w2": 2}
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +214,9 @@ def diagnostic_rollout(
         sis_value = last_sis[0]
 
         ctrl.use_quant()
+        attn_hook.reset()  # clear FP16-pass value so the next read is purely W2
         a_W2 = infer_with_noise(policy, openpi_obs, noise_np)
+        attn_e_w2 = attn_hook.get_last_entropy_h2()  # W2-pass entropy (deployable signal)
         mse = float(np.mean((a_FP - a_W2) ** 2))
 
         per_cycle.append({
@@ -196,13 +225,14 @@ def diagnostic_rollout(
             "sis": sis_value,
             "sis_recomputed": bool(is_stride_cycle),
             "attn_entropy_l12h2": float(attn_e) if attn_e == attn_e else None,
+            "attn_entropy_l12h2_w2": float(attn_e_w2) if attn_e_w2 == attn_e_w2 else None,
             "mse_fp_w2": mse,
         })
         if verbose:
             tag = "S" if is_stride_cycle else "."
             utils.log(
                 f"[diag {tag}] seed={seed} ep={episode_idx} cyc={i:3d} t={t:4d} "
-                f"sis={sis_value:.5f} attn_e={attn_e:.4f} mse={mse:.5f}"
+                f"sis={sis_value:.5f} attn_e_fp={attn_e:.4f} attn_e_w2={attn_e_w2:.4f} mse={mse:.5f}"
             )
 
     def pre_infer_callback(t):
@@ -303,7 +333,7 @@ def fp16_diagnostic_rollout(
 
 
 # ---------------------------------------------------------------------------
-# Override rollout — replays seed with W2 base + FP16 override mask
+# Override rollout — replays seed with per-cycle precision schedule
 # ---------------------------------------------------------------------------
 def override_rollout(
     policy,
@@ -313,24 +343,57 @@ def override_rollout(
     task_id: int,
     seed: int,
     episode_idx: int,
-    override_set: set,
+    override_set=None,
+    precision_per_cycle=None,
+    default_precision: str = "w2",
     verbose: bool = False,
 ):
-    """Replay the same (suite, task_id, seed, episode_idx) starting state, with
-    W2-with-protection as the base; at inference cycles whose 0-indexed
-    `cycle_idx` is in `override_set`, run that cycle's `policy.infer` under
-    FP16 weights instead.
+    """Replay the same (suite, task_id, seed, episode_idx) starting state with a
+    per-cycle weight precision schedule.
+
+    Two equivalent ways to specify the schedule (legacy `override_set` kept for
+    backwards compat with the original 8 conditions):
+
+      override_set: set[int]          — binary {default, FP16}; cycles in the
+                                        set go to FP16, others use `default_precision`.
+      precision_per_cycle: dict[int,str] — full per-cycle map; values ∈
+                                        {"fp16", "w4", "w2"}. Cycles not present
+                                        in the map fall back to `default_precision`.
+
+    Both default_precision values must be installable on `ctrl` (FP16 is always
+    available; "w4" requires the controller was built with bits_list=(2, 4)).
 
     Returns the rollout_record.
     """
+    if override_set is not None and precision_per_cycle is not None:
+        raise ValueError("pass either override_set or precision_per_cycle, not both")
+    if override_set is not None:
+        # Convert binary mask to per-cycle dict for unified dispatch.
+        precision_per_cycle = {int(c): "fp16" for c in override_set}
+    if precision_per_cycle is None:
+        precision_per_cycle = {}
+
+    default_precision = default_precision.lower()
+    if default_precision not in BITS_BY_PRECISION:
+        raise ValueError(f"default_precision must be one of {list(BITS_BY_PRECISION)}; got {default_precision}")
+
     cycle_idx = [-1]
+
+    def _set_precision(prec: str) -> None:
+        prec = prec.lower()
+        if prec == "fp16":
+            ctrl.use_fp16()
+        elif prec == "w2":
+            ctrl.use_bits(2)
+        elif prec == "w4":
+            ctrl.use_bits(4)
+        else:
+            raise ValueError(f"unknown precision tag: {prec}")
 
     def pre_infer_callback(t):
         cycle_idx[0] += 1
-        if cycle_idx[0] in override_set:
-            ctrl.use_fp16()
-        else:
-            ctrl.use_quant()
+        prec = precision_per_cycle.get(cycle_idx[0], default_precision)
+        _set_precision(prec)
 
     seeded = SeededInferContext(policy, model, base_seed=seed)
     with seeded:
@@ -346,6 +409,21 @@ def override_rollout(
     return rec
 
 
+def _avg_bits(precision_per_cycle: dict, n_cycles: int, default_precision: str) -> float:
+    """Average bits per parameter across `n_cycles` cycles given the schedule."""
+    if n_cycles <= 0:
+        return float("nan")
+    bits_default = BITS_BY_PRECISION[default_precision.lower()]
+    total = 0.0
+    for i in range(n_cycles):
+        prec = precision_per_cycle.get(i)
+        if prec is None:
+            total += bits_default
+        else:
+            total += BITS_BY_PRECISION[prec.lower()]
+    return total / n_cycles
+
+
 # ---------------------------------------------------------------------------
 # Mask construction from diagnostic per-cycle scores
 # ---------------------------------------------------------------------------
@@ -359,29 +437,99 @@ def _topk_indices(scores, k: int, largest: bool = True) -> set:
     return {i for i, _ in valid[:k]}
 
 
-def build_masks(per_cycle_w2, per_cycle_fp16, frac: float, seed: int) -> dict:
-    """Build the override-frame-index masks from the W2 + FP16 diagnostic data.
+def _rank_indices(scores, ascending: bool):
+    """Return cycle indices sorted by score (ascending=True puts smallest first).
+    NaN scores are dropped and ranked-out — they cannot be ordered."""
+    valid = [(i, s) for i, s in enumerate(scores) if s is not None and s == s]
+    valid.sort(key=lambda x: x[1] if ascending else -x[1])
+    return [i for i, _ in valid]
 
-    `per_cycle_w2` provides SIS, attn entropy, and MSE-W2traj scores (cycles
-    indexed in the W2 trajectory). `per_cycle_fp16` provides MSE-FP16traj
-    scores (cycles indexed in the FP16 trajectory). The two trajectories
-    diverge so cycle counts may differ; each mask is sized as `frac` of its
-    own diagnostic's cycle count, and reflects indices within THAT diagnostic
-    — which align with override-rollout cycle indices since all rollouts share
-    the same starting state.
 
-    Cycle indices in the override mask that aren't reached during a particular
-    rollout simply have no effect.
+def _ternary_assignment(
+    ranked_low_to_high,
+    n_total: int,
+    frac_fp16: float,
+    frac_w4: float,
+    frac_w2: float,
+):
+    """Given indices ranked low-entropy-first (most-sensitive-first per D2 ρ<0),
+    assign the bottom frac_fp16 → 'fp16', next frac_w4 → 'w4', remainder → 'w2'.
+    Indices not appearing in `ranked_low_to_high` (e.g. NaN entropies) get 'w2'.
+
+    Returns {cycle_idx: precision_str}. Cycles not in the dict default to 'w2'
+    at override_rollout time (matches default_precision).
+    """
+    n_fp16 = max(0, int(round(frac_fp16 * n_total)))
+    n_w4 = max(0, int(round(frac_w4 * n_total)))
+    out = {}
+    for k, idx in enumerate(ranked_low_to_high):
+        if k < n_fp16:
+            out[idx] = "fp16"
+        elif k < n_fp16 + n_w4:
+            out[idx] = "w4"
+        else:
+            out[idx] = "w2"
+    return out
+
+
+def _binary_assignment(ranked_low_to_high, n_total: int, frac_fp16: float):
+    """Bottom frac_fp16 of the rank (most-sensitive-first) → 'fp16'; others → 'w2'."""
+    n_fp16 = max(1, int(round(frac_fp16 * n_total)))
+    out = {idx: "fp16" for idx in ranked_low_to_high[:n_fp16]}
+    return out
+
+
+def _lag_one(precision_per_cycle: dict, n_cycles: int) -> dict:
+    """Apply one-frame lag to a per-cycle precision dict: cycle t inherits the
+    decision that would have been made for cycle t-1's signal. Cycle 0 defaults
+    to 'fp16' (bootstrap — no prior frame to read).
+    """
+    lagged = {0: "fp16"}
+    for t in range(1, n_cycles):
+        if (t - 1) in precision_per_cycle:
+            lagged[t] = precision_per_cycle[t - 1]
+    return lagged
+
+
+def build_masks(
+    per_cycle_w2,
+    per_cycle_fp16,
+    frac: float,
+    seed: int,
+    ternary_partition=(0.2, 0.3, 0.5),
+) -> dict:
+    """Build per-condition precision schedules from the diagnostic data.
+
+    Returns dict[condition_name → schedule]. The schedule type depends on the
+    condition's granularity:
+      - Binary conditions return dict[cycle, "fp16"] for cycles in the FP16 set
+        (`override_rollout` will call cycles missing from the dict at the default
+        precision — typically W2). Legacy callers that expected `set` are still
+        supported via `override_set` in `override_rollout`.
+      - Ternary conditions return dict[cycle, "fp16"|"w4"|"w2"].
+
+    `ternary_partition` = (frac_fp16, frac_w4, frac_w2). Must sum to ≤ 1; any
+    remaining cycles default to W2.
+
+    `per_cycle_w2` provides SIS, FP16-pass attn entropy, W2-pass attn entropy,
+    and MSE-W2traj scores (cycles indexed in the W2 trajectory). `per_cycle_fp16`
+    provides MSE-FP16traj scores (cycles indexed in the FP16 trajectory).
     """
     n_w2 = len(per_cycle_w2)
+    if n_w2 == 0:
+        return {}
     k_w2 = max(1, int(round(frac * n_w2)))
 
-    sis  = [c["sis"] for c in per_cycle_w2]
-    mse  = [c["mse_fp_w2"] for c in per_cycle_w2]
-    attn = [c["attn_entropy_l12h2"] for c in per_cycle_w2]
+    sis      = [c["sis"] for c in per_cycle_w2]
+    mse      = [c["mse_fp_w2"] for c in per_cycle_w2]
+    attn_fp  = [c["attn_entropy_l12h2"] for c in per_cycle_w2]
+    # The augmented field is None on legacy diagnostic rows; downstream code
+    # gracefully skips conditions that need it when all values are None.
+    attn_w2  = [c.get("attn_entropy_l12h2_w2") for c in per_cycle_w2]
 
     rng = _random.Random(seed)
 
+    # ---- legacy binary masks (sets, kept for backwards compatibility) ----
     masks = {
         "FP16":                 set(range(n_w2)),
         "SIS-top":              _topk_indices(sis, k_w2, largest=True),
@@ -389,10 +537,10 @@ def build_masks(per_cycle_w2, per_cycle_fp16, frac: float, seed: int) -> dict:
         "Bottom-SIS":           _topk_indices(sis, k_w2, largest=False),
         "MSE-W2traj":           _topk_indices(mse, k_w2, largest=True),
         # Low entropy → predicted high sensitivity (D2 finding ρ=-0.294); pick smallest entropy.
-        "AttnEntropy":          _topk_indices(attn, k_w2, largest=False),
+        "AttnEntropy":          _topk_indices(attn_fp, k_w2, largest=False),
         # Symmetry control: high entropy → predicted LOW sensitivity. If
         # AttnEntropy ≈ AttnEntropy-flipped, the direction has no signal.
-        "AttnEntropy-flipped":  _topk_indices(attn, k_w2, largest=True),
+        "AttnEntropy-flipped":  _topk_indices(attn_fp, k_w2, largest=True),
     }
 
     if per_cycle_fp16 is not None and len(per_cycle_fp16) > 0:
@@ -400,6 +548,36 @@ def build_masks(per_cycle_w2, per_cycle_fp16, frac: float, seed: int) -> dict:
         k_fp = max(1, int(round(frac * n_fp)))
         mse_fp = [c["mse_fp_w2_fp16traj"] for c in per_cycle_fp16]
         masks["MSE-FP16traj"] = _topk_indices(mse_fp, k_fp, largest=True)
+
+    # ---- 2026-04-22: deployable Scheme 1 / Scheme 2 conditions ----
+    # Only build these if the diagnostic has W2-pass entropy (augmented run).
+    if any(v is not None and v == v for v in attn_w2):
+        # Rank cycles low-entropy-first (= predicted-most-sensitive-first per D2 ρ<0).
+        ranked_low = _rank_indices(attn_w2, ascending=True)
+
+        frac_fp16, frac_w4, frac_w2 = ternary_partition
+        if frac_fp16 + frac_w4 + frac_w2 > 1.0 + 1e-6:
+            raise ValueError(f"ternary_partition fractions must sum to ≤ 1; got {ternary_partition}")
+
+        # Scheme 2 (no-lag): apply assignment directly to W2-pass-entropy ranking.
+        s2_bin = _binary_assignment(ranked_low, n_w2, frac_fp16=frac)
+        s2_tern = _ternary_assignment(ranked_low, n_w2, frac_fp16, frac_w4, frac_w2)
+
+        # Scheme 1 (one-frame-lag): same assignment but shift decisions by +1 cycle.
+        s1_bin = _lag_one(s2_bin, n_w2)
+        s1_tern = _lag_one(s2_tern, n_w2)
+
+        # Random ternary control: independent random partition matching the same fractions.
+        rng_t = _random.Random(seed * 7919)  # distinct stream from binary Random
+        all_idx = list(range(n_w2))
+        rng_t.shuffle(all_idx)
+        rand_ternary = _ternary_assignment(all_idx, n_w2, frac_fp16, frac_w4, frac_w2)
+
+        masks["S1-Bin"]      = s1_bin
+        masks["S2-Bin"]      = s2_bin
+        masks["S1-Tern"]     = s1_tern
+        masks["S2-Tern"]     = s2_tern
+        masks["Random-Tern"] = rand_ternary
 
     return masks
 
@@ -414,10 +592,14 @@ def run_seed(
     n_grid: int = 4, sigma: float = 8.0,
     sis_stride: int = 4,
     frac: float = 0.20,
+    ternary_partition=(0.2, 0.3, 0.5),
+    diag_path: Path = None,
     verbose: bool = False,
 ) -> list:
     """Run all requested conditions for one (suite, task_id, seed, episode_idx).
     Appends to JSONL files incrementally and returns the list of rollout records."""
+    if diag_path is None:
+        diag_path = DIAG_PATH
     out = []
     rollout_key = {
         "suite": suite, "task_id": int(task_id),
@@ -425,7 +607,10 @@ def run_seed(
     }
 
     # Conditions that need the W2 diagnostic (SIS, attn entropy, MSE-W2traj scores)
-    NEEDS_W2_DIAG = {"W2", "SIS-top", "Random", "Bottom-SIS", "MSE-W2traj", "AttnEntropy"}
+    NEEDS_W2_DIAG = (
+        {"W2", "SIS-top", "Random", "Bottom-SIS", "MSE-W2traj", "AttnEntropy", "AttnEntropy-flipped"}
+        | set(SCHEMES_CONDITIONS)
+    )
     # Conditions that need the FP16 diagnostic (MSE-FP16traj scores)
     NEEDS_FP16_DIAG = {"FP16", "MSE-FP16traj"}
 
@@ -444,7 +629,7 @@ def run_seed(
             f"steps={w2_rec.steps} cycles={len(w2_per_cycle)} wall={time.time()-t0:.1f}s"
         )
         for c in w2_per_cycle:
-            utils.append_jsonl({**rollout_key, **c}, DIAG_PATH)
+            utils.append_jsonl({**rollout_key, **c}, diag_path)
 
     fp16_rec, fp16_per_cycle = None, None
     if any(c in conditions for c in NEEDS_FP16_DIAG):
@@ -462,31 +647,49 @@ def run_seed(
         for c in fp16_per_cycle:
             utils.append_jsonl({**rollout_key, **c}, FP16_DIAG_PATH)
 
-    masks = build_masks(w2_per_cycle, fp16_per_cycle, frac=frac, seed=seed) \
-        if w2_per_cycle else {}
+    masks = build_masks(
+        w2_per_cycle, fp16_per_cycle, frac=frac, seed=seed,
+        ternary_partition=ternary_partition,
+    ) if w2_per_cycle else {}
     n_cycles_w2 = len(w2_per_cycle) if w2_per_cycle else 0
 
     for cond in conditions:
         if cond == "W2":
             rec = w2_rec
-            mask = set()
+            schedule = {}
+            n_overrides = 0
+            override_indices = []
+            avg_bits = float(BITS_BY_PRECISION["w2"])
         elif cond == "FP16":
             rec = fp16_rec
-            mask = masks.get("FP16", set())  # informational only; FP16 diag IS the FP16 rollout
+            schedule = masks.get("FP16", set())
+            n_overrides = len(schedule)
+            override_indices = sorted(schedule) if isinstance(schedule, set) else sorted(schedule.keys())
+            avg_bits = float(BITS_BY_PRECISION["fp16"])
         else:
             if cond not in masks:
                 utils.log(f"[expB] WARN: skipping {cond} — mask not available")
                 continue
-            mask = masks[cond]
+            schedule = masks[cond]
+            # Normalize set → dict (binary FP16-override) for unified dispatch.
+            if isinstance(schedule, set):
+                precision_per_cycle = {int(c): "fp16" for c in schedule}
+            else:
+                precision_per_cycle = dict(schedule)
+            n_overrides = sum(1 for p in precision_per_cycle.values() if p != "w2")
+            override_indices = sorted(precision_per_cycle.keys())
+            avg_bits = _avg_bits(precision_per_cycle, n_cycles_w2, default_precision="w2")
+
             t0 = time.time()
             utils.log(
                 f"[expB] {cond} seed={seed} task={task_id} ep={episode_idx} "
-                f"|mask|={len(mask)}/{n_cycles_w2}"
+                f"|overrides|={n_overrides}/{n_cycles_w2} avg_bits={avg_bits:.2f}"
             )
             rec = override_rollout(
                 policy, model, ctrl,
                 suite, task_id, seed, episode_idx,
-                override_set=mask,
+                precision_per_cycle=precision_per_cycle,
+                default_precision="w2",
                 verbose=verbose,
             )
             utils.log(
@@ -494,6 +697,8 @@ def run_seed(
                 f"wall={time.time()-t0:.1f}s"
             )
 
+        # Route schemes conditions to the schemes JSONL; legacy to ROLLOUT_PATH.
+        target_path = SCHEMES_ROLLOUT_PATH if cond in SCHEMES_CONDITIONS else ROLLOUT_PATH
         entry = {
             **rollout_key,
             "condition": cond,
@@ -501,12 +706,14 @@ def run_seed(
             "steps": int(rec.steps),
             "wall_time_s": float(rec.wall_time_s),
             "termination_reason": rec.termination_reason,
-            "n_overrides": len(mask),
-            "override_indices": sorted(mask),
+            "n_overrides": n_overrides,
+            "override_indices": override_indices,
             "n_cycles_w2": n_cycles_w2,
             "n_cycles_fp16": len(fp16_per_cycle) if fp16_per_cycle else None,
+            "condition_avg_bits": avg_bits,
+            "ternary_partition": list(ternary_partition) if cond in ("S1-Tern", "S2-Tern", "Random-Tern") else None,
         }
-        utils.append_jsonl(entry, ROLLOUT_PATH)
+        utils.append_jsonl(entry, target_path)
         out.append(entry)
 
     return out
@@ -520,12 +727,18 @@ def run_seed(
 SWEEP_PATH = RESULTS_DIR / "expB_frac_sweep.jsonl"
 
 
-def _load_diagnostic_by_trial():
-    """Group expB_diagnostic.jsonl rows by (suite, task_id, seed, episode_idx).
-    Returns dict[trial_key] = sorted list of per-cycle records."""
-    if not DIAG_PATH.exists():
+def _load_diagnostic_by_trial(diag_path: Path = None):
+    """Group diagnostic JSONL rows by (suite, task_id, seed, episode_idx).
+    Returns dict[trial_key] = sorted list of per-cycle records.
+
+    Defaults to the legacy DIAG_PATH; pass DIAG_V2_PATH to read the augmented
+    diagnostic that contains attn_entropy_l12h2_w2.
+    """
+    if diag_path is None:
+        diag_path = DIAG_PATH
+    if not diag_path.exists():
         return {}
-    rows = utils.load_jsonl(DIAG_PATH)
+    rows = utils.load_jsonl(diag_path)
     from collections import defaultdict
     by_trial = defaultdict(list)
     for r in rows:
@@ -536,15 +749,29 @@ def _load_diagnostic_by_trial():
     return dict(by_trial)
 
 
-def run_frac_sweep(fracs, conditions, verbose=False):
+def run_frac_sweep(
+    fracs, conditions,
+    bits_list=(2,),
+    ternary_partition=(0.2, 0.3, 0.5),
+    diag_path: Path = None,
+    verbose=False,
+):
     """For each (frac, condition, trial) combo, build mask from existing W2
     diagnostic data and run an override rollout. Cheap because we skip both
     diagnostic passes entirely.
+
+    `diag_path` defaults to DIAG_PATH; for the deployable schemes use DIAG_V2_PATH
+    which has attn_entropy_l12h2_w2.
     """
-    diag_by_trial = _load_diagnostic_by_trial()
+    diag_by_trial = _load_diagnostic_by_trial(diag_path=diag_path)
     if not diag_by_trial:
-        utils.log(f"[sweep] no diagnostic data at {DIAG_PATH}; cannot sweep")
+        utils.log(f"[sweep] no diagnostic data at {diag_path or DIAG_PATH}; cannot sweep")
         return
+
+    needs_w4 = any(c in conditions for c in ("S1-Tern", "S2-Tern", "Random-Tern"))
+    if needs_w4 and 4 not in bits_list:
+        bits_list = tuple(sorted(set(bits_list) | {4}))
+        utils.log(f"[sweep] auto-extending bits_list to {bits_list} for ternary conditions")
 
     utils.log(f"[sweep] {len(diag_by_trial)} trials × {len(fracs)} fracs × "
               f"{len(conditions)} conditions = {len(diag_by_trial)*len(fracs)*len(conditions)} rollouts")
@@ -553,8 +780,8 @@ def run_frac_sweep(fracs, conditions, verbose=False):
 
     utils.log("[sweep] loading policy + model...")
     policy, model = utils.load_policy()
-    utils.log("[sweep] building PrecisionController (W2 + protect)...")
-    ctrl = PrecisionController(model, bits=2, group_size=128)
+    utils.log(f"[sweep] building PrecisionController (bits_list={bits_list} + protect)...")
+    ctrl = PrecisionController(model, bits_list=bits_list, group_size=128)
     ctrl.use_fp16()
 
     try:
@@ -564,23 +791,34 @@ def run_frac_sweep(fracs, conditions, verbose=False):
             n_cycles = len(per_cycle_w2)
 
             for frac in fracs:
-                masks = build_masks(per_cycle_w2, None, frac=frac, seed=seed)
+                masks = build_masks(
+                    per_cycle_w2, None, frac=frac, seed=seed,
+                    ternary_partition=ternary_partition,
+                )
 
                 for cond in conditions:
                     if cond not in masks:
                         utils.log(f"[sweep] skip {cond}: not in masks {list(masks.keys())}")
                         continue
-                    mask = masks[cond]
+                    schedule = masks[cond]
+                    if isinstance(schedule, set):
+                        precision_per_cycle = {int(c): "fp16" for c in schedule}
+                    else:
+                        precision_per_cycle = dict(schedule)
+                    n_overrides = sum(1 for p in precision_per_cycle.values() if p != "w2")
+                    avg_bits = _avg_bits(precision_per_cycle, n_cycles, default_precision="w2")
+
                     t0 = time.time()
                     utils.log(
                         f"[sweep] frac={frac} {cond} seed={seed} task={task_id} "
-                        f"ep={episode_idx} |mask|={len(mask)}/{n_cycles}"
+                        f"ep={episode_idx} |overrides|={n_overrides}/{n_cycles} avg_bits={avg_bits:.2f}"
                     )
                     try:
                         rec = override_rollout(
                             policy, model, ctrl,
                             suite, task_id, seed, episode_idx,
-                            override_set=mask,
+                            precision_per_cycle=precision_per_cycle,
+                            default_precision="w2",
                             verbose=verbose,
                         )
                     except Exception as e:
@@ -599,8 +837,10 @@ def run_frac_sweep(fracs, conditions, verbose=False):
                         "success": bool(rec.success), "steps": int(rec.steps),
                         "wall_time_s": float(rec.wall_time_s),
                         "termination_reason": rec.termination_reason,
-                        "n_overrides": len(mask),
+                        "n_overrides": n_overrides,
                         "n_cycles_w2": n_cycles,
+                        "condition_avg_bits": avg_bits,
+                        "ternary_partition": list(ternary_partition) if cond in ("S1-Tern", "S2-Tern", "Random-Tern") else None,
                     }
                     utils.append_jsonl(entry, SWEEP_PATH)
     finally:
@@ -666,13 +906,32 @@ def analyze_sweep():
 # ---------------------------------------------------------------------------
 # Multi-seed driver
 # ---------------------------------------------------------------------------
-def run_trials(trials, conditions, n_grid=4, sigma=8.0, sis_stride=4, frac=0.20, verbose=False):
-    """trials: list of (suite, task_id, seed, episode_idx) tuples."""
+def run_trials(
+    trials, conditions,
+    n_grid=4, sigma=8.0, sis_stride=4, frac=0.20,
+    bits_list=(2,),
+    ternary_partition=(0.2, 0.3, 0.5),
+    diag_path: Path = None,
+    verbose=False,
+):
+    """trials: list of (suite, task_id, seed, episode_idx) tuples.
+
+    `bits_list` controls which quantized weight tiers PrecisionController caches.
+    Use (2, 4) when running ternary conditions (S1-Tern / S2-Tern / Random-Tern);
+    legacy default (2,) preserves the original ExpB memory footprint.
+    `diag_path` overrides DIAG_PATH (e.g. write augmented W2-pass entropy to
+    DIAG_V2_PATH instead of clobbering the legacy expB_diagnostic.jsonl).
+    """
+    needs_w4 = any(c in conditions for c in ("S1-Tern", "S2-Tern", "Random-Tern"))
+    if needs_w4 and 4 not in bits_list:
+        bits_list = tuple(sorted(set(bits_list) | {4}))
+        utils.log(f"[expB] auto-extending bits_list to {bits_list} for ternary conditions")
+
     utils.log(f"[expB] loading policy + model...")
     policy, model = utils.load_policy()
 
-    utils.log(f"[expB] building PrecisionController (W2 + protect)...")
-    ctrl = PrecisionController(model, bits=2, group_size=128)
+    utils.log(f"[expB] building PrecisionController (bits_list={bits_list} + protect)...")
+    ctrl = PrecisionController(model, bits_list=bits_list, group_size=128)
     ctrl.use_fp16()  # start clean
 
     utils.log(f"[expB] installing L12H2 attention hook...")
@@ -686,7 +945,10 @@ def run_trials(trials, conditions, n_grid=4, sigma=8.0, sis_stride=4, frac=0.20,
                     suite, task_id, seed, episode_idx,
                     conditions=conditions,
                     n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
-                    frac=frac, verbose=verbose,
+                    frac=frac,
+                    ternary_partition=ternary_partition,
+                    diag_path=diag_path,
+                    verbose=verbose,
                 )
             except Exception as e:
                 utils.log(f"[expB] FAILED trial {(suite, task_id, seed, episode_idx)}: {e}")
@@ -832,6 +1094,28 @@ def full_trials():
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
+def _parse_ternary_partition(s: str) -> tuple:
+    """Parse '0.2,0.3,0.5' into (frac_fp16, frac_w4, frac_w2)."""
+    parts = [float(x) for x in s.split(",")]
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            f"ternary-partition must be three comma-separated floats (FP16,W4,W2); got {s!r}"
+        )
+    if any(x < 0 for x in parts) or sum(parts) > 1.0 + 1e-6:
+        raise argparse.ArgumentTypeError(
+            f"ternary-partition fractions must be ≥0 and sum ≤1; got {parts}"
+        )
+    return tuple(parts)
+
+
+def _parse_trial_range(s: str) -> slice:
+    """Parse 'A:B' into a slice(A, B). Either bound may be omitted."""
+    if ":" not in s:
+        raise argparse.ArgumentTypeError(f"trial-range must be 'A:B' (slice); got {s!r}")
+    a, b = s.split(":", 1)
+    return slice(int(a) if a else None, int(b) if b else None)
+
+
 def main():
     p = argparse.ArgumentParser()
     g = p.add_mutually_exclusive_group()
@@ -840,7 +1124,11 @@ def main():
     g.add_argument("--pilot", action="store_true",
                    help="20 trials × {FP16,W2,SIS-top,Random,MSE-W2traj} on libero_10 task 0")
     g.add_argument("--full", action="store_true",
-                   help="100 trials (50 Long + 50 Object) × all 8 conditions @ frac=0.5")
+                   help="100 trials (50 Long + 50 Object) × all legacy conditions @ frac=0.5")
+    g.add_argument("--schemes", action="store_true",
+                   help="100 trials × {S1-Bin, S2-Bin, S1-Tern, S2-Tern, Random-Tern} @ frac=0.5; "
+                        "implies --recompute-diagnostic and writes to expB_diagnostic_v2.jsonl + "
+                        "expB_schemes_rollouts.jsonl. Default for the 2026-04-22 deployable plan.")
     g.add_argument("--analyze", action="store_true",
                    help="produce summary markdown from existing JSONL")
     g.add_argument("--frac-sweep", nargs="+", type=float, default=None,
@@ -854,7 +1142,7 @@ def main():
     p.add_argument("--seeds", type=int, nargs="+", default=None)
     p.add_argument("--episode-idx", type=int, default=0)
     p.add_argument("--conditions", nargs="+", default=None,
-                   help='subset of conditions, or "all" / "pilot"')
+                   help='subset of conditions, or "all" / "pilot" / "schemes"')
 
     p.add_argument("--n-grid", type=int, default=4,
                    help="SIS perturbation grid (NxN patches); default 4 for ~10x speedup over paper's 8")
@@ -862,10 +1150,23 @@ def main():
     p.add_argument("--sis-stride", type=int, default=4,
                    help="recompute SIS every k cycles, reuse last value in between (paper §3 table 12)")
     p.add_argument("--frac", type=float, default=0.5,
-                   help="override fraction; default 0.5 (pilot showed 0.2 was budget-bound)")
+                   help="override fraction (binary granularity); default 0.5 (pilot showed 0.2 was budget-bound)")
+    p.add_argument("--ternary-partition", type=_parse_ternary_partition, default=(0.2, 0.3, 0.5),
+                   help="comma-separated FP16,W4,W2 fractions for ternary conditions; default 0.2,0.3,0.5")
+    p.add_argument("--trial-range", type=_parse_trial_range, default=None,
+                   help="slice into the full/schemes trial list as 'A:B' (e.g. 0:50 / 50:100). "
+                        "Use with --schemes to split work across two GPUs.")
+    p.add_argument("--recompute-diagnostic", action="store_true",
+                   help="write the augmented diagnostic (with attn_entropy_l12h2_w2) to "
+                        "expB_diagnostic_v2.jsonl, leaving the legacy expB_diagnostic.jsonl intact. "
+                        "Implied by --schemes.")
     p.add_argument("--sweep-conditions", nargs="+",
                    default=["AttnEntropy", "Random"],
                    help="conditions to run in --frac-sweep mode (default: AttnEntropy Random)")
+    p.add_argument("--sweep-diag", choices=("legacy", "v2"), default="legacy",
+                   help="which diagnostic JSONL to read in sweep mode: 'legacy' = expB_diagnostic.jsonl "
+                        "(default; works with all original conditions), 'v2' = expB_diagnostic_v2.jsonl "
+                        "(required for S1-* / S2-* / Random-Tern conditions in sweep mode)")
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--reset", action="store_true",
                    help="delete existing JSONLs before running")
@@ -879,6 +1180,12 @@ def main():
             if SWEEP_PATH.exists():
                 utils.log(f"[expB] removing {SWEEP_PATH}")
                 SWEEP_PATH.unlink()
+        elif args.schemes:
+            # Schemes mode: reset only the augmented diag + schemes rollouts (preserve legacy).
+            for f in (DIAG_V2_PATH, SCHEMES_ROLLOUT_PATH):
+                if f.exists():
+                    utils.log(f"[expB] removing {f}")
+                    f.unlink()
         else:
             for f in (DIAG_PATH, FP16_DIAG_PATH, ROLLOUT_PATH):
                 if f.exists():
@@ -894,11 +1201,19 @@ def main():
         return
 
     if args.frac_sweep is not None:
-        run_frac_sweep(args.frac_sweep, args.sweep_conditions, verbose=args.verbose)
+        sweep_diag_path = DIAG_V2_PATH if args.sweep_diag == "v2" else DIAG_PATH
+        run_frac_sweep(
+            args.frac_sweep, args.sweep_conditions,
+            bits_list=(2, 4),
+            ternary_partition=args.ternary_partition,
+            diag_path=sweep_diag_path,
+            verbose=args.verbose,
+        )
         analyze_sweep()
         return
 
     # Build trial set
+    diag_path_for_trials = DIAG_PATH
     if args.smoke:
         trials = [("Long", 0, 0, 0)]
         conditions = ALL_CONDITIONS
@@ -907,29 +1222,53 @@ def main():
         conditions = PILOT_CONDITIONS
     elif args.full:
         trials = full_trials()
-        conditions = ALL_CONDITIONS
+        conditions = [c for c in ALL_CONDITIONS if c not in SCHEMES_CONDITIONS]
+    elif args.schemes:
+        trials = full_trials()
+        conditions = SCHEMES_CONDITIONS
+        # Schemes mode requires the augmented diagnostic. Implies --recompute-diagnostic.
+        diag_path_for_trials = DIAG_V2_PATH
     else:
         if args.suite is None or args.task_id is None or not args.seeds:
-            p.error("must specify --smoke / --pilot / --full / --analyze, "
+            p.error("must specify --smoke / --pilot / --full / --schemes / --analyze, "
                     "or (--suite + --task-id + --seeds)")
         trials = [(args.suite, args.task_id, s, args.episode_idx) for s in args.seeds]
         if args.conditions is None or args.conditions == ["all"]:
             conditions = ALL_CONDITIONS
         elif args.conditions == ["pilot"]:
             conditions = PILOT_CONDITIONS
+        elif args.conditions == ["schemes"]:
+            conditions = SCHEMES_CONDITIONS
         else:
             unknown = [c for c in args.conditions if c not in ALL_CONDITIONS]
             if unknown:
                 p.error(f"unknown conditions: {unknown}; known: {ALL_CONDITIONS}")
             conditions = args.conditions
+        if any(c in SCHEMES_CONDITIONS for c in conditions) or args.recompute_diagnostic:
+            diag_path_for_trials = DIAG_V2_PATH
+
+    if args.trial_range is not None:
+        trials = trials[args.trial_range]
+        utils.log(f"[expB] applied --trial-range {args.trial_range}: {len(trials)} trials remain")
+
+    # Decide bits_list: ternary conditions need W4 cached.
+    bits_list = (2, 4) if any(c in conditions for c in ("S1-Tern", "S2-Tern", "Random-Tern")) else (2,)
 
     utils.log(f"[expB] {len(trials)} trials × {len(conditions)} conditions = "
               f"{len(trials) * len(conditions)} rollouts (+ {len(trials)} diagnostic passes)")
     utils.log(f"[expB] conditions: {conditions}")
+    utils.log(f"[expB] diag path: {diag_path_for_trials}")
+    utils.log(f"[expB] bits_list: {bits_list}; ternary_partition: {args.ternary_partition}")
 
-    run_trials(trials, conditions,
-               n_grid=args.n_grid, sigma=args.sigma, sis_stride=args.sis_stride,
-               frac=args.frac, verbose=args.verbose)
+    run_trials(
+        trials, conditions,
+        n_grid=args.n_grid, sigma=args.sigma, sis_stride=args.sis_stride,
+        frac=args.frac,
+        bits_list=bits_list,
+        ternary_partition=args.ternary_partition,
+        diag_path=diag_path_for_trials,
+        verbose=args.verbose,
+    )
     analyze()
 
 

@@ -38,8 +38,10 @@ Studying how weight quantization of the VLM backbone in flow-matching VLAs (pi0,
     ├── exp6_diagnostics.py   — Bootstrap CIs, Spearman + Bonferroni, RF/GB nonlinear comparison
     ├── exp7_per_frame_sensitivity.py — Per-call (obs, FP16, W4) capture for per-frame MSE
     ├── exp7_analyze.py       — Per-frame regression (n=1879, LOTP, ridge/RF, Spearman)
-    ├── sis_utils.py          — SIS computation, FP16/W2 PrecisionController, layer-12-h2 attn hook
-    ├── expB_sis_validation.py — ExpB: counterfactual SIS frame-selection test (7 conditions)
+    ├── sis_utils.py          — SIS computation, FP16/W2/W4 PrecisionController, layer-12-h2 attn hook
+    ├── expB_sis_validation.py — ExpB: 8 legacy conditions + 5 deployable Scheme 1/2 conditions (W2/W4/FP16 ternary)
+    ├── expB_schemes_analyze.py — Bootstrap-CI analysis + matched-trial deltas for the deployable-schemes run
+    ├── exp2_suite_split_table.py — Per-suite (Object vs Long) per-layer-group ExpB split into LaTeX
     └── run_all.py            — Orchestrator for overnight runs
 ```
 
@@ -193,6 +195,28 @@ Full experiment took 6h 9min on a single H100 (batched SIS perturbations gave ~1
 3. **MSE-FP16traj catastrophically failed (0.01).** Per-frame MSE rankings only transfer across trajectories that visit similar states — the W2-base override rollout doesn't visit the FP16 states the FP16-traj diagnostic ranked. Methodological caution.
 
 Full writeup with per-suite tables, verdict revision (the auto-printed "STRONG" verdict was based on weak SIS vs Random, missed the AttnEntropy headline), and trajectory-divergence analysis in `EXPERIMENT_FINDINGS.md` → "Experiment B → Full experiment (2026-04-22)".
+
+## ExpB — Deployable Schemes (staged 2026-04-22, awaiting GPU)
+
+Follow-up to ExpB's AttnEntropy headline. The original 68% rescue rate used l12h2 entropy captured during a forced FP16 forward pass inside the diagnostic — not a deployable signal in production. Two deployable variants now staged in `scripts/expB_sis_validation.py`:
+
+- **Scheme 1 (one-frame-lag, `S1-Bin`/`S1-Tern`):** read W2-pass entropy from frame *t*, gate frame *t+1*'s precision; cycle 0 bootstraps to FP16. Zero extra compute.
+- **Scheme 2 (speculative, `S2-Bin`/`S2-Tern`):** read W2-pass entropy from frame *t*'s cheap pass, optionally re-run *t* at higher precision. No lag; pays a bandwidth tax on escalations (reported via `condition_avg_bits` in the rollout JSONL).
+
+Both schemes available at **binary {W2, FP16}** (frac=0.5) and **ternary {W2, W4, FP16}** (default 50/30/20 → ~5.4 avg bits, configurable via `--ternary-partition`). `Random-Tern` is the matched-fraction control. `PrecisionController` extended to cache multiple bit tiers simultaneously via `bits_list=(2, 4)`.
+
+```bash
+# When a GPU on tambe-server-1 frees up (always run nvidia-smi --query-compute-apps first):
+cd /data/subha2/experiments
+CUDA_VISIBLE_DEVICES=<idx> nohup /data/subha2/openpi/.venv/bin/python \
+  /data/subha2/quantization/scripts/expB_sis_validation.py --schemes \
+  --frac 0.5 --ternary-partition "0.2,0.3,0.5" \
+  > results/expB_schemes_stdout.log 2>&1 &
+# Post-hoc analysis:
+/data/subha2/openpi/.venv/bin/python /data/subha2/quantization/scripts/expB_schemes_analyze.py
+```
+
+The analysis script evaluates H1–H5 from the plan: Scheme-1 viability, Scheme-2 vs Scheme-1 lag tax, ternary-vs-binary granularity gain, ternary direction symmetry control, and W2-pass-vs-FP16-pass entropy correlation.
 
 ## Key References
 

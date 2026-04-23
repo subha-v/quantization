@@ -243,33 +243,56 @@ def _quantize_weight(w: torch.Tensor, bits: int, group_size: int = 128) -> torch
 
 
 class PrecisionController:
-    """Maintains FP16 originals + W2-with-protection precomputed weights for
-    every quantizable VLM Linear. Swaps via `weight.data = ...` (no copy).
+    """Maintains FP16 originals + one or more quantized-with-protection precomputed
+    weight tensors for every quantizable VLM Linear. Swaps via `weight.data = ...`
+    (no copy).
 
-    Memory cost: one extra weight tensor per quantized Linear (~equal to the
-    VLM's quantizable weight footprint). On pi0.5 this is a few GB — fine
-    on a server GPU.
+    Memory cost: one extra weight tensor per quantized Linear per bits value
+    (~equal to the VLM's quantizable weight footprint per tier). On pi0.5
+    with bits_list=(2, 4) this is FP16 + W4 + W2 ≈ 8.25 GB total — fits on H100.
 
     Usage:
-        ctrl = PrecisionController(model, bits=2)
-        ctrl.use_fp16()    # → original weights
-        ctrl.use_quant()   # → W2-with-protection
+        ctrl = PrecisionController(model, bits_list=(2, 4))
+        ctrl.use_fp16()        # → original weights
+        ctrl.use_bits(2)       # → W2-with-protection (alias: use_quant())
+        ctrl.use_bits(4)       # → W4-with-protection
         # ... inference happens normally; no other code changes needed.
+
+    Backwards compat: `bits=N` (legacy scalar) is accepted and converted to
+    `bits_list=(N,)`. Default remains W2-only to keep the legacy ExpB path's
+    memory footprint unchanged.
     """
 
-    def __init__(self, model: torch.nn.Module, bits: int = 2, group_size: int = 128):
+    def __init__(
+        self,
+        model: torch.nn.Module,
+        bits=None,
+        bits_list=None,
+        group_size: int = 128,
+    ):
+        if bits is not None and bits_list is not None:
+            raise ValueError("Pass either `bits` (legacy scalar) or `bits_list`, not both")
+        if bits is None and bits_list is None:
+            bits_list = (2,)
+        elif bits is not None:
+            bits_list = (int(bits),)
+        bits_list = tuple(int(b) for b in bits_list)
+        if any(b <= 0 or b > 16 for b in bits_list):
+            raise ValueError(f"bits_list must be in (0, 16]; got {bits_list}")
+
         self.model = model
-        self.bits = bits
+        self.bits_list = bits_list
         self.group_size = group_size
 
         self.vlm_name, self.vlm = find_vlm_root(model)
         protect = _get_bottleneck_protect_modules(model)
         self.protect_prefixes = [n for n, _ in protect]
 
-        # name → module / fp16 weight tensor / quantized weight tensor
+        # name → module / fp16 weight tensor / quantized weight tensor per bits
         self.linear_modules: dict = {}
         self.fp16_weights: dict = {}
-        self.quant_weights: dict = {}
+        # bits → {name: quantized_weight_tensor}
+        self.quant_weights_by_bits: dict = {b: {} for b in bits_list}
 
         n_quantized = 0
         n_protected = 0
@@ -282,16 +305,27 @@ class PrecisionController:
                 continue
             self.linear_modules[global_name] = m
             self.fp16_weights[global_name] = m.weight.data
-            self.quant_weights[global_name] = _quantize_weight(
-                m.weight.data, bits=bits, group_size=group_size
-            )
+            for b in bits_list:
+                self.quant_weights_by_bits[b][global_name] = _quantize_weight(
+                    m.weight.data, bits=b, group_size=group_size
+                )
             n_quantized += 1
 
         self.current = "fp16"
         utils.log(
-            f"[PrecisionController] bits={bits} quantized={n_quantized} "
-            f"protected={n_protected} (W2 keeps {self.protect_prefixes} at FP16)"
+            f"[PrecisionController] bits_list={bits_list} quantized={n_quantized} "
+            f"protected={n_protected} (protect prefixes kept at FP16: {self.protect_prefixes})"
         )
+
+    @property
+    def bits(self) -> int:
+        """Legacy alias: the smallest cached bits value. Used to be a scalar."""
+        return min(self.bits_list)
+
+    @property
+    def quant_weights(self) -> dict:
+        """Legacy alias for the smallest-bits cache. Preserves use_quant() semantics."""
+        return self.quant_weights_by_bits[min(self.bits_list)]
 
     def use_fp16(self) -> None:
         if self.current == "fp16":
@@ -300,18 +334,35 @@ class PrecisionController:
             mod.weight.data = self.fp16_weights[name]
         self.current = "fp16"
 
-    def use_quant(self) -> None:
-        if self.current == "quant":
+    def use_bits(self, bits: int) -> None:
+        """Swap to the cached weights for the given bits value.
+
+        Raises if `bits` was not in the constructor's bits_list (so we don't
+        silently quantize on the hot path)."""
+        bits = int(bits)
+        if bits not in self.quant_weights_by_bits:
+            raise KeyError(
+                f"bits={bits} not cached; controller was built with bits_list={self.bits_list}"
+            )
+        target = f"w{bits}"
+        if self.current == target:
             return
+        cache = self.quant_weights_by_bits[bits]
         for name, mod in self.linear_modules.items():
-            mod.weight.data = self.quant_weights[name]
-        self.current = "quant"
+            mod.weight.data = cache[name]
+        self.current = target
+
+    def use_quant(self) -> None:
+        """Legacy alias: swap to the smallest-bits cache (typically W2)."""
+        self.use_bits(min(self.bits_list))
 
     def restore_fp16_permanent(self) -> None:
-        """Drop the quant cache and ensure FP16 is installed. Call before
+        """Drop all quant caches and ensure FP16 is installed. Call before
         unrelated downstream work."""
         self.use_fp16()
-        self.quant_weights.clear()
+        for cache in self.quant_weights_by_bits.values():
+            cache.clear()
+        self.quant_weights_by_bits.clear()
 
 
 # ===================================================================
