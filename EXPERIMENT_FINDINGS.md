@@ -796,3 +796,56 @@ The deployment story is now decisive: **use l12h2 attention entropy as the per-f
 
 - `results/expB_frac_sweep.jsonl` (1000 rollouts: 100 trials × 2 fracs × 5 conditions)
 - `results/expB_frac_sweep_summary.md` (regenerated with all 5 conditions)
+
+### Deployment caveat — what the AttnEntropy result actually validated (2026-04-22)
+
+A clarification worth pinning down before any "AttnEntropy is free at inference time" claim makes it into a paper.
+
+**What our PrecisionController does.** It swaps *all* non-protected VLM Linear weights in O(1) before each `policy.infer` call (the existing-weight pointers live next to a precomputed-quantized-weight cache; `weight.data = ...` switches between them). It does not do per-layer adaptive precision within a single forward pass — at any moment the entire VLM is either FP16 or W2-with-protection.
+
+**How the AttnEntropy override condition actually got its mask.** Per (suite, task_id, seed, episode_idx):
+
+1. Run a full W2 diagnostic rollout. In its `obs_callback`, swap to FP16 *before* each cycle's measurement, run a forward pass, read l12h2 head 2 attention entropy from the hook, then swap back to W2 for the actual rollout step.
+2. After the diagnostic completes, rank the per-cycle entropy values across the whole rollout, take the bottom 50%.
+3. Replay the seed in a separate "override rollout": at each cycle whose index is in the precomputed mask, swap to FP16 for that cycle's `policy.infer`; otherwise W2.
+
+So **the entropy was computed on a full FP16 forward pass during the diagnostic** — not online, and not from a W2 pass. The override decision used those FP16-measured entropies as a stand-in for "what an oracle detector would say."
+
+**What that means.** The result validates that the *signal* l12h2 head 2 entropy carries is the right signal to gate precision on. It does *not* directly validate a deployable runtime detector, because:
+
+- To compute entropy at l12h2 you have to run the model up to layer 12.
+- If you've run layers 0-12 in some precision X, you can't retroactively pick a different X for those layers.
+- "Use FP16 at this frame" therefore can't be a decision made *during* this frame's forward pass.
+
+#### Option (1) — one-frame-lag deployable scheme
+
+The most promising deployable path, because it requires no architecture changes and no per-layer precision swapping:
+
+```
+state at frame t:
+    precision_t = decision made at frame t-1
+    run policy.infer at precision_t
+    as a side-effect of that pass, read l12h2 head 2 entropy E_t
+    if E_t < threshold (low entropy → predicted high sensitivity):
+        decision for frame t+1 = FP16
+    else:
+        decision for frame t+1 = W2
+```
+
+Properties:
+- **Zero extra compute.** Entropy is read from a softmax tensor that already had to be computed; the hook is one tensor reduction.
+- **One-frame lag.** Frame t+1's precision is decided by frame t's signal. Robot trajectories are smooth (5 Hz control on LIBERO), so the entropy at adjacent frames is correlated.
+- **Bootstrapping.** Pick the first frame's precision arbitrarily (e.g. FP16); subsequent frames adapt.
+
+#### What needs to be validated before claiming option (1) works
+
+The signal validated in the experiment is **FP16-pass l12h2 entropy**. Option (1) reads entropy from whichever precision is currently running — so on most cycles it's reading **W2-pass l12h2 entropy** instead. The one-frame-lag scheme works only if these are highly correlated.
+
+The correlation check is cheap. For each trial we already have FP16-pass entropy in `expB_diagnostic.jsonl`. Run one extra rollout per trial that computes entropy on each cycle's W2 forward pass, then per-trial Spearman ρ between FP16-pass and W2-pass entropies. If ρ > ~0.7 across trials, the one-frame-lag scheme is viable.
+
+Estimated cost: 100 trials × ~30s = ~50 min on H100, reusing the existing diagnostic infrastructure.
+
+Until that check runs, the honest framing of the AttnEntropy result is:
+
+- **Research claim (validated):** l12h2 head 2 attention entropy is the per-frame signal that best ranks which frames a W2-with-protection trajectory needs FP16 rescue at; it dominates SIS, beats per-frame-MSE oracle, and has a clean direction-symmetry control.
+- **Deployment claim (not yet validated):** that signal can be read cheaply enough at runtime to support a streaming precision gate. The most promising path is the one-frame-lag scheme above; it depends on FP16-pass-entropy and W2-pass-entropy being highly correlated.
