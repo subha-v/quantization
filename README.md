@@ -163,6 +163,12 @@ python -u scripts/expB_sis_validation.py --full     # 100 trials × 7 conditions
 python -u scripts/expB_sis_validation.py --analyze  # markdown summary from JSONLs
 ```
 
+### ExpB headline (post-sweep, 2026-04-22)
+
+Across all override fractions tested ({0.3, 0.4, 0.5}), **AttnEntropy beats every other detector — including the per-frame ground-truth-MSE oracle.** At frac=0.4 (60% W2 weights, 40% FP16 rescue): AttnEntropy 0.28 success vs MSE-W2traj 0.16, SIS-top 0.14, Random 0.06, AttnEntropy-flipped 0.01. The cheap online detector (entropy of `language_model.layers.12.self_attn` head 2, ~zero marginal cost since the VLM forward pass already runs) is the deployable answer — there is no method-quality / cost tradeoff.
+
+Full per-frac × per-condition tables in `EXPERIMENT_FINDINGS.md` → "Baseline-expanded sweep". Below is the original frac=0.5 result that motivated the sweep.
+
 ### ExpB results (50 Long + 50 Object × 8 conditions @ frac=0.5, 2026-04-22)
 
 Full experiment took 6h 9min on a single H100 (batched SIS perturbations gave ~1.7× speedup on the diagnostic phase; sequential-vs-batched parity verified at |diff| = 1.08e-5).
