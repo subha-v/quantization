@@ -218,6 +218,51 @@ CUDA_VISIBLE_DEVICES=<idx> nohup /data/subha2/openpi/.venv/bin/python \
 
 The analysis script evaluates H1–H5 from the plan: Scheme-1 viability, Scheme-2 vs Scheme-1 lag tax, ternary-vs-binary granularity gain, ternary direction symmetry control, and W2-pass-vs-FP16-pass entropy correlation.
 
+## ExpB — W4-first Online Mixed-Precision (staged 2026-04-29)
+
+Pivoting the deployment story from "W2 with FP16 rescue" to **"W4 default with intelligent {W2/W4/FP16} allocation"** — modern GPUs have native W4 tensor cores, while sub-4-bit needs custom kernels. The new plan is in `MEETING_5.md`; the implementation lives across `sis_utils.py` + `expB_sis_validation.py`.
+
+### What's new in `sis_utils.py`
+- `AttentionMetricHook(model, layer_idx, head_idx, metric)` — generalized attention probe at any (layer, head, metric ∈ {entropy, top1, top5, sparsity, sink}). Captures all five metrics per forward; `metric` selects the scalar `get_last()` returns. Replaces ad-hoc per-layer probes; the legacy `L12H2EntropyHook` is kept for back-compat.
+- `PrecisionController.use_bits_range(start_layer, end_layer, target)` — per-layer-range pointer swap. Lets a forward hook on layer L swap layers L+1..17 to a different precision *mid-forward*, without touching layer 0 / vision tower / projector. Idempotent via per-layer state cache.
+- `IntraPassController(model, ctrl, layer_L, head, metric, base_prec, decision_high_prec, decision_low_prec, direction, frac_high, frac_low)` — wraps `language_model.layers.{layer_L}.self_attn` so the metric is read on each forward, ranked against a per-rollout running quantile, and used to call `use_bits_range(L+1, 17, ...)` *during* the same forward pass. Three-tier supported (e.g., `decision_high="fp16"`, `decision_low="w2"` over a `base="w4"`).
+- `parse_probe_tag` / `format_probe_tag` / `PROBE_DIRECTION_BY_TAG` — helpers for the 5 candidate readouts from MEETING_5's top-15 (l1h7-top1, l9h2-ent, l12h2-ent, l3h4-top5, l17h4-top1).
+
+### What's new in `expB_sis_validation.py`
+- 17 W4-base conditions added to `ALL_CONDITIONS`: `W4-Floor`, `W4-Static-Sched`, `Random-W4`, `AttnEntropy-W4`, `S1-Bin-W4`, `S2-Bin-W4`, `S1-Tern-W4`, `S2-Tern-W4`, `Random-Tern-W4`, three `S3-Bin-W4-*` (intra-pass at l1h7/l9h2/l12h2), `S3-Tern-W4-l12h2`, four `Probe-W4-*` (lag-1 candidate-readout sweep).
+- `diagnostic_rollout_v3` — captures W4-pass attention metrics for ALL 5 candidate probes per cycle (writes nested `attn_probes_w4` and `attn_probes_fp16` dicts to `expB_diagnostic_v3.jsonl`).
+- `intrapass_rollout` — replays a (suite, task_id, seed, episode_idx) trial with intra-pass online precision control via `IntraPassController`.
+- `build_masks_w4` — reads V3 diagnostic, builds W4-base mask for each non-S3 condition.
+- `analyze_w4` — bootstrap-CI summary table + HW0–HW7 hypothesis matrix (matched-pair signed deltas) + HW7 D2-W4 transfer Spearman ρ across all 5 probes.
+- New CLI modes: `--w4-tier0` (W4 baseline only, 3 conditions × 100 trials, ~1h), `--w4-schemes` (full W4 plan, 17 conditions × 100 trials, ~7h), `--analyze-w4` (post-hoc summary).
+
+### Running the W4-first overnight
+```bash
+# On tambe-server-1 (after git pull + GPU pin):
+cd /data/subha2/experiments
+# Smoke (~30 min):
+CUDA_VISIBLE_DEVICES=<idx> python /data/subha2/quantization/scripts/expB_sis_validation.py \
+    --smoke --conditions W4-Floor S1-Bin-W4 S3-Bin-W4-l1h7-top1 S3-Bin-W4-l9h2-ent \
+                          S3-Bin-W4-l12h2-ent Probe-W4-l1h7-top1 \
+    --candidate-readouts l1h7-top1 l9h2-ent l12h2-ent l3h4-top5 l17h4-top1 --verbose
+# Tier 0 — W4 baseline (~1 h):
+CUDA_VISIBLE_DEVICES=<idx> nohup python /data/subha2/quantization/scripts/expB_sis_validation.py \
+    --w4-tier0 --verbose > logs/tier0_w4baseline.log 2>&1 &
+# Tier 1+2+3 — full W4 plan (~7 h):
+CUDA_VISIBLE_DEVICES=<idx> nohup python /data/subha2/quantization/scripts/expB_sis_validation.py \
+    --w4-schemes --frac 0.4 --ternary-partition "0.1,0.4,0.5" --verbose \
+    > logs/w4_overnight.log 2>&1 &
+# Analysis:
+python /data/subha2/quantization/scripts/expB_sis_validation.py --analyze-w4
+```
+
+The hypothesis matrix tests:
+- HW0: SR(W4-Floor) − SR(FP16) — does the FP16 rescue framing apply at W4?
+- HW2: SR(S3-Bin-W4-l12h2) − SR(S1-Bin-W4) — does intra-pass beat lag-1?
+- HW3a: SR(S3-Bin-W4-l1h7-top1) − SR(S3-Bin-W4-l12h2-ent) — viable cheap-pass at the earliest layer?
+- HW4: SR(S1-Tern-W4) − SR(W4-Floor) at avg_bits < 4 — sub-W4 average beats uniform W4?
+- HW7: per-trial Spearman ρ(l12h2-ent W4-pass, ‖a_FP − a_W4‖²) — does D2 transfer to W4?
+
 ## Key References
 
 - **QVLA** (ICLR 2026) — Action-centric channel-wise quantization for AR VLAs

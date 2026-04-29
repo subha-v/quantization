@@ -49,8 +49,13 @@ from exp3_flow_step_sensitivity import infer_with_noise, make_noise, get_action_
 from sis_utils import (
     PrecisionController,
     L12H2EntropyHook,
+    AttentionMetricHook,
+    IntraPassController,
+    PROBE_DIRECTION_BY_TAG,
     compute_sis,
     cycle_noise,
+    parse_probe_tag,
+    format_probe_tag,
 )
 
 
@@ -59,12 +64,15 @@ from sis_utils import (
 # ---------------------------------------------------------------------------
 RESULTS_DIR = Path(utils.RESULTS_DIR)
 DIAG_PATH = RESULTS_DIR / "expB_diagnostic.jsonl"
-DIAG_V2_PATH = RESULTS_DIR / "expB_diagnostic_v2.jsonl"   # NEW: augmented with W2-pass entropy
+DIAG_V2_PATH = RESULTS_DIR / "expB_diagnostic_v2.jsonl"   # augmented with W2-pass entropy
+DIAG_V3_PATH = RESULTS_DIR / "expB_diagnostic_v3.jsonl"   # multi-probe + W4-pass diagnostic (2026-04-29)
 FP16_DIAG_PATH = RESULTS_DIR / "expB_fp16_diagnostic.jsonl"
 ROLLOUT_PATH = RESULTS_DIR / "expB_rollouts.jsonl"
-SCHEMES_ROLLOUT_PATH = RESULTS_DIR / "expB_schemes_rollouts.jsonl"  # NEW: S1/S2 conditions
+SCHEMES_ROLLOUT_PATH = RESULTS_DIR / "expB_schemes_rollouts.jsonl"  # S1/S2 (W2 base) conditions
+W4_ROLLOUT_PATH = RESULTS_DIR / "expB_w4_rollouts.jsonl"            # W4-base conditions (2026-04-29)
 SUMMARY_PATH = RESULTS_DIR / "expB_summary.md"
 SCHEMES_SUMMARY_PATH = RESULTS_DIR / "expB_schemes_summary.md"
+W4_SUMMARY_PATH = RESULTS_DIR / "expB_w4_summary.md"
 
 # ---------------------------------------------------------------------------
 # Conditions
@@ -96,13 +104,73 @@ ALL_CONDITIONS = [
     "S1-Tern",       # 11 — Scheme 1 lag-1 ternary {W2, W4, FP16} from W2-pass entropy
     "S2-Tern",       # 12 — Scheme 2 speculative ternary {W2, W4, FP16} from W2-pass entropy
     "Random-Tern",   # 13 — random ternary partition (matches S1/S2-Tern fractions), null
+    # ---- 2026-04-29: W4-first deployable conditions ----
+    # Tier 0: baseline characterization
+    "W4-Floor",          # 14 — pure W4-with-protection (no schedule, no overrides)
+    "W4-Static-Sched",   # 15 — exp3-style static expert step schedule on W4-protect VLM (placeholder; not yet wired)
+    # Tier 1: W4 base + FP16 rescue (binary)
+    "Random-W4",                    # 16 — random binary mask on W4 base
+    "AttnEntropy-W4",               # 17 — bottom-frac% by FP16-pass l12h2 entropy on W4 base (oracle)
+    "S1-Bin-W4",                    # 18 — lag-1 binary on W4 base, W4-pass l12h2 entropy
+    "S2-Bin-W4",                    # 19 — speculative binary on W4 base, W4-pass l12h2 entropy
+    "S3-Bin-W4-l1h7-top1",          # 20 — intra-pass at l1h7 top1, W4 base → FP16 escalation
+    "S3-Bin-W4-l9h2-ent",           # 21 — intra-pass at l9h2 entropy, W4 base → FP16 escalation
+    "S3-Bin-W4-l12h2-ent",          # 22 — intra-pass at l12h2 entropy, W4 base → FP16 escalation
+    # Tier 2: W4 base + ternary {W2, W4, FP16}
+    "S1-Tern-W4",                   # 23 — lag-1 ternary on W4 base
+    "S2-Tern-W4",                   # 24 — speculative ternary on W4 base
+    "S3-Tern-W4-l12h2",             # 25 — intra-pass three-tier at l12h2 (W2 ↓ W4 base ↑ FP16)
+    "Random-Tern-W4",               # 26 — random ternary partition on W4 base, null
+    # Tier 3: candidate-readout sweep (lag-1 binary at different probes, W4 base)
+    "Probe-W4-l1h7-top1",           # 27
+    "Probe-W4-l9h2-ent",            # 28
+    "Probe-W4-l3h4-top5",           # 29
+    "Probe-W4-l17h4-top1",          # 30
 ]
+
 # Legacy pilot conditions (frac=0.5 results live under old labels in the previous JSONLs)
 PILOT_CONDITIONS = ["FP16", "W2", "SIS-top", "Random", "MSE-W2traj"]
-# Deployable-schemes conditions (the 2026-04-22 plan); diagnostic must capture W2-pass entropy.
+# W2-base deployable schemes (the 2026-04-22 plan); needs attn_entropy_l12h2_w2.
 SCHEMES_CONDITIONS = ["S1-Bin", "S2-Bin", "S1-Tern", "S2-Tern", "Random-Tern"]
 # Conditions that require attn_entropy_l12h2_w2 in the diagnostic (the augmented field).
 NEEDS_W2_PASS_ENTROPY = {"S1-Bin", "S2-Bin", "S1-Tern", "S2-Tern", "Random-Tern"}
+# W4-base conditions added 2026-04-29.
+W4_BASELINE_CONDITIONS = {"W4-Floor", "W4-Static-Sched", "FP16"}
+W4_BIN_CONDITIONS = {"Random-W4", "AttnEntropy-W4", "S1-Bin-W4", "S2-Bin-W4"}
+W4_INTRAPASS_CONDITIONS = {
+    "S3-Bin-W4-l1h7-top1", "S3-Bin-W4-l9h2-ent", "S3-Bin-W4-l12h2-ent",
+    "S3-Tern-W4-l12h2",
+}
+W4_TERN_CONDITIONS = {"S1-Tern-W4", "S2-Tern-W4", "Random-Tern-W4"}
+W4_PROBE_CONDITIONS = {
+    "Probe-W4-l1h7-top1", "Probe-W4-l9h2-ent",
+    "Probe-W4-l3h4-top5", "Probe-W4-l17h4-top1",
+}
+# All W4 conditions that need the V3 diagnostic (W4-pass entropy + multi-probe).
+W4_ALL_CONDITIONS = (
+    {"W4-Floor", "W4-Static-Sched"}
+    | W4_BIN_CONDITIONS
+    | W4_INTRAPASS_CONDITIONS
+    | W4_TERN_CONDITIONS
+    | W4_PROBE_CONDITIONS
+)
+# Mapping from intra-pass condition name to (layer, head, metric) — used to
+# instantiate IntraPassController with the right probe.
+INTRAPASS_PROBE_BY_CONDITION = {
+    "S3-Bin-W4-l1h7-top1":  (1, 7, "top1"),
+    "S3-Bin-W4-l9h2-ent":   (9, 2, "entropy"),
+    "S3-Bin-W4-l12h2-ent":  (12, 2, "entropy"),
+    "S3-Tern-W4-l12h2":     (12, 2, "entropy"),
+}
+# Mapping from probe condition to (layer, head, metric).
+PROBE_BY_CONDITION = {
+    "Probe-W4-l1h7-top1":   (1, 7, "top1"),
+    "Probe-W4-l9h2-ent":    (9, 2, "entropy"),
+    "Probe-W4-l3h4-top5":   (3, 4, "top5"),
+    "Probe-W4-l17h4-top1":  (17, 4, "top1"),
+}
+# Default candidate readouts captured in the V3 diagnostic per cycle.
+DEFAULT_CANDIDATE_READOUTS = ["l1h7-top1", "l9h2-ent", "l12h2-ent", "l3h4-top5", "l17h4-top1"]
 
 # Bits per param for cost reporting; FP16 = 16, W4 = 4, W2 = 2.
 BITS_BY_PRECISION = {"fp16": 16, "w4": 4, "w2": 2}
@@ -580,6 +648,761 @@ def build_masks(
         masks["Random-Tern"] = rand_ternary
 
     return masks
+
+
+# ===========================================================================
+# W4-first additions (2026-04-29)
+# ===========================================================================
+# All W4-base experiment plumbing lives below. The legacy W2-base functions
+# above are unchanged.
+# ---------------------------------------------------------------------------
+
+def diagnostic_rollout_v3(
+    policy,
+    model,
+    ctrl: PrecisionController,
+    legacy_attn_hook: L12H2EntropyHook,
+    probe_hooks: dict,             # {tag: AttentionMetricHook}
+    suite: str,
+    task_id: int,
+    seed: int,
+    episode_idx: int,
+    base_precision: str = "w4",
+    n_grid: int = 4,
+    sigma: float = 8.0,
+    sis_stride: int = 4,
+    verbose: bool = False,
+):
+    """V3 diagnostic — supports W4 base AND multi-probe per-cycle attention metrics.
+
+    For each cycle:
+      1. FP16 forward at the cycle's state with seeded noise → a_FP, all probes
+         populate `_per_pass_fp16` snapshot.
+      2. Base-precision forward at the same state, same noise → a_base, all probes
+         populate `_per_pass_base` snapshot. (base_precision = "w4" or "w2")
+      3. Per-cycle MSE = ‖a_FP − a_base‖² (saved as `mse_fp_base`).
+
+    Per-cycle JSONL row format:
+        {
+          cycle_idx, env_step, sis, sis_recomputed, base_precision,
+          mse_fp_base,
+          attn_entropy_l12h2,        # FP16-pass legacy hook (back-compat with v2)
+          attn_entropy_l12h2_base,   # base-pass legacy hook
+          attn_probes_fp16: {tag: float, ...},
+          attn_probes_base: {tag: float, ...},
+        }
+
+    The rollout's executed trajectory is base_precision (W4-with-protection or
+    W2-with-protection per `base_precision`).
+    """
+    base = base_precision.lower()
+    if base not in ("w2", "w4"):
+        raise ValueError(f"base_precision must be 'w2' or 'w4'; got {base!r}")
+    base_bits = 2 if base == "w2" else 4
+
+    per_cycle = []
+    cycle_idx = [-1]
+    last_sis = [float("nan")]
+
+    def _probe_snapshot() -> dict:
+        out = {}
+        for tag, h in probe_hooks.items():
+            out[tag] = float(h.get_last())
+        return out
+
+    def _reset_all_probes():
+        if legacy_attn_hook is not None:
+            legacy_attn_hook.reset()
+        for h in probe_hooks.values():
+            h.reset()
+
+    def obs_callback(t, libero_obs, openpi_obs):
+        cycle_idx[0] += 1
+        i = cycle_idx[0]
+        sis_noise_seed = seeded.peek_next_seed()
+        ah, ad = get_action_shape(model)
+        device = next(model.parameters()).device
+        noise_t = make_noise(ah, ad, seed=sis_noise_seed, device=device)
+        noise_np = noise_t.cpu().numpy().astype(np.float32)
+
+        # ---- FP16 pass ----
+        ctrl.use_fp16()
+        _reset_all_probes()
+        a_FP = infer_with_noise(policy, openpi_obs, noise_np)
+        attn_fp16_legacy = legacy_attn_hook.get_last_entropy_h2() if legacy_attn_hook else float("nan")
+        probes_fp16 = _probe_snapshot()
+
+        # SIS only on stride-aligned cycles; reuse last value otherwise.
+        is_stride_cycle = (i % sis_stride == 0)
+        if is_stride_cycle:
+            sis_val, _ = compute_sis(
+                policy, openpi_obs, noise_np,
+                n_grid=n_grid, sigma=sigma, a_clean=a_FP,
+            )
+            last_sis[0] = float(sis_val)
+        sis_value = last_sis[0]
+
+        # ---- Base-precision pass ----
+        ctrl.use_bits(base_bits)
+        _reset_all_probes()
+        a_base = infer_with_noise(policy, openpi_obs, noise_np)
+        attn_base_legacy = legacy_attn_hook.get_last_entropy_h2() if legacy_attn_hook else float("nan")
+        probes_base = _probe_snapshot()
+        mse = float(np.mean((a_FP - a_base) ** 2))
+
+        per_cycle.append({
+            "cycle_idx": i,
+            "env_step": int(t),
+            "base_precision": base,
+            "sis": sis_value,
+            "sis_recomputed": bool(is_stride_cycle),
+            "attn_entropy_l12h2": float(attn_fp16_legacy) if attn_fp16_legacy == attn_fp16_legacy else None,
+            f"attn_entropy_l12h2_{base}": float(attn_base_legacy) if attn_base_legacy == attn_base_legacy else None,
+            "attn_probes_fp16": probes_fp16,
+            f"attn_probes_{base}": probes_base,
+            f"mse_fp_{base}": mse,
+        })
+        if verbose:
+            tag = "S" if is_stride_cycle else "."
+            utils.log(
+                f"[diag-v3-{base} {tag}] seed={seed} ep={episode_idx} cyc={i:3d} t={t:4d} "
+                f"sis={sis_value:.5f} attn_fp={attn_fp16_legacy:.4f} attn_{base}={attn_base_legacy:.4f} mse={mse:.5f}"
+            )
+
+    def pre_infer_callback(t):
+        # The executed rollout step uses base precision.
+        ctrl.use_bits(base_bits)
+
+    seeded = SeededInferContext(policy, model, base_seed=seed)
+    with seeded:
+        ctrl.use_bits(base_bits)
+        rec = rollout_mod.run_rollout(
+            policy,
+            task_id=task_id,
+            suite=suite,
+            seed=seed,
+            episode_idx=episode_idx,
+            obs_callback=obs_callback,
+            pre_infer_callback=pre_infer_callback,
+            verbose=False,
+        )
+
+    return rec, per_cycle
+
+
+def intrapass_rollout(
+    policy,
+    model,
+    ctrl: PrecisionController,
+    intrapass_ctrl: IntraPassController,
+    suite: str,
+    task_id: int,
+    seed: int,
+    episode_idx: int,
+    verbose: bool = False,
+):
+    """Replay (suite, task_id, seed, episode_idx) with intra-pass online
+    precision control. Each cycle's `pre_infer` resets layers 1..MAX to the
+    base precision; the IntraPassController's forward hook on layer L reads the
+    attention metric and swaps layers L+1..MAX mid-forward when the metric
+    crosses the per-rollout running quantile.
+
+    Returns (rec, per_cycle_decisions) where per_cycle_decisions is a list
+    of (metric_value, decision_str) tuples.
+    """
+    intrapass_ctrl.reset_per_rollout()
+
+    def pre_infer_callback(t):
+        intrapass_ctrl.pre_infer(t)
+
+    seeded = SeededInferContext(policy, model, base_seed=seed)
+    with seeded:
+        # Initialize at base precision.
+        intrapass_ctrl.pre_infer(0)
+        rec = rollout_mod.run_rollout(
+            policy,
+            task_id=task_id,
+            suite=suite,
+            seed=seed,
+            episode_idx=episode_idx,
+            pre_infer_callback=pre_infer_callback,
+            verbose=False,
+        )
+    return rec, list(intrapass_ctrl.cycle_decisions)
+
+
+def _per_candidate_assignment(
+    scores,
+    n_total: int,
+    frac: float,
+    direction: str,
+    granularity: str = "binary",
+    ternary_partition=(0.2, 0.3, 0.5),
+):
+    """Build a per-cycle precision dict from a per-cycle score series.
+
+    `direction='bottom'` means LOW scores predict HIGH sensitivity (escalate);
+    'top' flips this.
+
+    `granularity='binary'` returns dict[cycle, "fp16"] for the selected fraction.
+    `granularity='ternary'` partitions: bottom-frac_fp16 → "fp16",
+        next frac_w4 → "w4", remainder → "w2" (if direction='bottom'); flipped
+        for direction='top'.
+    """
+    if direction not in ("bottom", "top"):
+        raise ValueError(f"direction must be 'bottom' or 'top'; got {direction}")
+    ranked = _rank_indices(scores, ascending=(direction == "bottom"))
+    if granularity == "binary":
+        k = max(1, int(round(frac * n_total)))
+        return {idx: "fp16" for idx in ranked[:k]}
+    elif granularity == "ternary":
+        frac_fp16, frac_w4, frac_w2 = ternary_partition
+        return _ternary_assignment(ranked, n_total, frac_fp16, frac_w4, frac_w2)
+    else:
+        raise ValueError(f"granularity must be 'binary' or 'ternary'; got {granularity}")
+
+
+def build_masks_w4(
+    per_cycle_v3,
+    frac: float,
+    seed: int,
+    ternary_partition=(0.1, 0.4, 0.5),
+) -> dict:
+    """Build per-condition precision schedules for W4-base conditions from a
+    V3 diagnostic.
+
+    Reads each cycle's:
+      - `attn_probes_w4` (dict tag → float)  for deployable per-cycle decision signal
+      - `attn_probes_fp16` (dict tag → float)  for oracle baseline (AttnEntropy-W4)
+      - `mse_fp_w4`                          for oracle/MSE-style fallback masks
+
+    Returns dict[condition_name → schedule], where schedule is dict[int → "fp16"|"w4"|"w2"].
+    Cycles not in the dict default to "w4" at override_rollout time.
+
+    Note: S3-* conditions are NOT built here — they're handled by intrapass_rollout
+    which doesn't use a precomputed mask.
+    """
+    n = len(per_cycle_v3)
+    if n == 0:
+        return {}
+
+    rng = _random.Random(seed)
+    masks: dict = {}
+
+    # ---- Random binary on W4 base ----
+    rand_set = set(rng.sample(range(n), max(1, int(round(frac * n)))))
+    masks["Random-W4"] = {idx: "fp16" for idx in rand_set}
+
+    # ---- AttnEntropy-W4: oracle deployable using FP16-pass entropy ----
+    attn_fp16 = []
+    for c in per_cycle_v3:
+        probes = c.get("attn_probes_fp16", {})
+        attn_fp16.append(probes.get("l12h2-ent"))
+    masks["AttnEntropy-W4"] = _per_candidate_assignment(
+        attn_fp16, n, frac, direction="bottom", granularity="binary",
+    )
+
+    # ---- S1-Bin-W4 / S2-Bin-W4: lag-1 / speculative on W4-pass l12h2 entropy ----
+    attn_w4 = []
+    for c in per_cycle_v3:
+        probes = c.get("attn_probes_w4", {})
+        attn_w4.append(probes.get("l12h2-ent"))
+    s2_bin_w4 = _per_candidate_assignment(
+        attn_w4, n, frac, direction="bottom", granularity="binary",
+    )
+    s1_bin_w4 = _lag_one(s2_bin_w4, n)
+    masks["S1-Bin-W4"] = s1_bin_w4
+    masks["S2-Bin-W4"] = s2_bin_w4
+
+    # ---- S1-Tern-W4 / S2-Tern-W4: lag-1 / speculative ternary on W4 base ----
+    s2_tern_w4 = _per_candidate_assignment(
+        attn_w4, n, frac, direction="bottom", granularity="ternary",
+        ternary_partition=ternary_partition,
+    )
+    s1_tern_w4 = _lag_one(s2_tern_w4, n)
+    masks["S1-Tern-W4"] = s1_tern_w4
+    masks["S2-Tern-W4"] = s2_tern_w4
+
+    # ---- Random-Tern-W4: random ternary partition matching same fractions ----
+    rng_t = _random.Random(seed * 7919)
+    all_idx = list(range(n))
+    rng_t.shuffle(all_idx)
+    masks["Random-Tern-W4"] = _ternary_assignment(
+        all_idx, n, *ternary_partition,
+    )
+
+    # ---- Probe-W4-* sweep: lag-1 binary at alternative readouts (W4-pass) ----
+    for cond_name, (layer, head, metric) in PROBE_BY_CONDITION.items():
+        tag = format_probe_tag(layer, head, metric)
+        scores = []
+        for c in per_cycle_v3:
+            probes = c.get("attn_probes_w4", {})
+            scores.append(probes.get(tag))
+        direction = PROBE_DIRECTION_BY_TAG.get(tag, "bottom")
+        s2_probe = _per_candidate_assignment(
+            scores, n, frac, direction=direction, granularity="binary",
+        )
+        masks[cond_name] = _lag_one(s2_probe, n)  # lag-1 (Scheme 1) for cheap deployability
+
+    return masks
+
+
+def _avg_bits_w4(precision_per_cycle: dict, n_cycles: int) -> float:
+    """Avg bits given a W4-base override schedule (default = W4)."""
+    return _avg_bits(precision_per_cycle, n_cycles, default_precision="w4")
+
+
+def run_seed_w4(
+    policy, model, ctrl,
+    legacy_attn_hook,
+    probe_hooks: dict,
+    suite: str, task_id: int, seed: int, episode_idx: int,
+    conditions,
+    n_grid: int = 4, sigma: float = 8.0,
+    sis_stride: int = 4,
+    frac: float = 0.4,
+    ternary_partition=(0.1, 0.4, 0.5),
+    diag_path: Path = None,
+    rollout_path: Path = None,
+    verbose: bool = False,
+) -> list:
+    """W4-base per-seed driver. Mirrors run_seed but routes through the V3
+    diagnostic + W4 mask builder, and dispatches S3-* conditions to
+    intrapass_rollout."""
+    if diag_path is None:
+        diag_path = DIAG_V3_PATH
+    if rollout_path is None:
+        rollout_path = W4_ROLLOUT_PATH
+
+    out = []
+    rollout_key = {
+        "suite": suite, "task_id": int(task_id),
+        "seed": int(seed), "episode_idx": int(episode_idx),
+    }
+
+    # Conditions that require the V3 W4 diagnostic (any condition that needs
+    # per-cycle attention probes or per-cycle ‖a_FP - a_W4‖² targets).
+    NEEDS_W4_DIAG = (
+        W4_BIN_CONDITIONS | W4_TERN_CONDITIONS | W4_PROBE_CONDITIONS | {"AttnEntropy-W4"}
+    )
+    # Conditions that need an FP16 baseline rollout.
+    NEEDS_FP16_BASELINE = {"FP16"}
+    # Floor conditions that just need a base rollout (no overrides).
+    BASELINE_CONDS = {"FP16", "W4-Floor", "W4-Static-Sched"}
+
+    w4_rec, w4_per_cycle = None, None
+    if any(c in conditions for c in NEEDS_W4_DIAG | {"W4-Floor"}):
+        utils.log(f"[expB-W4] W4-DIAG seed={seed} task={task_id} ep={episode_idx}")
+        t0 = time.time()
+        w4_rec, w4_per_cycle = diagnostic_rollout_v3(
+            policy, model, ctrl, legacy_attn_hook, probe_hooks,
+            suite, task_id, seed, episode_idx,
+            base_precision="w4",
+            n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
+            verbose=verbose,
+        )
+        utils.log(
+            f"[expB-W4] W4-DIAG done seed={seed} success={w4_rec.success} "
+            f"steps={w4_rec.steps} cycles={len(w4_per_cycle)} wall={time.time()-t0:.1f}s"
+        )
+        for c in w4_per_cycle:
+            utils.append_jsonl({**rollout_key, **c}, diag_path)
+
+    fp16_rec = None
+    if "FP16" in conditions:
+        utils.log(f"[expB-W4] FP16-BASELINE seed={seed} task={task_id} ep={episode_idx}")
+        t0 = time.time()
+        ctrl.use_fp16()
+        seeded = SeededInferContext(policy, model, base_seed=seed)
+        with seeded:
+            fp16_rec = rollout_mod.run_rollout(
+                policy,
+                task_id=task_id, suite=suite,
+                seed=seed, episode_idx=episode_idx,
+                pre_infer_callback=lambda t: ctrl.use_fp16(),
+                verbose=False,
+            )
+        utils.log(
+            f"[expB-W4] FP16-BASELINE done seed={seed} success={fp16_rec.success} "
+            f"steps={fp16_rec.steps} wall={time.time()-t0:.1f}s"
+        )
+
+    # Build W4-base masks (for non-S3 conditions).
+    if w4_per_cycle:
+        masks = build_masks_w4(
+            w4_per_cycle, frac=frac, seed=seed,
+            ternary_partition=ternary_partition,
+        )
+    else:
+        masks = {}
+    n_cycles = len(w4_per_cycle) if w4_per_cycle else 0
+
+    for cond in conditions:
+        rec = None
+        precision_per_cycle = {}
+        n_overrides = 0
+        avg_bits = float("nan")
+        intrapass_decisions = None
+
+        if cond == "FP16":
+            rec = fp16_rec
+            avg_bits = float(BITS_BY_PRECISION["fp16"])
+
+        elif cond == "W4-Floor":
+            # Re-use the W4 diagnostic's executed trajectory (which IS W4-Floor).
+            rec = w4_rec
+            avg_bits = float(BITS_BY_PRECISION["w4"])
+
+        elif cond == "W4-Static-Sched":
+            # The exp3 static expert step schedule on W4-protect VLM. The expert-
+            # side step controller lives in expA; not yet ported here. For this
+            # overnight we treat W4-Static-Sched the same as W4-Floor and flag it
+            # so the analysis can highlight that step 9 wasn't separately handled.
+            # TODO(expA-port): wire StepController for the expert.
+            utils.log(f"[expB-W4] WARN: W4-Static-Sched not yet wired (uses W4-Floor for now)")
+            rec = w4_rec
+            avg_bits = float(BITS_BY_PRECISION["w4"])
+
+        elif cond in W4_INTRAPASS_CONDITIONS:
+            layer, head, metric = INTRAPASS_PROBE_BY_CONDITION[cond]
+            granularity = "ternary" if cond.startswith("S3-Tern") else "binary"
+            tag = format_probe_tag(layer, head, metric)
+            direction = PROBE_DIRECTION_BY_TAG.get(tag, "bottom")
+            if granularity == "binary":
+                intrapass_ctrl_obj = IntraPassController(
+                    model, ctrl, layer_L=layer, head=head, metric=metric,
+                    base_prec="w4", decision_high_prec="fp16",
+                    decision_low_prec=None,
+                    direction=direction, frac_high=frac, frac_low=0.0,
+                )
+            else:  # ternary
+                # Three-tier: bottom-frac_high → fp16, top-frac_low → w2, middle → w4
+                frac_fp16 = ternary_partition[0]
+                frac_w2 = ternary_partition[2]
+                intrapass_ctrl_obj = IntraPassController(
+                    model, ctrl, layer_L=layer, head=head, metric=metric,
+                    base_prec="w4", decision_high_prec="fp16",
+                    decision_low_prec="w2",
+                    direction=direction, frac_high=frac_fp16, frac_low=frac_w2,
+                )
+            try:
+                t0 = time.time()
+                utils.log(
+                    f"[expB-W4] {cond} seed={seed} task={task_id} ep={episode_idx} "
+                    f"L={layer} head={head} metric={metric} dir={direction} frac_high={frac_high if False else (frac if granularity == 'binary' else ternary_partition[0])}"
+                )
+                rec, intrapass_decisions = intrapass_rollout(
+                    policy, model, ctrl, intrapass_ctrl_obj,
+                    suite, task_id, seed, episode_idx,
+                    verbose=verbose,
+                )
+                avg_bits = float(intrapass_ctrl_obj.avg_bits())
+                n_overrides = intrapass_ctrl_obj.n_escalations() + intrapass_ctrl_obj.n_de_escalations()
+                utils.log(
+                    f"[expB-W4] {cond} done success={rec.success} steps={rec.steps} "
+                    f"avg_bits={avg_bits:.2f} escalations={intrapass_ctrl_obj.n_escalations()} "
+                    f"de-escalations={intrapass_ctrl_obj.n_de_escalations()} "
+                    f"wall={time.time()-t0:.1f}s"
+                )
+            finally:
+                intrapass_ctrl_obj.uninstall()
+
+        else:
+            # Override-style W4-base condition (Random-W4, AttnEntropy-W4, S1/S2-Bin/Tern-W4, Probe-W4-*)
+            if cond not in masks:
+                utils.log(f"[expB-W4] WARN: skipping {cond} — mask not available")
+                continue
+            schedule = masks[cond]
+            if isinstance(schedule, set):
+                precision_per_cycle = {int(c): "fp16" for c in schedule}
+            else:
+                precision_per_cycle = dict(schedule)
+            n_overrides = sum(1 for p in precision_per_cycle.values() if p != "w4")
+            avg_bits = _avg_bits_w4(precision_per_cycle, n_cycles)
+
+            t0 = time.time()
+            utils.log(
+                f"[expB-W4] {cond} seed={seed} task={task_id} ep={episode_idx} "
+                f"|overrides|={n_overrides}/{n_cycles} avg_bits={avg_bits:.2f}"
+            )
+            rec = override_rollout(
+                policy, model, ctrl,
+                suite, task_id, seed, episode_idx,
+                precision_per_cycle=precision_per_cycle,
+                default_precision="w4",
+                verbose=verbose,
+            )
+            utils.log(
+                f"[expB-W4] {cond} done success={rec.success} steps={rec.steps} "
+                f"wall={time.time()-t0:.1f}s"
+            )
+
+        if rec is None:
+            continue
+
+        entry = {
+            **rollout_key,
+            "condition": cond,
+            "base_precision": "w4",
+            "success": bool(rec.success),
+            "steps": int(rec.steps),
+            "wall_time_s": float(rec.wall_time_s),
+            "termination_reason": rec.termination_reason,
+            "n_overrides": int(n_overrides),
+            "n_cycles": int(n_cycles),
+            "condition_avg_bits": float(avg_bits) if avg_bits == avg_bits else None,
+            "ternary_partition": list(ternary_partition) if cond.endswith("-Tern-W4") or cond == "S3-Tern-W4-l12h2" else None,
+        }
+        if intrapass_decisions is not None:
+            # Record the per-cycle decision string sequence so analysis can
+            # recover realized avg_bits histograms and decision frequency.
+            entry["intrapass_decisions"] = [d for _, d in intrapass_decisions]
+            entry["intrapass_metric_values"] = [v for v, _ in intrapass_decisions]
+        utils.append_jsonl(entry, rollout_path)
+        out.append(entry)
+
+    return out
+
+
+def run_trials_w4(
+    trials, conditions,
+    candidate_readouts=None,
+    n_grid=4, sigma=8.0, sis_stride=4,
+    frac=0.4,
+    ternary_partition=(0.1, 0.4, 0.5),
+    diag_path: Path = None,
+    rollout_path: Path = None,
+    verbose=False,
+):
+    """W4-base top-level driver. Loads policy + builds PrecisionController with
+    bits_list=(2, 4) (need both for ternary), installs the multi-probe hook
+    set, then runs each trial through run_seed_w4."""
+    if candidate_readouts is None:
+        candidate_readouts = list(DEFAULT_CANDIDATE_READOUTS)
+
+    utils.log("[expB-W4] loading policy + model...")
+    policy, model = utils.load_policy()
+
+    utils.log("[expB-W4] building PrecisionController bits_list=(2, 4)...")
+    ctrl = PrecisionController(model, bits_list=(2, 4), group_size=128)
+    ctrl.use_fp16()
+
+    utils.log("[expB-W4] installing legacy L12H2 hook + multi-probe hooks...")
+    legacy_hook = L12H2EntropyHook(model)
+    probe_hooks: dict = {}
+    for tag in candidate_readouts:
+        try:
+            layer, head, metric = parse_probe_tag(tag)
+        except ValueError as e:
+            utils.log(f"[expB-W4] WARN: skipping bad probe tag {tag!r}: {e}")
+            continue
+        try:
+            probe_hooks[tag] = AttentionMetricHook(model, layer, head, metric)
+        except Exception as e:
+            utils.log(f"[expB-W4] WARN: failed to install probe {tag!r}: {e}")
+
+    utils.log(f"[expB-W4] {len(probe_hooks)} probe hooks installed: {list(probe_hooks)}")
+
+    try:
+        for (suite, task_id, seed, episode_idx) in trials:
+            try:
+                run_seed_w4(
+                    policy, model, ctrl, legacy_hook, probe_hooks,
+                    suite, task_id, seed, episode_idx,
+                    conditions=conditions,
+                    n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
+                    frac=frac,
+                    ternary_partition=ternary_partition,
+                    diag_path=diag_path,
+                    rollout_path=rollout_path,
+                    verbose=verbose,
+                )
+            except Exception as e:
+                utils.log(f"[expB-W4] FAILED trial {(suite, task_id, seed, episode_idx)}: {e}")
+                import traceback
+                traceback.print_exc()
+    finally:
+        for h in probe_hooks.values():
+            h.uninstall()
+        legacy_hook.uninstall()
+        ctrl.use_fp16()
+
+
+def _matched_pair_delta(rows_a, rows_b):
+    """SR(A) − SR(B) over trials present in BOTH conditions, plus n_matched."""
+    def _key(r):
+        return (r["suite"], int(r["task_id"]), int(r["seed"]), int(r["episode_idx"]))
+    by_a = {_key(r): bool(r["success"]) for r in rows_a}
+    by_b = {_key(r): bool(r["success"]) for r in rows_b}
+    common = set(by_a) & set(by_b)
+    if not common:
+        return float("nan"), 0
+    deltas = [int(by_a[k]) - int(by_b[k]) for k in common]
+    return float(np.mean(deltas)), len(deltas)
+
+
+def _spearman_per_trial_w4(diag_v3_rows, probe_tag: str = "l12h2-ent"):
+    """Per-trial Spearman ρ between W4-pass `attn_probes_w4[probe_tag]` and
+    per-cycle `mse_fp_w4`. Tests whether the D2 finding (W2 sensitivity ↔ l12h2
+    entropy) transfers to W4 sensitivity.
+
+    Returns list of (trial_key, n_cycles, rho).
+    """
+    from collections import defaultdict
+    by_trial = defaultdict(list)
+    for r in diag_v3_rows:
+        key = (r["suite"], int(r["task_id"]), int(r["seed"]), int(r["episode_idx"]))
+        by_trial[key].append(r)
+    out = []
+    for k, rs in by_trial.items():
+        rs.sort(key=lambda r: r["cycle_idx"])
+        # Pull (probe_tag, mse) pairs.
+        probes = [r.get("attn_probes_w4", {}).get(probe_tag) for r in rs]
+        mses = [r.get("mse_fp_w4") for r in rs]
+        valid = [
+            (p, m) for p, m in zip(probes, mses)
+            if p is not None and m is not None and p == p and m == m
+        ]
+        if len(valid) < 4:
+            continue
+        try:
+            from scipy.stats import rankdata  # type: ignore
+        except ImportError:
+            return out
+        p_arr = np.array([x[0] for x in valid])
+        m_arr = np.array([x[1] for x in valid])
+        rho = float(np.corrcoef(rankdata(p_arr), rankdata(m_arr))[0, 1])
+        out.append((k, len(valid), rho))
+    return out
+
+
+def analyze_w4():
+    """Bootstrap-CI summary table + HW0-HW7 hypothesis tests (writes expB_w4_summary.md)."""
+    if not W4_ROLLOUT_PATH.exists():
+        utils.log(f"[expB-W4] no rollouts at {W4_ROLLOUT_PATH}; nothing to analyze")
+        return
+    rows = utils.load_jsonl(W4_ROLLOUT_PATH)
+    if not rows:
+        utils.log("[expB-W4] empty rollouts file")
+        return
+
+    from collections import defaultdict
+    by_cond_full = defaultdict(list)
+    by_cond = defaultdict(list)
+    by_suite_cond = defaultdict(list)
+    for r in rows:
+        by_cond_full[r["condition"]].append(r)
+        by_cond[r["condition"]].append(r["success"])
+        by_suite_cond[(r["suite"], r["condition"])].append(r["success"])
+
+    lines = []
+    lines.append("# ExpB W4-First — Online Mixed-Precision Quantization Summary\n")
+    lines.append(f"_n rollouts = {len(rows)}_\n")
+
+    # ---- Overall SR table ----
+    lines.append("## Overall success rate (95% bootstrap CI, n_boot=10k)\n")
+    lines.append("| Condition | n | success rate | 95% CI | avg bits |")
+    lines.append("|---|---:|---:|---|---:|")
+    avg_bits_by_cond = defaultdict(list)
+    for r in rows:
+        b = r.get("condition_avg_bits")
+        if b is not None:
+            avg_bits_by_cond[r["condition"]].append(b)
+    for cond in ALL_CONDITIONS:
+        if cond not in by_cond:
+            continue
+        vals = by_cond[cond]
+        m, lo, hi = _bootstrap_ci(vals)
+        bits = avg_bits_by_cond.get(cond, [])
+        bits_str = f"{np.mean(bits):.2f}" if bits else "—"
+        lines.append(f"| {cond} | {len(vals)} | {m:.3f} | [{lo:.3f}, {hi:.3f}] | {bits_str} |")
+
+    # ---- Per-suite SR table ----
+    lines.append("\n## Per-suite success rate\n")
+    suites = sorted({r["suite"] for r in rows})
+    lines.append("| Condition | " + " | ".join(suites) + " |")
+    lines.append("|---|" + "---:|" * len(suites))
+    for cond in ALL_CONDITIONS:
+        cells = [cond]
+        any_data = False
+        for s in suites:
+            vals = by_suite_cond.get((s, cond), [])
+            if vals:
+                any_data = True
+                m, lo, hi = _bootstrap_ci(vals, n_boot=2000)
+                cells.append(f"{m:.3f} [{lo:.2f},{hi:.2f}] (n={len(vals)})")
+            else:
+                cells.append("—")
+        if any_data:
+            lines.append("| " + " | ".join(cells) + " |")
+
+    # ---- HW0-HW7 matched-pair hypothesis matrix ----
+    lines.append("\n## Hypothesis matrix (matched-pair signed deltas)\n")
+    lines.append("Each row computes SR(A) − SR(B) over trials present in BOTH conditions.")
+    lines.append("Positive = A wins. Matched seeds cancel intrinsic trial difficulty.\n")
+    lines.append("| Tag | A | B | n_matched | SR(A) − SR(B) | Question |")
+    lines.append("|---|---|---|---:|---:|---|")
+    pairs = [
+        ("HW0", "W4-Floor", "FP16", "Is W4 alone good enough? (defines whether FP16-rescue is meaningful)"),
+        ("HW1", "S1-Bin-W4", "Random-W4", "Does the lag-1 mechanism work at W4?"),
+        ("HW2", "S3-Bin-W4-l12h2-ent", "S1-Bin-W4", "Does intra-pass beat lag-1 at W4?"),
+        ("HW3a", "S3-Bin-W4-l1h7-top1", "S3-Bin-W4-l12h2-ent", "Earlier-layer cheap-pass viable at W4?"),
+        ("HW3b", "S3-Bin-W4-l9h2-ent", "S3-Bin-W4-l12h2-ent", "Mid-layer alt viable?"),
+        ("HW4", "S1-Tern-W4", "W4-Floor", "Sub-W4 average preserves SR vs uniform W4?"),
+        ("HW5", "S2-Bin-W4", "S1-Bin-W4", "No-lag advantage at W4?"),
+        ("HW6", "AttnEntropy-W4", "Random-W4", "Oracle direction validation at W4"),
+        ("HW8a", "Probe-W4-l1h7-top1", "AttnEntropy-W4", "Lag-1 probe l1h7 vs lag-0 oracle l12h2"),
+        ("HW8b", "Probe-W4-l17h4-top1", "AttnEntropy-W4", "Late-layer signal-strength upper bound"),
+        ("HW8c", "Probe-W4-l9h2-ent", "AttnEntropy-W4", "Mid-layer probe vs oracle"),
+    ]
+    for tag, a, b, q in pairs:
+        if a not in by_cond_full or b not in by_cond_full:
+            continue
+        d, n = _matched_pair_delta(by_cond_full[a], by_cond_full[b])
+        lines.append(f"| {tag} | {a} | {b} | {n} | {d:+.3f} | {q} |")
+
+    # ---- HW7 — D2-W4 transfer Spearman ----
+    if DIAG_V3_PATH.exists():
+        diag_rows = utils.load_jsonl(DIAG_V3_PATH)
+        lines.append("\n## HW7 — D2-W4 transfer (per-trial Spearman ρ)\n")
+        lines.append("Per-trial ρ between l12h2-entropy on W4-pass and ‖a_FP − a_W4‖² per cycle.")
+        lines.append("If |median ρ| > 0.15, the D2 mechanism transfers cleanly from W2 to W4.\n")
+        rhos = _spearman_per_trial_w4(diag_rows, probe_tag="l12h2-ent")
+        if rhos:
+            rho_vals = np.array([r for (_, _, r) in rhos])
+            lines.append(
+                f"_n={len(rho_vals)} trials. median ρ = {float(np.median(rho_vals)):.3f}, "
+                f"mean ρ = {float(np.mean(rho_vals)):.3f}, "
+                f"P(|ρ| > 0.15) = {float(np.mean(np.abs(rho_vals) > 0.15)):.2f}, "
+                f"min/max = {float(np.min(rho_vals)):.3f}/{float(np.max(rho_vals)):.3f}._"
+            )
+            lines.append("")
+            lines.append("| quantile | ρ |")
+            lines.append("|---|---:|")
+            for q in (0.10, 0.25, 0.50, 0.75, 0.90):
+                lines.append(f"| p{int(q*100)} | {float(np.quantile(rho_vals, q)):.3f} |")
+        else:
+            lines.append("_No trials with sufficient valid (probe, mse) pairs._")
+
+        # Also report ρ for alternative probes — early-layer transfer test.
+        lines.append("\n### HW7-extension — alternative probes\n")
+        lines.append("| probe tag | n trials | median ρ | mean ρ | p25 | p75 |")
+        lines.append("|---|---:|---:|---:|---:|---:|")
+        for tag in DEFAULT_CANDIDATE_READOUTS:
+            tag_rhos = _spearman_per_trial_w4(diag_rows, probe_tag=tag)
+            if not tag_rhos:
+                continue
+            tv = np.array([r for (_, _, r) in tag_rhos])
+            lines.append(
+                f"| {tag} | {len(tv)} | {float(np.median(tv)):+.3f} | "
+                f"{float(np.mean(tv)):+.3f} | {float(np.quantile(tv, 0.25)):+.3f} | "
+                f"{float(np.quantile(tv, 0.75)):+.3f} |"
+            )
+
+    W4_SUMMARY_PATH.parent.mkdir(parents=True, exist_ok=True)
+    W4_SUMMARY_PATH.write_text("\n".join(lines) + "\n")
+    print("\n".join(lines))
+    utils.log(f"[expB-W4] wrote {W4_SUMMARY_PATH}")
 
 
 # ---------------------------------------------------------------------------
@@ -1136,6 +1959,17 @@ def main():
                         "writes to expB_frac_sweep.jsonl")
     g.add_argument("--analyze-sweep", action="store_true",
                    help="produce per-frac × per-condition table from sweep JSONL")
+    g.add_argument("--w4-schemes", action="store_true",
+                   help="2026-04-29 W4-first plan: 100 trials × W4-base conditions "
+                        "(W4-Floor, S1/S2-Bin/Tern-W4, S3-Bin-W4-*, Probe-W4-*). "
+                        "Writes diag to expB_diagnostic_v3.jsonl + rollouts to "
+                        "expB_w4_rollouts.jsonl. Implies bits_list=(2,4).")
+    g.add_argument("--w4-tier0", action="store_true",
+                   help="W4 baseline only: FP16 + W4-Floor + W4-Static-Sched "
+                        "on 100 trials. Sets the gate decision for whether the "
+                        "FP16-rescue framing is meaningful.")
+    g.add_argument("--analyze-w4", action="store_true",
+                   help="produce W4 summary markdown from expB_w4_rollouts.jsonl")
 
     p.add_argument("--suite", default=None)
     p.add_argument("--task-id", type=int, default=None)
@@ -1170,6 +2004,10 @@ def main():
     p.add_argument("--verbose", action="store_true")
     p.add_argument("--reset", action="store_true",
                    help="delete existing JSONLs before running")
+    p.add_argument("--candidate-readouts", nargs="+", default=None,
+                   help="probe tags to capture in the V3 diagnostic, e.g. "
+                        "'l1h7-top1 l9h2-ent l12h2-ent l3h4-top5 l17h4-top1'. "
+                        "Default: all 5 from MEETING_5 top-15.")
 
     args = p.parse_args()
 
@@ -1186,6 +2024,12 @@ def main():
                 if f.exists():
                     utils.log(f"[expB] removing {f}")
                     f.unlink()
+        elif args.w4_schemes or args.w4_tier0:
+            # W4 mode: reset V3 diagnostic + W4 rollouts (preserve W2 legacy).
+            for f in (DIAG_V3_PATH, W4_ROLLOUT_PATH):
+                if f.exists():
+                    utils.log(f"[expB-W4] removing {f}")
+                    f.unlink()
         else:
             for f in (DIAG_PATH, FP16_DIAG_PATH, ROLLOUT_PATH):
                 if f.exists():
@@ -1200,6 +2044,10 @@ def main():
         analyze_sweep()
         return
 
+    if args.analyze_w4:
+        analyze_w4()
+        return
+
     if args.frac_sweep is not None:
         sweep_diag_path = DIAG_V2_PATH if args.sweep_diag == "v2" else DIAG_PATH
         run_frac_sweep(
@@ -1210,6 +2058,56 @@ def main():
             verbose=args.verbose,
         )
         analyze_sweep()
+        return
+
+    # ---- W4-first modes (2026-04-29) ----
+    if args.w4_tier0 or args.w4_schemes or (args.smoke and any(
+        c in W4_ALL_CONDITIONS for c in (args.conditions or [])
+    )):
+        if args.smoke:
+            trials = [("Long", 0, 0, 0)]
+            if args.conditions and args.conditions != ["all"]:
+                conditions = args.conditions
+            else:
+                conditions = ["W4-Floor", "S1-Bin-W4", "S3-Bin-W4-l1h7-top1",
+                              "S3-Bin-W4-l12h2-ent", "Probe-W4-l1h7-top1"]
+        elif args.w4_tier0:
+            trials = full_trials()
+            conditions = ["FP16", "W4-Floor", "W4-Static-Sched"]
+        elif args.w4_schemes:
+            trials = full_trials()
+            if args.conditions and args.conditions != ["all"]:
+                # Allow user to subset
+                unknown = [c for c in args.conditions if c not in ALL_CONDITIONS]
+                if unknown:
+                    p.error(f"unknown conditions: {unknown}")
+                conditions = args.conditions
+            else:
+                # Default: ALL W4 conditions (Tier 1 + Tier 2 + Tier 3 + W4-Floor)
+                conditions = (
+                    ["FP16", "W4-Floor"]
+                    + sorted(W4_BIN_CONDITIONS)
+                    + sorted(W4_INTRAPASS_CONDITIONS)
+                    + sorted(W4_TERN_CONDITIONS)
+                    + sorted(W4_PROBE_CONDITIONS)
+                )
+
+        if args.trial_range is not None:
+            trials = trials[args.trial_range]
+            utils.log(f"[expB-W4] applied --trial-range {args.trial_range}: {len(trials)} trials remain")
+
+        readouts = args.candidate_readouts or list(DEFAULT_CANDIDATE_READOUTS)
+        utils.log(f"[expB-W4] {len(trials)} trials × {len(conditions)} conditions; "
+                  f"readouts={readouts}; frac={args.frac}; ternary={args.ternary_partition}")
+        run_trials_w4(
+            trials, conditions,
+            candidate_readouts=readouts,
+            n_grid=args.n_grid, sigma=args.sigma, sis_stride=args.sis_stride,
+            frac=args.frac,
+            ternary_partition=args.ternary_partition,
+            verbose=args.verbose,
+        )
+        analyze_w4()
         return
 
     # Build trial set
