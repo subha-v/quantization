@@ -141,6 +141,14 @@ ALL_CONDITIONS = [
     "S1-Tern-W4-top",               # 35 — lag-1 ternary, top direction
     "S2-Tern-W4-top",               # 36 — speculative ternary, top direction
     "S3-Tern-W4-l12h2-top",         # 37 — intra-pass three-tier at l12h2, top direction
+    # ---- Tier 5 (added 2026-04-29 post-Tier-4): l1h7 with W4-correct direction (bottom) ----
+    # Tier 1+2+3 ran S3-Bin-W4-l1h7-top1 with the W2-default direction "top" (ρ=+0.26 at W2).
+    # At W4 the per-trial mean ρ is -0.155 — strongest of all 5 candidate probes — but the
+    # CORRECT direction is "bottom". The earlier-layer position means swapping layers 2-17
+    # (vs l12h2's 13-17) → much larger compute savings. May Pareto-dominate S3-Tern-W4-l12h2
+    # at lower avg_bits / matching SR.
+    "S3-Bin-W4-l1h7-bottom",        # 38 — intra-pass at l1h7 top1, BOTTOM direction (W4-correct)
+    "S3-Tern-W4-l1h7-bottom",       # 39 — intra-pass three-tier at l1h7 top1, BOTTOM direction
 ]
 
 # Legacy pilot conditions (frac=0.5 results live under old labels in the previous JSONLs)
@@ -163,6 +171,8 @@ W4_INTRAPASS_CONDITIONS = {
     "S3-Bin-W4-l12h2-ent-top",
     # 2026-04-29 Tier 4: direction-flipped intra-pass ternary at l12h2
     "S3-Tern-W4-l12h2-top",
+    # 2026-04-29 Tier 5: l1h7 with W4-correct (bottom) direction
+    "S3-Bin-W4-l1h7-bottom", "S3-Tern-W4-l1h7-bottom",
 }
 W4_TERN_CONDITIONS = {
     "S1-Tern-W4", "S2-Tern-W4", "Random-Tern-W4",
@@ -190,6 +200,9 @@ INTRAPASS_PROBE_BY_CONDITION = {
     "S3-Tern-W4-l12h2":         (12, 2, "entropy"),
     "S3-Bin-W4-l12h2-ent-top":  (12, 2, "entropy"),
     "S3-Tern-W4-l12h2-top":     (12, 2, "entropy"),
+    # 2026-04-29 Tier 5: l1h7 with W4-correct (bottom) direction
+    "S3-Bin-W4-l1h7-bottom":    (1, 7, "top1"),
+    "S3-Tern-W4-l1h7-bottom":   (1, 7, "top1"),
 }
 # Per-condition direction override. None → use PROBE_DIRECTION_BY_TAG default
 # (typically "bottom" for entropy probes per the W2 D2 finding).
@@ -204,6 +217,9 @@ CONDITION_DIRECTION_OVERRIDE = {
     "S1-Tern-W4-top":           "top",
     "S2-Tern-W4-top":           "top",
     "S3-Tern-W4-l12h2-top":     "top",
+    # 2026-04-29 Tier 5: l1h7 W4-correct direction (bottom; opposite of W2 default "top")
+    "S3-Bin-W4-l1h7-bottom":    "bottom",
+    "S3-Tern-W4-l1h7-bottom":   "bottom",
 }
 # Mapping from probe condition to (layer, head, metric).
 PROBE_BY_CONDITION = {
@@ -1490,6 +1506,11 @@ def analyze_w4():
         ("HW10c", "S3-Tern-W4-l12h2-top", "S3-Tern-W4-l12h2", "Top vs bottom intra-pass ternary at l12h2"),
         ("HW10d", "S1-Tern-W4-top", "W4-Floor", "Direction-flipped ternary: does it match Floor at sub-W4 bits?"),
         ("HW10e", "S3-Tern-W4-l12h2-top", "W4-Floor", "Intra-pass top-dir ternary: even better than bottom?"),
+        # 2026-04-29 Tier 5: l1h7 with W4-correct direction (bottom)
+        ("HW11a", "S3-Bin-W4-l1h7-bottom", "S3-Bin-W4-l1h7-top1", "l1h7 bottom (W4-correct) vs top (W2-default)"),
+        ("HW11b", "S3-Bin-W4-l1h7-bottom", "S3-Bin-W4-l12h2-ent", "l1h7 bottom vs l12h2 bottom — earlier layer better?"),
+        ("HW11c", "S3-Tern-W4-l1h7-bottom", "S3-Tern-W4-l12h2", "l1h7 bottom ternary vs l12h2 bottom ternary"),
+        ("HW11d", "S3-Tern-W4-l1h7-bottom", "W4-Floor", "l1h7 ternary vs W4-Floor (cheap-pass Pareto test)"),
     ]
     for tag, a, b, q in pairs:
         if a not in by_cond_full or b not in by_cond_full:
