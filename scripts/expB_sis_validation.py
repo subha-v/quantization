@@ -134,6 +134,13 @@ ALL_CONDITIONS = [
     "S1-Bin-W4-top",                # 32 — lag-1 binary, W4-pass entropy, top direction
     "S2-Bin-W4-top",                # 33 — speculative binary, W4-pass entropy, top direction
     "S3-Bin-W4-l12h2-ent-top",      # 34 — intra-pass at l12h2 ent, top direction
+    # ---- Tier 4 direction-flipped ternary (added 2026-04-29 mid-run; queue for follow-up) ----
+    # Tests whether direction-flip rescues the broken S1/S2-Tern.
+    # If S1-Tern-W4-top SR matches W4-Floor (96.7%) while bottom dir collapsed to 78%,
+    # the direction-flip story is confirmed for ternary too.
+    "S1-Tern-W4-top",               # 35 — lag-1 ternary, top direction
+    "S2-Tern-W4-top",               # 36 — speculative ternary, top direction
+    "S3-Tern-W4-l12h2-top",         # 37 — intra-pass three-tier at l12h2, top direction
 ]
 
 # Legacy pilot conditions (frac=0.5 results live under old labels in the previous JSONLs)
@@ -154,8 +161,14 @@ W4_INTRAPASS_CONDITIONS = {
     "S3-Tern-W4-l12h2",
     # 2026-04-29 mid-Tier-0: direction-flipped intra-pass at l12h2
     "S3-Bin-W4-l12h2-ent-top",
+    # 2026-04-29 Tier 4: direction-flipped intra-pass ternary at l12h2
+    "S3-Tern-W4-l12h2-top",
 }
-W4_TERN_CONDITIONS = {"S1-Tern-W4", "S2-Tern-W4", "Random-Tern-W4"}
+W4_TERN_CONDITIONS = {
+    "S1-Tern-W4", "S2-Tern-W4", "Random-Tern-W4",
+    # 2026-04-29 Tier 4: direction-flipped ternary variants
+    "S1-Tern-W4-top", "S2-Tern-W4-top",
+}
 W4_PROBE_CONDITIONS = {
     "Probe-W4-l1h7-top1", "Probe-W4-l9h2-ent",
     "Probe-W4-l3h4-top5", "Probe-W4-l17h4-top1",
@@ -176,6 +189,7 @@ INTRAPASS_PROBE_BY_CONDITION = {
     "S3-Bin-W4-l12h2-ent":      (12, 2, "entropy"),
     "S3-Tern-W4-l12h2":         (12, 2, "entropy"),
     "S3-Bin-W4-l12h2-ent-top":  (12, 2, "entropy"),
+    "S3-Tern-W4-l12h2-top":     (12, 2, "entropy"),
 }
 # Per-condition direction override. None → use PROBE_DIRECTION_BY_TAG default
 # (typically "bottom" for entropy probes per the W2 D2 finding).
@@ -186,6 +200,10 @@ CONDITION_DIRECTION_OVERRIDE = {
     "S1-Bin-W4-top":            "top",
     "S2-Bin-W4-top":            "top",
     "S3-Bin-W4-l12h2-ent-top":  "top",
+    # 2026-04-29 Tier 4: direction-flipped ternary
+    "S1-Tern-W4-top":           "top",
+    "S2-Tern-W4-top":           "top",
+    "S3-Tern-W4-l12h2-top":     "top",
 }
 # Mapping from probe condition to (layer, head, metric).
 PROBE_BY_CONDITION = {
@@ -952,6 +970,7 @@ def build_masks_w4(
     masks["S2-Bin-W4-top"] = s2_bin_w4_top
 
     # ---- S1-Tern-W4 / S2-Tern-W4: lag-1 / speculative ternary on W4 base ----
+    # bottom direction (W2 default)
     s2_tern_w4 = _per_candidate_assignment(
         attn_w4, n, frac, direction="bottom", granularity="ternary",
         ternary_partition=ternary_partition,
@@ -959,6 +978,15 @@ def build_masks_w4(
     s1_tern_w4 = _lag_one(s2_tern_w4, n)
     masks["S1-Tern-W4"] = s1_tern_w4
     masks["S2-Tern-W4"] = s2_tern_w4
+    # 2026-04-29 Tier 4: top direction (testing whether direction-flip rescues
+    # the broken S1/S2-Tern bottom-dir result observed mid-Tier-1+2+3).
+    s2_tern_w4_top = _per_candidate_assignment(
+        attn_w4, n, frac, direction="top", granularity="ternary",
+        ternary_partition=ternary_partition,
+    )
+    s1_tern_w4_top = _lag_one(s2_tern_w4_top, n)
+    masks["S1-Tern-W4-top"] = s1_tern_w4_top
+    masks["S2-Tern-W4-top"] = s2_tern_w4_top
 
     # ---- Random-Tern-W4: random ternary partition matching same fractions ----
     rng_t = _random.Random(seed * 7919)
@@ -1456,6 +1484,12 @@ def analyze_w4():
         ("HW9c", "S1-Bin-W4-top", "S1-Bin-W4", "Top vs bottom lag-1 — which is right at W4?"),
         ("HW9d", "S3-Bin-W4-l12h2-ent-top", "S3-Bin-W4-l12h2-ent", "Top vs bottom intra-pass at l12h2"),
         ("HW9e", "S2-Bin-W4-top", "S2-Bin-W4", "Top vs bottom speculative"),
+        # 2026-04-29 Tier 4: direction-flipped TERNARY (the broken S1/S2-Tern story)
+        ("HW10a", "S1-Tern-W4-top", "S1-Tern-W4", "Top vs bottom lag-1 ternary — does flip rescue S1-Tern?"),
+        ("HW10b", "S2-Tern-W4-top", "S2-Tern-W4", "Top vs bottom speculative ternary — does flip rescue S2-Tern?"),
+        ("HW10c", "S3-Tern-W4-l12h2-top", "S3-Tern-W4-l12h2", "Top vs bottom intra-pass ternary at l12h2"),
+        ("HW10d", "S1-Tern-W4-top", "W4-Floor", "Direction-flipped ternary: does it match Floor at sub-W4 bits?"),
+        ("HW10e", "S3-Tern-W4-l12h2-top", "W4-Floor", "Intra-pass top-dir ternary: even better than bottom?"),
     ]
     for tag, a, b, q in pairs:
         if a not in by_cond_full or b not in by_cond_full:
