@@ -287,6 +287,48 @@ Full writeup with HW0–HW10e hypothesis matrix and per-suite splits in `EXPERIM
 
 Implementation: branch `overnight-2026-04-29-w4-first` (commits c7f0414, 325c65b, d876110, ad6867e). New code in `scripts/sis_utils.py` (`AttentionMetricHook`, `PrecisionController.use_bits_range`, `IntraPassController`) and `scripts/expB_sis_validation.py` (V3 diagnostic, intra-pass driver, 21 W4-base conditions). Results in `results/expB_w4_summary.md`, `results/expB_w4_rollouts.jsonl`, `results/expB_diagnostic_v3.jsonl`.
 
+## LIBERO-PRO at W4 (staged 2026-04-29)
+
+ExpC's W4 conditions tied FP16 at 94% combined SR on standard LIBERO — there's no rescue gap for AttnEntropy to close at W4. Per the LIBERO-PRO paper (arXiv:2510.03827, github.com/Zxy-MLlab/LIBERO-PRO), most VLAs memorize standard LIBERO; the benchmark needs perturbation to surface real generalization. Plan: swap the benchmark, keep the model and quantization stack identical, and re-run a focused 7-condition expC subset at the LIBERO-PRO position-perturbation operating point closest to FP16 ≈ 70% — the regime where W4 has headroom to degrade and AttnEntropy has signal to detect.
+
+### What's new
+
+- `scripts/setup_libero_pro.sh` — idempotent remote setup. Clones Zxy-MLlab/LIBERO-PRO, overlays its updated `benchmark/__init__.py` + `libero_suite_task_map.py` into the openpi LIBERO checkout (registers `libero_<suite>_temp` task suites), and downloads the per-(suite, axis, magnitude) bddl + init bundles from the HuggingFace dataset `zhouxueyang/LIBERO-Pro` into `bddl_files/` and `init_files/`. Falls back to the cloned repo's bundled files if HuggingFace is unavailable.
+- `scripts/rollout.py` — added `set_libero_pro_config()` / `parse_pro_config_str()` / `stage_libero_pro_files()` (process-safe, idempotent, fcntl-locked). When a Pro config is active for a suite, `make_libero_env()` routes to that suite's `_temp` variant after staging the right bundle. Unflagged invocations are byte-identical to the prior harness. New `--pro-config "Suite:axis:mag ..."` CLI flag.
+- `scripts/find_operating_point.py` — Step 2 driver. Sweeps configurable suites × magnitudes × N FP16 trials per cell. Writes `results/libero_pro_operating_point.md` with bootstrap CIs and a `D*` recommendation per suite.
+- `scripts/expB_sis_validation.py` — added `--pro-config`, `--out-tag`, `--w4-pro`, `--w2-pro`. The W4 mode runs the 5 W4-base conditions (`FP16`, `W4-Floor`, `AttnEntropy-W4`, `Random-W4`, `S3-Tern-W4-l12h2`); the W2 mode runs `W2` + `AttnEntropy` for sanity. Output paths get the `--out-tag` suffix so PRO results don't clobber the existing `expB_w4_*` files.
+
+### Running the LIBERO-PRO experiment
+```bash
+# Remote tambe-server-1 setup (one-time):
+bash /data/subha2/quantization/scripts/setup_libero_pro.sh
+
+# Step 1 — integration smoke (15 trials, ~5 min):
+CUDA_VISIBLE_DEVICES=<idx> MUJOCO_GL=egl uv run python \
+    /data/subha2/quantization/scripts/rollout.py \
+    --single-rollout --suite Object --task-id 20 --seed 0 \
+    --pro-config "Object:x:0.2"
+
+# Step 2 — operating point sweep (Object + Goal × {0.1, 0.2, 0.3}, 50 trials/cell, ~6h):
+CUDA_VISIBLE_DEVICES=<idx> uv run python \
+    /data/subha2/quantization/scripts/find_operating_point.py \
+    --suites Object Goal --magnitudes 0.1 0.2 0.3 --axis x --n-per-cell 50
+
+# Step 3 — focused expC at chosen D* per suite (5 W4 conditions × 100 trials, ~6-8h):
+CUDA_VISIBLE_DEVICES=<idx> uv run python \
+    /data/subha2/quantization/scripts/expB_sis_validation.py \
+    --w4-pro --pro-config "Object:x:<D*_Object> Goal:x:<D*_Goal>" \
+    --out-tag libero_pro --frac 0.5 --ternary-partition "0.1,0.4,0.5"
+
+# Optional W2 sanity (W2-Floor + AttnEntropy at W2; 2 conditions × 100 trials):
+CUDA_VISIBLE_DEVICES=<idx> uv run python \
+    /data/subha2/quantization/scripts/expB_sis_validation.py \
+    --w2-pro --pro-config "Object:x:<D*_Object> Goal:x:<D*_Goal>" \
+    --out-tag libero_pro --frac 0.5
+```
+
+The decision points are documented in the plan: W4-Floor SR < FP16 SR by ≥ 10 pp confirms W4 degrades on harder tasks (the headline hypothesis); AttnEntropy-W4 SR > Random-W4 SR with non-overlapping bootstrap CIs confirms the rescue gate works at W4 in this regime.
+
 ## Key References
 
 - **QVLA** (ICLR 2026) — Action-centric channel-wise quantization for AR VLAs

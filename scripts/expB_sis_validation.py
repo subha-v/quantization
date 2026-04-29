@@ -2071,6 +2071,31 @@ def full_trials():
     return out
 
 
+# Suite -> (global_task_id_base, n_tasks). Standard LIBERO has 10 tasks per suite.
+_SUITE_TASK_BASE = {"Long": 0, "Goal": 10, "Object": 20, "Spatial": 30}
+
+
+def pro_full_trials(pro_config: dict, n_per_suite: int = 50):
+    """Build a matched-pair trial set across the suites listed in pro_config.
+
+    Splits `n_per_suite` evenly over the suite's 10 tasks (5 episodes each by
+    default for n=50 per suite). Same (suite, task, seed, ep) shape as
+    full_trials(); only the suite list is parameterized.
+    """
+    out = []
+    eps_per_task = max(1, n_per_suite // 10)
+    for suite in sorted(pro_config):
+        if suite not in _SUITE_TASK_BASE:
+            raise ValueError(f"pro_full_trials: unknown suite {suite!r}")
+        base = _SUITE_TASK_BASE[suite]
+        for task_off in range(10):
+            for ep in range(eps_per_task):
+                global_task_id = base + task_off
+                seed = task_off * 10 + ep
+                out.append((suite, global_task_id, seed, ep))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -2127,6 +2152,17 @@ def main():
                         "FP16-rescue framing is meaningful.")
     g.add_argument("--analyze-w4", action="store_true",
                    help="produce W4 summary markdown from expB_w4_rollouts.jsonl")
+    g.add_argument("--w4-pro", action="store_true",
+                   help="LIBERO-PRO variant of --w4-schemes. Builds the trial set "
+                        "from --pro-config (50 trials per listed suite by default), "
+                        "writes outputs with the --out-tag suffix. Default conditions: "
+                        "FP16 + W4-Floor + AttnEntropy-W4 + Random-W4 + S3-Tern-W4-l12h2 "
+                        "(the 5 W4-base conditions of the LIBERO-PRO Step 3 plan).")
+    g.add_argument("--w2-pro", action="store_true",
+                   help="LIBERO-PRO sibling of --w4-pro for the W2-base sanity "
+                        "conditions. Default conditions: W2 + AttnEntropy (frac=0.5). "
+                        "Same trial set as --w4-pro; writes to expB__<tag>_rollouts.jsonl "
+                        "and expB_diagnostic__<tag>.jsonl.")
 
     p.add_argument("--suite", default=None)
     p.add_argument("--task-id", type=int, default=None)
@@ -2170,8 +2206,42 @@ def main():
                         "prior records exist for that trial in DIAG_V3_PATH. "
                         "Used to chain Tier 0 → Tier 1+2+3 without redoing the "
                         "diagnostic (~half the per-trial wall time).")
+    p.add_argument("--pro-config", default=None,
+                   help="LIBERO-PRO multi-suite config, e.g. 'Object:x:0.2 Goal:x:0.3'. "
+                        "Routes the listed suites to libero_<suite>_temp at the given "
+                        "axis/magnitude via rollout_mod.set_libero_pro_config(). Required "
+                        "for --w4-pro; optional for other modes if you want the existing "
+                        "trial set to run on the perturbed benchmark.")
+    p.add_argument("--out-tag", default=None,
+                   help="suffix appended to W4 diagnostic + rollout + summary filenames "
+                        "(e.g. 'libero_pro_obj0.2_goal0.3' → expB_w4_<tag>_rollouts.jsonl). "
+                        "Defaults: no suffix (overwrites the existing standard-LIBERO files).")
 
     args = p.parse_args()
+
+    # Apply LIBERO-PRO config if set: stages files + routes future make_libero_env
+    # calls to the _temp suite names.
+    pro_cfg = {}
+    if args.pro_config:
+        pro_cfg = rollout_mod.parse_pro_config_str(args.pro_config)
+        rollout_mod.set_libero_pro_config(pro_cfg)
+        utils.log(f"[expB] LIBERO-PRO config active: {pro_cfg}")
+
+    # Apply --out-tag suffix to all output paths so PRO runs don't clobber
+    # the existing expB_* artifacts.
+    global DIAG_V3_PATH, W4_ROLLOUT_PATH, W4_SUMMARY_PATH
+    global DIAG_PATH, ROLLOUT_PATH, SUMMARY_PATH
+    if args.out_tag:
+        tag = args.out_tag
+        DIAG_V3_PATH = RESULTS_DIR / f"expB_diagnostic_v3__{tag}.jsonl"
+        W4_ROLLOUT_PATH = RESULTS_DIR / f"expB_w4__{tag}_rollouts.jsonl"
+        W4_SUMMARY_PATH = RESULTS_DIR / f"expB_w4__{tag}_summary.md"
+        DIAG_PATH = RESULTS_DIR / f"expB_diagnostic__{tag}.jsonl"
+        ROLLOUT_PATH = RESULTS_DIR / f"expB__{tag}_rollouts.jsonl"
+        SUMMARY_PATH = RESULTS_DIR / f"expB__{tag}_summary.md"
+        utils.log(f"[expB] output tag '{tag}' -> {DIAG_V3_PATH.name}, "
+                  f"{W4_ROLLOUT_PATH.name}, {W4_SUMMARY_PATH.name}, "
+                  f"{DIAG_PATH.name}, {ROLLOUT_PATH.name}")
 
     if args.reset:
         # Sweep mode: only reset the sweep file, never the main diagnostic JSONLs
@@ -2223,7 +2293,7 @@ def main():
         return
 
     # ---- W4-first modes (2026-04-29) ----
-    if args.w4_tier0 or args.w4_schemes or (args.smoke and any(
+    if args.w4_tier0 or args.w4_schemes or args.w4_pro or (args.smoke and any(
         c in W4_ALL_CONDITIONS for c in (args.conditions or [])
     )):
         if args.smoke:
@@ -2236,6 +2306,28 @@ def main():
         elif args.w4_tier0:
             trials = full_trials()
             conditions = ["FP16", "W4-Floor", "W4-Static-Sched"]
+        elif args.w4_pro:
+            if not pro_cfg:
+                p.error("--w4-pro requires --pro-config 'Suite:axis:mag ...'")
+            trials = pro_full_trials(pro_cfg, n_per_suite=50)
+            if args.conditions and args.conditions != ["all"]:
+                unknown = [c for c in args.conditions if c not in ALL_CONDITIONS]
+                if unknown:
+                    p.error(f"unknown conditions: {unknown}")
+                conditions = args.conditions
+            else:
+                # Step 3 plan: 7 focused conditions for the LIBERO-PRO experiment.
+                conditions = [
+                    "FP16",
+                    "W4-Floor",
+                    "W2",
+                    "AttnEntropy",
+                    "AttnEntropy-W4",
+                    "Random-W4",
+                    "S3-Tern-W4-l12h2",
+                ]
+            utils.log(f"[expB-W4-pro] {len(trials)} trials across suites {sorted(pro_cfg)}; "
+                      f"conditions={conditions}")
         elif args.w4_schemes:
             trials = full_trials()
             if args.conditions and args.conditions != ["all"]:
@@ -2281,6 +2373,20 @@ def main():
     elif args.pilot:
         trials = pilot_trials()
         conditions = PILOT_CONDITIONS
+    elif args.w2_pro:
+        if not pro_cfg:
+            p.error("--w2-pro requires --pro-config 'Suite:axis:mag ...'")
+        trials = pro_full_trials(pro_cfg, n_per_suite=50)
+        if args.conditions and args.conditions != ["all"]:
+            unknown = [c for c in args.conditions if c not in ALL_CONDITIONS]
+            if unknown:
+                p.error(f"unknown conditions: {unknown}")
+            conditions = args.conditions
+        else:
+            # Step 3 plan W2 sanity subset.
+            conditions = ["W2", "AttnEntropy"]
+        utils.log(f"[expB-W2-pro] {len(trials)} trials across suites {sorted(pro_cfg)}; "
+                  f"conditions={conditions}")
     elif args.full:
         trials = full_trials()
         conditions = [c for c in ALL_CONDITIONS if c not in SCHEMES_CONDITIONS]

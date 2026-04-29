@@ -23,6 +23,7 @@ import collections
 import dataclasses
 import math
 import os
+import shutil
 import sys
 import time
 import traceback
@@ -69,6 +70,152 @@ SUITE_TO_OPENPI_NAME = {
 # standard LIBERO benchmark; they are indexed 0..9 in their own suite).
 def task_id_in_suite(global_task_id: int) -> int:
     return global_task_id % 10
+
+
+# ---------------------------------------------------------------------------
+# LIBERO-PRO integration
+# ---------------------------------------------------------------------------
+# LIBERO-PRO ships per (suite, axis, magnitude) bundles of bddl + init files.
+# The "active" bundle for a suite is always read from `libero_<suite>_temp/`;
+# switching magnitude means copying files from `libero_<suite>_temp_<axis><mag>/`
+# into that active dir (per LIBERO-PRO README §"Initial Position Perturbation").
+#
+# We register the active config in a module-level dict; make_libero_env() then
+# routes to the `_temp` suite name and ensures files are staged before the env
+# is constructed. Idempotent: a sentinel in the active dir records the staged
+# (axis, magnitude); restaging is a no-op when it matches.
+LIBERO_PRO_BDDL_DIR = os.environ.get(
+    "LIBERO_PRO_BDDL_DIR",
+    "/data/subha2/experiments/openpi/third_party/libero/libero/libero/bddl_files",
+)
+LIBERO_PRO_INIT_DIR = os.environ.get(
+    "LIBERO_PRO_INIT_DIR",
+    "/data/subha2/experiments/openpi/third_party/libero/libero/libero/init_files",
+)
+_PRO_CONFIG: dict = {}        # suite ("Object", ...) -> (axis, magnitude_str)
+_STAGED_CONFIG: dict = {}     # suite_temp_name -> (axis, magnitude_str) currently staged on disk
+
+
+def parse_pro_config_str(s: str) -> dict:
+    """Parse a multi-suite config string like 'Object:x:0.2 Goal:x:0.3'.
+
+    Each entry is `<Suite>:<axis>:<magnitude>`. Returns dict[Suite -> (axis, mag_str)].
+    """
+    out: dict = {}
+    if not s:
+        return out
+    # Allow comma OR whitespace separation.
+    tokens = [t for t in s.replace(",", " ").split() if t]
+    for tok in tokens:
+        parts = tok.split(":")
+        if len(parts) != 3:
+            raise ValueError(
+                f"--pro-config entry must be 'Suite:axis:magnitude', got {tok!r}"
+            )
+        suite, axis, mag = parts
+        if suite not in SUITE_TO_OPENPI_NAME:
+            raise ValueError(
+                f"--pro-config suite {suite!r} not in {list(SUITE_TO_OPENPI_NAME)}"
+            )
+        if axis not in ("x", "y"):
+            raise ValueError(f"--pro-config axis must be x|y, got {axis!r}")
+        # Normalize magnitude to single-decimal-digit string ("0.2") to match dir naming.
+        try:
+            mag_f = float(mag)
+        except ValueError:
+            raise ValueError(f"--pro-config magnitude must be numeric, got {mag!r}")
+        if mag_f not in (0.1, 0.2, 0.3, 0.4, 0.5):
+            raise ValueError(
+                f"--pro-config magnitude must be one of 0.1/0.2/0.3/0.4/0.5, got {mag_f}"
+            )
+        mag_str = f"{mag_f:.1f}"
+        out[suite] = (axis, mag_str)
+    return out
+
+
+def set_libero_pro_config(suite_configs: dict):
+    """Register a multi-suite LIBERO-PRO config and pre-stage files for each entry.
+
+    suite_configs: dict[Suite -> (axis, magnitude_str)], e.g. {"Object": ("x", "0.2")}.
+    Subsequent calls to make_libero_env(suite, ...) for any registered suite will
+    use the corresponding `libero_<suite>_temp` task suite and ensure the right
+    bundle is staged in the active `_temp` dir.
+    """
+    global _PRO_CONFIG
+    _PRO_CONFIG = dict(suite_configs)
+    for suite, (axis, mag_str) in _PRO_CONFIG.items():
+        suite_temp = SUITE_TO_OPENPI_NAME[suite] + "_temp"
+        stage_libero_pro_files(suite_temp, axis, mag_str)
+
+
+def get_libero_pro_config() -> dict:
+    return dict(_PRO_CONFIG)
+
+
+def stage_libero_pro_files(suite_temp_name: str, axis: str, magnitude: str):
+    """Copy bddl + init files from the magnitude-tagged source dir into the
+    active `<suite_temp_name>/` dir under both BDDL and init roots. Idempotent.
+
+    Process-safe: an fcntl flock on a per-active-dir lockfile prevents two
+    rollout processes on the same host from racing. Inside the lock we re-check
+    the sentinel file, so the second process is a no-op if the first finished.
+    """
+    import fcntl
+    import pathlib
+
+    bddl_root = pathlib.Path(LIBERO_PRO_BDDL_DIR)
+    init_root = pathlib.Path(LIBERO_PRO_INIT_DIR)
+    src_tag = f"{suite_temp_name}_{axis}{magnitude}"
+    sentinel_name = "_active_pro_config.txt"
+
+    cached_key = (suite_temp_name, axis, magnitude)
+    if _STAGED_CONFIG.get(suite_temp_name) == cached_key:
+        return  # already staged in this process
+
+    for root in (bddl_root, init_root):
+        if not root.exists():
+            raise RuntimeError(
+                f"LIBERO-PRO root {root!r} does not exist. "
+                f"Run scripts/setup_libero_pro.sh first."
+            )
+        src = root / src_tag
+        dst = root / suite_temp_name
+        if not src.exists():
+            raise RuntimeError(
+                f"LIBERO-PRO source bundle {src!r} not found. "
+                f"Available levels: x0.1..x0.5, y0.1..y0.5. "
+                f"Verify the HuggingFace download in setup_libero_pro.sh."
+            )
+        dst.mkdir(parents=True, exist_ok=True)
+        lockfile = dst.parent / f".{suite_temp_name}.lock"
+        with open(lockfile, "w") as lf:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+            try:
+                sentinel = dst / sentinel_name
+                want = f"{axis}{magnitude}"
+                if sentinel.exists() and sentinel.read_text().strip() == want:
+                    continue  # another process / prior run already staged this
+                # Wipe destination (preserve the lockfile lives outside).
+                for child in dst.iterdir():
+                    if child.is_dir():
+                        shutil.rmtree(child)
+                    else:
+                        child.unlink()
+                # Copy source files in (recursive — handles nested problem-folders).
+                for child in src.iterdir():
+                    if child.is_dir():
+                        shutil.copytree(child, dst / child.name)
+                    else:
+                        shutil.copy2(child, dst / child.name)
+                sentinel.write_text(want)
+            finally:
+                fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+    _STAGED_CONFIG[suite_temp_name] = cached_key
+    utils.log(
+        f"[libero-pro] staged {suite_temp_name} <- {src_tag} "
+        f"in {bddl_root} and {init_root}"
+    )
 
 
 # Per-suite max rollout step budget — cribbed from openpi/examples/libero/main.py
@@ -175,7 +322,20 @@ def make_libero_env(suite: str, task_id: int, seed: int, resolution: int = LIBER
         raise ValueError(f"Unknown suite {suite!r}; expected one of {list(SUITE_TO_OPENPI_NAME)}")
     suite_name = SUITE_TO_OPENPI_NAME[suite]
 
+    # LIBERO-PRO: if this suite has an active Pro config, route to the _temp
+    # variant and ensure the bddl/init bundle is staged on disk.
+    if suite in _PRO_CONFIG:
+        axis, mag_str = _PRO_CONFIG[suite]
+        suite_name = suite_name + "_temp"
+        stage_libero_pro_files(suite_name, axis, mag_str)
+
     benchmark_dict = benchmark.get_benchmark_dict()
+    if suite_name not in benchmark_dict:
+        raise RuntimeError(
+            f"LIBERO benchmark dict missing {suite_name!r}; available: "
+            f"{sorted(benchmark_dict)}. If using --pro-config, ensure setup_libero_pro.sh "
+            f"has run (registers libero_*_temp suites)."
+        )
     task_suite = benchmark_dict[suite_name]()
     n_tasks = task_suite.n_tasks
     local_id = task_id_in_suite(task_id)
@@ -428,7 +588,17 @@ def main():
     p.add_argument("--task-id", type=int, default=20,
                    help="Global task_id (suite-agnostic; mapped via task_id % 10).")
     p.add_argument("--seed", type=int, default=0)
+    p.add_argument("--pro-config", default=None,
+                   help="LIBERO-PRO multi-suite config, e.g. 'Object:x:0.2 Goal:x:0.3'. "
+                        "Each entry routes that suite to libero_<suite>_temp at the given "
+                        "axis/magnitude, staging files on demand. When unset (default), "
+                        "all suites use the standard LIBERO benchmark.")
     args = p.parse_args()
+
+    if args.pro_config:
+        cfg = parse_pro_config_str(args.pro_config)
+        set_libero_pro_config(cfg)
+        utils.log(f"[rollout] LIBERO-PRO config active: {cfg}")
 
     if args.smoke_render:
         try:
