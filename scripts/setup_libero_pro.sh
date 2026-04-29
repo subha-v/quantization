@@ -106,7 +106,13 @@ echo "--- Downloading LIBERO-PRO bundles from HuggingFace $HF_REPO ---"
 # The dataset is small (~hundreds of MB) so a full snapshot is simplest;
 # it's idempotent (skips already-downloaded files).
 cd "$OPENPI_DIR"
-"$OPENPI_DIR/.venv/bin/pip" install --quiet 'huggingface_hub>=0.20'
+# huggingface_hub is required for the snapshot_download below. Most openpi
+# venvs already have it; if not, install it via the venv python's ensurepip.
+if ! "$OPENPI_DIR/.venv/bin/python" -c 'import huggingface_hub' 2>/dev/null; then
+    echo "huggingface_hub not present; installing via venv python..."
+    "$OPENPI_DIR/.venv/bin/python" -m ensurepip --upgrade
+    "$OPENPI_DIR/.venv/bin/python" -m pip install --quiet 'huggingface_hub>=0.20'
+fi
 
 "$OPENPI_DIR/.venv/bin/python" -c "
 import os, shutil, sys
