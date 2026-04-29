@@ -86,11 +86,11 @@ def task_id_in_suite(global_task_id: int) -> int:
 # (axis, magnitude); restaging is a no-op when it matches.
 LIBERO_PRO_BDDL_DIR = os.environ.get(
     "LIBERO_PRO_BDDL_DIR",
-    "/data/subha2/experiments/openpi/third_party/libero/libero/libero/bddl_files",
+    "/data/subha2/openpi/third_party/libero/libero/libero/bddl_files",
 )
 LIBERO_PRO_INIT_DIR = os.environ.get(
     "LIBERO_PRO_INIT_DIR",
-    "/data/subha2/experiments/openpi/third_party/libero/libero/libero/init_files",
+    "/data/subha2/openpi/third_party/libero/libero/libero/init_files",
 )
 _PRO_CONFIG: dict = {}        # suite ("Object", ...) -> (axis, magnitude_str)
 _STAGED_CONFIG: dict = {}     # suite_temp_name -> (axis, magnitude_str) currently staged on disk
