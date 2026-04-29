@@ -126,6 +126,14 @@ ALL_CONDITIONS = [
     "Probe-W4-l9h2-ent",            # 28
     "Probe-W4-l3h4-top5",           # 29
     "Probe-W4-l17h4-top1",          # 30
+    # ---- 2026-04-29 mid-Tier-0 finding: at W4 base, l12h2-ent ρ flipped vs W2.
+    # Pooled n=1806 cycles (35 Long trials) showed ρ(W4-pass l12h2-ent, mse_fp_w4) = +0.172
+    # (W2 D2 finding had ρ = -0.294, opposite direction). Add -top variants to test
+    # whether high-entropy = high-W4-sensitivity is the right direction at W4.
+    "AttnEntropy-W4-top",           # 31 — FP16-pass oracle, top-frac% by entropy
+    "S1-Bin-W4-top",                # 32 — lag-1 binary, W4-pass entropy, top direction
+    "S2-Bin-W4-top",                # 33 — speculative binary, W4-pass entropy, top direction
+    "S3-Bin-W4-l12h2-ent-top",      # 34 — intra-pass at l12h2 ent, top direction
 ]
 
 # Legacy pilot conditions (frac=0.5 results live under old labels in the previous JSONLs)
@@ -136,10 +144,16 @@ SCHEMES_CONDITIONS = ["S1-Bin", "S2-Bin", "S1-Tern", "S2-Tern", "Random-Tern"]
 NEEDS_W2_PASS_ENTROPY = {"S1-Bin", "S2-Bin", "S1-Tern", "S2-Tern", "Random-Tern"}
 # W4-base conditions added 2026-04-29.
 W4_BASELINE_CONDITIONS = {"W4-Floor", "W4-Static-Sched", "FP16"}
-W4_BIN_CONDITIONS = {"Random-W4", "AttnEntropy-W4", "S1-Bin-W4", "S2-Bin-W4"}
+W4_BIN_CONDITIONS = {
+    "Random-W4", "AttnEntropy-W4", "S1-Bin-W4", "S2-Bin-W4",
+    # 2026-04-29 mid-Tier-0: direction-flipped variants (top instead of bottom)
+    "AttnEntropy-W4-top", "S1-Bin-W4-top", "S2-Bin-W4-top",
+}
 W4_INTRAPASS_CONDITIONS = {
     "S3-Bin-W4-l1h7-top1", "S3-Bin-W4-l9h2-ent", "S3-Bin-W4-l12h2-ent",
     "S3-Tern-W4-l12h2",
+    # 2026-04-29 mid-Tier-0: direction-flipped intra-pass at l12h2
+    "S3-Bin-W4-l12h2-ent-top",
 }
 W4_TERN_CONDITIONS = {"S1-Tern-W4", "S2-Tern-W4", "Random-Tern-W4"}
 W4_PROBE_CONDITIONS = {
@@ -157,10 +171,21 @@ W4_ALL_CONDITIONS = (
 # Mapping from intra-pass condition name to (layer, head, metric) — used to
 # instantiate IntraPassController with the right probe.
 INTRAPASS_PROBE_BY_CONDITION = {
-    "S3-Bin-W4-l1h7-top1":  (1, 7, "top1"),
-    "S3-Bin-W4-l9h2-ent":   (9, 2, "entropy"),
-    "S3-Bin-W4-l12h2-ent":  (12, 2, "entropy"),
-    "S3-Tern-W4-l12h2":     (12, 2, "entropy"),
+    "S3-Bin-W4-l1h7-top1":      (1, 7, "top1"),
+    "S3-Bin-W4-l9h2-ent":       (9, 2, "entropy"),
+    "S3-Bin-W4-l12h2-ent":      (12, 2, "entropy"),
+    "S3-Tern-W4-l12h2":         (12, 2, "entropy"),
+    "S3-Bin-W4-l12h2-ent-top":  (12, 2, "entropy"),
+}
+# Per-condition direction override. None → use PROBE_DIRECTION_BY_TAG default
+# (typically "bottom" for entropy probes per the W2 D2 finding).
+# "top" → flip direction (high metric → escalate). Used for the 2026-04-29
+# mid-Tier-0 finding that l12h2-ent ρ flipped sign at W4 base.
+CONDITION_DIRECTION_OVERRIDE = {
+    "AttnEntropy-W4-top":       "top",
+    "S1-Bin-W4-top":            "top",
+    "S2-Bin-W4-top":            "top",
+    "S3-Bin-W4-l12h2-ent-top":  "top",
 }
 # Mapping from probe condition to (layer, head, metric).
 PROBE_BY_CONDITION = {
@@ -894,6 +919,7 @@ def build_masks_w4(
     masks["Random-W4"] = {idx: "fp16" for idx in rand_set}
 
     # ---- AttnEntropy-W4: oracle deployable using FP16-pass entropy ----
+    # bottom direction = W2 D2 default; top direction = 2026-04-29 W4 finding
     attn_fp16 = []
     for c in per_cycle_v3:
         probes = c.get("attn_probes_fp16", {})
@@ -901,18 +927,29 @@ def build_masks_w4(
     masks["AttnEntropy-W4"] = _per_candidate_assignment(
         attn_fp16, n, frac, direction="bottom", granularity="binary",
     )
+    masks["AttnEntropy-W4-top"] = _per_candidate_assignment(
+        attn_fp16, n, frac, direction="top", granularity="binary",
+    )
 
     # ---- S1-Bin-W4 / S2-Bin-W4: lag-1 / speculative on W4-pass l12h2 entropy ----
     attn_w4 = []
     for c in per_cycle_v3:
         probes = c.get("attn_probes_w4", {})
         attn_w4.append(probes.get("l12h2-ent"))
+    # Bottom direction (W2 D2 default)
     s2_bin_w4 = _per_candidate_assignment(
         attn_w4, n, frac, direction="bottom", granularity="binary",
     )
     s1_bin_w4 = _lag_one(s2_bin_w4, n)
     masks["S1-Bin-W4"] = s1_bin_w4
     masks["S2-Bin-W4"] = s2_bin_w4
+    # Top direction (W4 mid-Tier-0 finding: ρ flipped sign at W4 base)
+    s2_bin_w4_top = _per_candidate_assignment(
+        attn_w4, n, frac, direction="top", granularity="binary",
+    )
+    s1_bin_w4_top = _lag_one(s2_bin_w4_top, n)
+    masks["S1-Bin-W4-top"] = s1_bin_w4_top
+    masks["S2-Bin-W4-top"] = s2_bin_w4_top
 
     # ---- S1-Tern-W4 / S2-Tern-W4: lag-1 / speculative ternary on W4 base ----
     s2_tern_w4 = _per_candidate_assignment(
@@ -1116,7 +1153,11 @@ def run_seed_w4(
             layer, head, metric = INTRAPASS_PROBE_BY_CONDITION[cond]
             granularity = "ternary" if cond.startswith("S3-Tern") else "binary"
             tag = format_probe_tag(layer, head, metric)
-            direction = PROBE_DIRECTION_BY_TAG.get(tag, "bottom")
+            # Use per-condition override if set (e.g. for `-top` flipped variants);
+            # otherwise fall back to PROBE_DIRECTION_BY_TAG default.
+            direction = CONDITION_DIRECTION_OVERRIDE.get(
+                cond, PROBE_DIRECTION_BY_TAG.get(tag, "bottom")
+            )
             if granularity == "binary":
                 intrapass_ctrl_obj = IntraPassController(
                     model, ctrl, layer_L=layer, head=head, metric=metric,
@@ -1399,16 +1440,22 @@ def analyze_w4():
     lines.append("|---|---|---|---:|---:|---|")
     pairs = [
         ("HW0", "W4-Floor", "FP16", "Is W4 alone good enough? (defines whether FP16-rescue is meaningful)"),
-        ("HW1", "S1-Bin-W4", "Random-W4", "Does the lag-1 mechanism work at W4?"),
-        ("HW2", "S3-Bin-W4-l12h2-ent", "S1-Bin-W4", "Does intra-pass beat lag-1 at W4?"),
+        ("HW1", "S1-Bin-W4", "Random-W4", "Does the lag-1 mechanism work at W4? (bottom dir)"),
+        ("HW2", "S3-Bin-W4-l12h2-ent", "S1-Bin-W4", "Does intra-pass beat lag-1 at W4? (bottom dir)"),
         ("HW3a", "S3-Bin-W4-l1h7-top1", "S3-Bin-W4-l12h2-ent", "Earlier-layer cheap-pass viable at W4?"),
         ("HW3b", "S3-Bin-W4-l9h2-ent", "S3-Bin-W4-l12h2-ent", "Mid-layer alt viable?"),
         ("HW4", "S1-Tern-W4", "W4-Floor", "Sub-W4 average preserves SR vs uniform W4?"),
         ("HW5", "S2-Bin-W4", "S1-Bin-W4", "No-lag advantage at W4?"),
-        ("HW6", "AttnEntropy-W4", "Random-W4", "Oracle direction validation at W4"),
+        ("HW6", "AttnEntropy-W4", "Random-W4", "Oracle direction validation (bottom dir, W2 default)"),
         ("HW8a", "Probe-W4-l1h7-top1", "AttnEntropy-W4", "Lag-1 probe l1h7 vs lag-0 oracle l12h2"),
         ("HW8b", "Probe-W4-l17h4-top1", "AttnEntropy-W4", "Late-layer signal-strength upper bound"),
         ("HW8c", "Probe-W4-l9h2-ent", "AttnEntropy-W4", "Mid-layer probe vs oracle"),
+        # 2026-04-29: direction-flip tests (mid-Tier-0 finding flagged ρ sign-flip at W4)
+        ("HW9a", "AttnEntropy-W4-top", "Random-W4", "Top-direction oracle vs random — does flipped direction work?"),
+        ("HW9b", "AttnEntropy-W4-top", "AttnEntropy-W4", "Top vs bottom direction oracle — which is right at W4?"),
+        ("HW9c", "S1-Bin-W4-top", "S1-Bin-W4", "Top vs bottom lag-1 — which is right at W4?"),
+        ("HW9d", "S3-Bin-W4-l12h2-ent-top", "S3-Bin-W4-l12h2-ent", "Top vs bottom intra-pass at l12h2"),
+        ("HW9e", "S2-Bin-W4-top", "S2-Bin-W4", "Top vs bottom speculative"),
     ]
     for tag, a, b, q in pairs:
         if a not in by_cond_full or b not in by_cond_full:
