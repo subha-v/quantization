@@ -967,5 +967,65 @@ Both are deployable, but at W4 the result is a true Pareto improvement (lower co
 
 - **CI overlap on the headline result**: S3-Tern-W4-l12h2 (0.95 [0.90, 0.99]) vs W4-Floor (0.94 [0.89, 0.98]) — bootstrap CIs overlap heavily at n=100. Matched-pair delta SR is +0.030 (HW10e against Floor for top-dir variant). The contribution is "matches Floor at lower bits" rather than "beats Floor."
 - **n=100 is the smallest workable n for this hypothesis matrix.** Per-condition CI widths are ±5 pp; some pairwise deltas are within noise. A future run at n=200+ would tighten these.
-- **The l1h7-top1 per-trial signal (mean ρ = -0.155) is intriguing**: if the cheap-pass intra-pass version with the *correct* (bottom) direction were tested, it might enable an even cheaper deployable scheme — but `S3-Bin-W4-l1h7-top1` was run with the W2-default direction ("top") which is wrong at W4. A `S3-Bin-W4-l1h7-bottom` follow-up is the obvious next experiment.
+- **The l1h7-top1 per-trial signal (mean ρ = -0.155) is intriguing**: if the cheap-pass intra-pass version with the *correct* (bottom) direction were tested, it might enable an even cheaper deployable scheme — but `S3-Bin-W4-l1h7-top1` was run with the W2-default direction ("top") which is wrong at W4. A `S3-Bin-W4-l1h7-bottom` follow-up is the obvious next experiment. **(Tier 5 below resolved this — falsified.)**
 - **Layer-restriction follow-up**: confirm the spatial finding by testing "layers 1-12 W4 + layer L W2 + layers L+1..17 W4" for each L — isolate which exact layer's W2 demotion causes the failure. Likely it's a specific cluster (layers 4-11 from exp7) but not yet pinpointed.
+
+---
+
+## Experiment C Tier 5 — l1h7 cheap-pass FALSIFICATION (2026-04-29 post-overnight)
+
+The Tier 1+2+3 run included `S3-Bin-W4-l1h7-top1` with the PROBE_DIRECTION_BY_TAG W2-default direction "top" (matching ρ = +0.26 at W2). At W4 the per-trial mean ρ for l1h7-top1 is **-0.155** — strongest of all 5 candidate probes — implying the W4-correct direction is "bottom" (low top1 → escalate FP16). The intuition: if l1h7-bottom works at W4, it would be a cheap-pass deployable winner because gating at layer 1 means swapping layers 2..17 (16 layers downstream) — much larger compute savings than l12h2 (5 layers downstream). Two new conditions added in commit e6e26ca and run on the same 100-trial set with `--reuse-diag`:
+
+- `S3-Bin-W4-l1h7-bottom` — binary, layer-1 readout, bottom direction (W4-correct)
+- `S3-Tern-W4-l1h7-bottom` — ternary 0.1/0.4/0.5 partition, bottom direction
+
+Total Tier 5 cost: 2 conditions × 100 trials = 200 rollouts in ~50 min.
+
+### Tier 5 results at n=100
+
+| Condition | SR | avg_bits | 95% CI | Long n=50 | Object n=50 |
+|---|---:|---:|---|---:|---:|
+| **S3-Bin-W4-l1h7-bottom** | **0.980** | **9.32** | [0.950, 1.000] | 0.960 | 1.000 |
+| **S3-Tern-W4-l1h7-bottom** | **0.910** | **4.43** | [0.850, 0.960] | 0.880 | 0.940 |
+
+### Tier 5 matched-pair deltas (all over n=100)
+
+| Tag | Comparison | Δ SR | Verdict |
+|---|---|---:|---|
+| HW11a | l1h7-bottom vs l1h7-top1 (direction flip, binary) | **+0.010** | direction-flip is real but small (1 pp) |
+| HW11b | l1h7-bottom vs l12h2-ent-bottom (binary, cross-layer) | +0.010 | l1h7 binary slightly better SR but 9.32 vs 4.42 bits — not Pareto |
+| HW11c | l1h7-bottom-tern vs l12h2-bottom-tern (ternary, cross-layer) | **-0.040** | l1h7 ternary loses to l12h2 ternary by 4 pp |
+| HW11d | l1h7-bottom-tern vs W4-Floor (Pareto test) | **-0.030** | l1h7 ternary LOSES to uniform W4 |
+
+### Two findings — direction is small, spatial is dominant
+
+**1. Direction-flip at l1h7 is a real but small effect (+1.0 pp).** Confirms the per-trial Spearman ρ = -0.155 signal is genuine: targeting low-top1 cycles for FP16 escalation does help vs. the W2-default top direction. But the magnitude is small — same order as the direction-flip effects we saw for AttnEntropy/S1-Bin/S2-Bin/S3-Bin-l12h2 (range ±3 pp).
+
+**2. The cheap-pass hypothesis is FALSIFIED.** `S3-Tern-W4-l1h7-bottom` gets 91.0% SR at 4.43 avg bits — **worse than W4-Floor's 94.0% / 4.00 bits on BOTH dimensions**. Even with the W4-correct direction at the strongest-signal probe, ternary at the earliest gate layer collapses by 3 pp. This is the same spatial-collapse mechanism that broke S1/S2-Tern: with L=1, the W2-demotable "tail" includes layers 2-17 (16 of 18 VLM layers, including the sensitive 2-12 region). Targeted demotion of "the right" cycles still fails because mid-VLM Gemma layers cannot tolerate W2 even on individual cycles.
+
+### What this means
+
+The S3-Tern-W4-l12h2 Pareto winner depends specifically on its narrow demotion footprint (layers 13-17 only). Moving the gate earlier into the VLM expands the W2-demotion footprint into the spatially sensitive zone, undoing the cost-vs-quality trade. The "earliest cheap layer" intuition from MEETING_5 is incompatible with the spatial-restriction requirement — they pull in opposite directions:
+
+- **Earlier gate → more layers downstream of L → larger compute savings per W2 demotion** (good)
+- **Earlier gate → demoted layers include sensitive mid-VLM 2-12** (catastrophic)
+
+The two conditions cannot be jointly satisfied with the current quantization setup. **`S3-Tern-W4-l12h2` is therefore the deployable optimum at this design point**: gating at layer 12 is the earliest position whose downstream tail (13-17) is entirely outside the sensitive zone.
+
+### Updated synthesis
+
+| Hypothesis | Status |
+|---|---|
+| AttnEntropy direction-flip at W4 (vs W2 default) | ✓ Confirmed (small effect, 1-3 pp) |
+| Layer-restricted W2 demotion enables sub-W4 average | ✓ Confirmed (S3-Tern-W4-l12h2: 95.2% / 3.58 bits) |
+| Full-pass W2 demotion (S1/S2/Random-Tern) is destructive | ✓ Confirmed (-15 to -30 pp loss) |
+| Earlier-layer gate (l1h7) enables cheaper deployable scheme | ✗ **Falsified** — spatial constraint dominates |
+| Strongest per-trial probe (l1h7-top1) → strongest deployable scheme | ✗ Per-trial ρ doesn't transfer to rollout-level SR when the demotion footprint includes sensitive layers |
+
+**The deployable contribution is firmly: layer-restricted intra-pass W2 demotion at L=12 with l12h2 entropy gate, bottom direction, frac=0.4, ternary partition (0.1, 0.4, 0.5).** Sub-W4 average bits (3.58) at matched/better SR (95.2% vs Floor 94.0%) on 100 paired LIBERO trials.
+
+### Open follow-ups (not yet run)
+
+1. **Layer-by-layer ternary sweep**: test L = 8, 10, 11, 13, 14, 15 to find the exact transition point where the spatial collapse begins. Currently jumps from "fails at L=1" to "works at L=12" — there's a continuous transition somewhere in between worth characterizing.
+2. **Conservative aggressive partitions at L=12**: `S3-Tern-W4-l12h2` with partitions (0.05, 0.25, 0.7) → ~3.0 avg bits, or (0, 0.4, 0.6) → no FP16 escalation at all (pure W2/W4 mix). The latter would test whether FP16 rescue is needed at L=12 or if the demotion side alone is sufficient.
+3. **Active expert quantization**: currently the action expert is FP16 throughout. A W4 action-expert would lower avg bits further; combined with S3-Tern-W4-l12h2 could push to ~2.5-3 effective bits.

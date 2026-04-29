@@ -1,6 +1,6 @@
 # ExpB W4-First — Online Mixed-Precision Quantization Summary
 
-_n rollouts = 2100_
+_n rollouts = 2300_
 
 ## Overall success rate (95% bootstrap CI, n_boot=10k)
 
@@ -27,6 +27,8 @@ _n rollouts = 2100_
 | S1-Tern-W4-top | 100 | 0.710 | [0.620, 0.800] | 4.45 |
 | S2-Tern-W4-top | 100 | 0.640 | [0.540, 0.730] | 4.19 |
 | S3-Tern-W4-l12h2-top | 100 | 0.970 | [0.930, 1.000] | 5.20 |
+| S3-Bin-W4-l1h7-bottom | 100 | 0.980 | [0.950, 1.000] | 9.32 |
+| S3-Tern-W4-l1h7-bottom | 100 | 0.910 | [0.850, 0.960] | 4.43 |
 
 ## Per-suite success rate
 
@@ -53,6 +55,8 @@ _n rollouts = 2100_
 | S1-Tern-W4-top | 0.580 [0.44,0.72] (n=50) | 0.840 [0.74,0.94] (n=50) |
 | S2-Tern-W4-top | 0.520 [0.38,0.66] (n=50) | 0.760 [0.64,0.86] (n=50) |
 | S3-Tern-W4-l12h2-top | 0.940 [0.86,1.00] (n=50) | 1.000 [1.00,1.00] (n=50) |
+| S3-Bin-W4-l1h7-bottom | 0.960 [0.90,1.00] (n=50) | 1.000 [1.00,1.00] (n=50) |
+| S3-Tern-W4-l1h7-bottom | 0.880 [0.78,0.96] (n=50) | 0.940 [0.86,1.00] (n=50) |
 
 ## Hypothesis matrix (matched-pair signed deltas)
 
@@ -79,6 +83,10 @@ Positive = A wins. Matched seeds cancel intrinsic trial difficulty.
 | HW10c | S3-Tern-W4-l12h2-top | S3-Tern-W4-l12h2 | 100 | +0.020 | Top vs bottom intra-pass ternary at l12h2 |
 | HW10d | S1-Tern-W4-top | W4-Floor | 100 | -0.230 | Direction-flipped ternary: does it match Floor at sub-W4 bits? |
 | HW10e | S3-Tern-W4-l12h2-top | W4-Floor | 100 | +0.030 | Intra-pass top-dir ternary: even better than bottom? |
+| HW11a | S3-Bin-W4-l1h7-bottom | S3-Bin-W4-l1h7-top1 | 100 | +0.010 | l1h7 bottom (W4-correct) vs top (W2-default) |
+| HW11b | S3-Bin-W4-l1h7-bottom | S3-Bin-W4-l12h2-ent | 100 | +0.010 | l1h7 bottom vs l12h2 bottom — earlier layer better? |
+| HW11c | S3-Tern-W4-l1h7-bottom | S3-Tern-W4-l12h2 | 100 | -0.040 | l1h7 bottom ternary vs l12h2 bottom ternary |
+| HW11d | S3-Tern-W4-l1h7-bottom | W4-Floor | 100 | -0.030 | l1h7 ternary vs W4-Floor (cheap-pass Pareto test) |
 
 ## HW7 — D2-W4 transfer (per-trial Spearman ρ)
 
