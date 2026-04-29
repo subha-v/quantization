@@ -29,6 +29,23 @@ LIBERO_DIR="$OPENPI_DIR/third_party/libero"
 LIBERO_PRO_DIR="$EXPERIMENT_DIR/LIBERO-PRO"
 HF_REPO="zhouxueyang/LIBERO-Pro"
 
+# LIBERO's __init__.py blocks on input() if config.yaml is missing. Pre-create
+# it so the verification step at the end of this script doesn't deadlock.
+export LIBERO_CONFIG_PATH="${LIBERO_CONFIG_PATH:-$WORKSPACE/.libero}"
+export PYTHONPATH="${PYTHONPATH:-}:$LIBERO_DIR"
+mkdir -p "$LIBERO_CONFIG_PATH"
+if [ ! -f "$LIBERO_CONFIG_PATH/config.yaml" ]; then
+    LIBERO_SRC="$LIBERO_DIR/libero/libero"
+    cat > "$LIBERO_CONFIG_PATH/config.yaml" << EOF
+benchmark_root: $LIBERO_SRC
+bddl_files: $LIBERO_SRC/bddl_files
+init_states: $LIBERO_SRC/init_files
+datasets: $LIBERO_SRC/datasets
+assets: $LIBERO_SRC/assets
+EOF
+    echo "  wrote LIBERO config to $LIBERO_CONFIG_PATH/config.yaml"
+fi
+
 echo "=== LIBERO-PRO setup ==="
 echo "WORKSPACE:         $WORKSPACE"
 echo "EXPERIMENT_DIR:    $EXPERIMENT_DIR"
@@ -114,6 +131,7 @@ if ! "$OPENPI_DIR/.venv/bin/python" -c 'import huggingface_hub' 2>/dev/null; the
     "$OPENPI_DIR/.venv/bin/python" -m pip install --quiet 'huggingface_hub>=0.20'
 fi
 
+export HF_CACHE_DIR
 "$OPENPI_DIR/.venv/bin/python" -c "
 import os, shutil, sys
 from pathlib import Path
@@ -215,11 +233,14 @@ bd = benchmark.get_benchmark_dict()
 suites = sorted(bd.keys())
 temp_suites = [s for s in suites if s.endswith('_temp')]
 print(f'registered _temp suites: {temp_suites}')
-needed = ['libero_object_temp', 'libero_goal_temp']
+# Only Object's _temp is required for the Initial Position Perturbation
+# experiment (Figure 6) — Goal/Spatial/10 use a different perturbation
+# engine (perturbation.create_env via evaluation_config.yaml).
+needed = ['libero_object_temp']
 missing = [s for s in needed if s not in suites]
 if missing:
     raise SystemExit(f'ERROR: missing suite registrations: {missing}')
-print('libero_*_temp suite registration OK')
+print('libero_object_temp suite registration OK')
 "
 
 echo ""
