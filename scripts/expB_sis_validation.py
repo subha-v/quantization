@@ -952,6 +952,24 @@ def _avg_bits_w4(precision_per_cycle: dict, n_cycles: int) -> float:
     return _avg_bits(precision_per_cycle, n_cycles, default_precision="w4")
 
 
+def _load_v3_diag_for_trial(diag_path: Path, suite: str, task_id: int, seed: int, episode_idx: int):
+    """Load per-cycle V3 diagnostic rows for a single trial from JSONL.
+    Returns sorted list (by cycle_idx) or empty list if no rows match.
+
+    Used by run_seed_w4 to skip re-running the diagnostic when prior records
+    exist (e.g., Tier 0 wrote them; Tier 1+2+3 reuses them)."""
+    if not diag_path.exists():
+        return []
+    rows = utils.load_jsonl(diag_path)
+    matching = [
+        r for r in rows
+        if r.get("suite") == suite and int(r.get("task_id", -1)) == int(task_id)
+        and int(r.get("seed", -1)) == int(seed) and int(r.get("episode_idx", -1)) == int(episode_idx)
+    ]
+    matching.sort(key=lambda r: int(r.get("cycle_idx", -1)))
+    return matching
+
+
 def run_seed_w4(
     policy, model, ctrl,
     legacy_attn_hook,
@@ -964,11 +982,20 @@ def run_seed_w4(
     ternary_partition=(0.1, 0.4, 0.5),
     diag_path: Path = None,
     rollout_path: Path = None,
+    reuse_cached_diag: bool = False,
     verbose: bool = False,
 ) -> list:
     """W4-base per-seed driver. Mirrors run_seed but routes through the V3
     diagnostic + W4 mask builder, and dispatches S3-* conditions to
-    intrapass_rollout."""
+    intrapass_rollout.
+
+    `reuse_cached_diag=True` skips the diagnostic_rollout_v3 call when prior
+    per-cycle records exist for this trial in `diag_path`. Used to chain
+    Tier 0 → Tier 1+2+3 without redoing the diagnostic. The skipped diagnostic
+    means W4-Floor / W4-Static-Sched conditions can't be re-emitted as rollout
+    rows (we don't have a fresh rollout_record); those should already be in
+    rollout_path from the prior run.
+    """
     if diag_path is None:
         diag_path = DIAG_V3_PATH
     if rollout_path is None:
@@ -991,22 +1018,37 @@ def run_seed_w4(
     BASELINE_CONDS = {"FP16", "W4-Floor", "W4-Static-Sched"}
 
     w4_rec, w4_per_cycle = None, None
+    cached_per_cycle = []
+    if reuse_cached_diag:
+        cached_per_cycle = _load_v3_diag_for_trial(
+            diag_path, suite, task_id, seed, episode_idx
+        )
+
     if any(c in conditions for c in NEEDS_W4_DIAG | {"W4-Floor"}):
-        utils.log(f"[expB-W4] W4-DIAG seed={seed} task={task_id} ep={episode_idx}")
-        t0 = time.time()
-        w4_rec, w4_per_cycle = diagnostic_rollout_v3(
-            policy, model, ctrl, legacy_attn_hook, probe_hooks,
-            suite, task_id, seed, episode_idx,
-            base_precision="w4",
-            n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
-            verbose=verbose,
-        )
-        utils.log(
-            f"[expB-W4] W4-DIAG done seed={seed} success={w4_rec.success} "
-            f"steps={w4_rec.steps} cycles={len(w4_per_cycle)} wall={time.time()-t0:.1f}s"
-        )
-        for c in w4_per_cycle:
-            utils.append_jsonl({**rollout_key, **c}, diag_path)
+        if cached_per_cycle:
+            utils.log(
+                f"[expB-W4] W4-DIAG CACHED seed={seed} task={task_id} ep={episode_idx} "
+                f"({len(cached_per_cycle)} cycles loaded from {diag_path.name})"
+            )
+            w4_per_cycle = cached_per_cycle
+            # w4_rec stays None — we don't have the rollout_record. Code below
+            # gracefully skips emitting W4-Floor/W4-Static-Sched rows when w4_rec is None.
+        else:
+            utils.log(f"[expB-W4] W4-DIAG seed={seed} task={task_id} ep={episode_idx}")
+            t0 = time.time()
+            w4_rec, w4_per_cycle = diagnostic_rollout_v3(
+                policy, model, ctrl, legacy_attn_hook, probe_hooks,
+                suite, task_id, seed, episode_idx,
+                base_precision="w4",
+                n_grid=n_grid, sigma=sigma, sis_stride=sis_stride,
+                verbose=verbose,
+            )
+            utils.log(
+                f"[expB-W4] W4-DIAG done seed={seed} success={w4_rec.success} "
+                f"steps={w4_rec.steps} cycles={len(w4_per_cycle)} wall={time.time()-t0:.1f}s"
+            )
+            for c in w4_per_cycle:
+                utils.append_jsonl({**rollout_key, **c}, diag_path)
 
     fp16_rec = None
     if "FP16" in conditions:
@@ -1050,6 +1092,10 @@ def run_seed_w4(
 
         elif cond == "W4-Floor":
             # Re-use the W4 diagnostic's executed trajectory (which IS W4-Floor).
+            if w4_rec is None:
+                # Cached-diag path: rollout already in rollout_path from prior run.
+                utils.log(f"[expB-W4] skip W4-Floor — diagnostic cached (row should exist from prior tier)")
+                continue
             rec = w4_rec
             avg_bits = float(BITS_BY_PRECISION["w4"])
 
@@ -1059,6 +1105,9 @@ def run_seed_w4(
             # overnight we treat W4-Static-Sched the same as W4-Floor and flag it
             # so the analysis can highlight that step 9 wasn't separately handled.
             # TODO(expA-port): wire StepController for the expert.
+            if w4_rec is None:
+                utils.log(f"[expB-W4] skip W4-Static-Sched — diagnostic cached")
+                continue
             utils.log(f"[expB-W4] WARN: W4-Static-Sched not yet wired (uses W4-Floor for now)")
             rec = w4_rec
             avg_bits = float(BITS_BY_PRECISION["w4"])
@@ -1172,11 +1221,16 @@ def run_trials_w4(
     ternary_partition=(0.1, 0.4, 0.5),
     diag_path: Path = None,
     rollout_path: Path = None,
+    reuse_cached_diag: bool = False,
     verbose=False,
 ):
     """W4-base top-level driver. Loads policy + builds PrecisionController with
     bits_list=(2, 4) (need both for ternary), installs the multi-probe hook
-    set, then runs each trial through run_seed_w4."""
+    set, then runs each trial through run_seed_w4.
+
+    `reuse_cached_diag=True` skips the V3 diagnostic per trial when prior records
+    are present in `diag_path` (Tier 0 → Tier 1+2+3 chaining).
+    """
     if candidate_readouts is None:
         candidate_readouts = list(DEFAULT_CANDIDATE_READOUTS)
 
@@ -1215,6 +1269,7 @@ def run_trials_w4(
                     ternary_partition=ternary_partition,
                     diag_path=diag_path,
                     rollout_path=rollout_path,
+                    reuse_cached_diag=reuse_cached_diag,
                     verbose=verbose,
                 )
             except Exception as e:
@@ -2008,6 +2063,11 @@ def main():
                    help="probe tags to capture in the V3 diagnostic, e.g. "
                         "'l1h7-top1 l9h2-ent l12h2-ent l3h4-top5 l17h4-top1'. "
                         "Default: all 5 from MEETING_5 top-15.")
+    p.add_argument("--reuse-diag", action="store_true",
+                   help="W4 modes only: skip the V3 diagnostic per trial when "
+                        "prior records exist for that trial in DIAG_V3_PATH. "
+                        "Used to chain Tier 0 → Tier 1+2+3 without redoing the "
+                        "diagnostic (~half the per-trial wall time).")
 
     args = p.parse_args()
 
@@ -2105,6 +2165,7 @@ def main():
             n_grid=args.n_grid, sigma=args.sigma, sis_stride=args.sis_stride,
             frac=args.frac,
             ternary_partition=args.ternary_partition,
+            reuse_cached_diag=args.reuse_diag,
             verbose=args.verbose,
         )
         analyze_w4()
