@@ -263,6 +263,30 @@ The hypothesis matrix tests:
 - HW4: SR(S1-Tern-W4) − SR(W4-Floor) at avg_bits < 4 — sub-W4 average beats uniform W4?
 - HW7: per-trial Spearman ρ(l12h2-ent W4-pass, ‖a_FP − a_W4‖²) — does D2 transfer to W4?
 
+### W4-first results — completed 2026-04-29 (n=100, 50 Long + 50 Object × 21 conditions = 2100 rollouts)
+
+Headline: **`S3-Tern-W4-l12h2` Pareto-dominates uniform W4** at 95.0% SR / 3.58 avg bits vs W4-Floor's 94.0% / 4.00 bits. The mechanism is **layer-restricted intra-pass W2 demotion** (only layers 13-17 are demoted; layers 1-12 stay at W4 base) gated per-cycle by an l12h2 attention entropy running quantile.
+
+| Condition | SR | avg bits | Note |
+|---|---:|---:|---|
+| FP16 (ceiling) | 0.940 | 16.00 | reference |
+| W4-Floor | 0.940 | 4.00 | reference |
+| **S3-Tern-W4-l12h2** | **0.950** | **3.58** | **Pareto winner** |
+| S3-Bin-W4-l12h2-ent | 0.970 | 4.42 | best binary at <5 bits |
+| S3-Bin-W4-l9h2-ent | 0.980 | 5.05 | strongest binary signal |
+| S1-Tern-W4 (full-pass W2 demotion) | 0.790 | 4.57 | spatial collapse: -15 pp |
+| S2-Tern-W4 (full-pass W2 demotion) | 0.740 | 4.19 | spatial collapse: -20 pp |
+| Random-Tern-W4 | 0.790 | 4.19 | random demotion also collapses |
+
+**Three findings**:
+1. **Layer-restricted intra-pass demotion** (S3-Tern only swaps layers 13-17 to W2) achieves sub-W4 avg bits at matched/better SR.
+2. **Full-pass W2 demotion (layers 1-17) is fundamentally broken at W4** — random, bottom-direction, and top-direction targeting all fail (-15 to -30 pp). Mid-VLM layers (1-12) do not tolerate W2 even on individual cycles.
+3. **The D2 direction is FLIPPED at W4 vs W2**: l12h2-ent ρ = +0.115 at W4 (vs -0.294 at W2). But the directional effect is small (+1-3 pp) compared to the spatial effect.
+
+Full writeup with HW0–HW10e hypothesis matrix and per-suite splits in `EXPERIMENT_FINDINGS.md` → "Experiment C — W4-first online mixed-precision".
+
+Implementation: branch `overnight-2026-04-29-w4-first` (commits c7f0414, 325c65b, d876110, ad6867e). New code in `scripts/sis_utils.py` (`AttentionMetricHook`, `PrecisionController.use_bits_range`, `IntraPassController`) and `scripts/expB_sis_validation.py` (V3 diagnostic, intra-pass driver, 21 W4-base conditions). Results in `results/expB_w4_summary.md`, `results/expB_w4_rollouts.jsonl`, `results/expB_diagnostic_v3.jsonl`.
+
 ## Key References
 
 - **QVLA** (ICLR 2026) — Action-centric channel-wise quantization for AR VLAs

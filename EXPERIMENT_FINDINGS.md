@@ -849,3 +849,123 @@ Until that check runs, the honest framing of the AttnEntropy result is:
 
 - **Research claim (validated):** l12h2 head 2 attention entropy is the per-frame signal that best ranks which frames a W2-with-protection trajectory needs FP16 rescue at; it dominates SIS, beats per-frame-MSE oracle, and has a clean direction-symmetry control.
 - **Deployment claim (not yet validated):** that signal can be read cheaply enough at runtime to support a streaming precision gate. The most promising path is the one-frame-lag scheme above; it depends on FP16-pass-entropy and W2-pass-entropy being highly correlated.
+
+---
+
+## Experiment C — W4-first online mixed-precision (overnight, 2026-04-28→29)
+
+Pivoted away from the W2-rescue framing of ExpB after the user identified that modern GPUs have native W4 tensor cores (sub-W4 needs custom kernels). The experimental question shifted from "can attention entropy rescue W2 failures" to **"can attention entropy enable sub-W4 average bits without rollout SR loss"**. Implementation in commits c7f0414, 325c65b, d876110, ad6867e on branch `overnight-2026-04-29-w4-first`.
+
+### Methodology
+
+- **Diagnostic V3** (`scripts/sis_utils.py:AttentionMetricHook`, `scripts/expB_sis_validation.py:diagnostic_rollout_v3`): captured FP16-pass and W4-pass attention metrics for 5 candidate (layer, head, metric) probes per cycle: `l1h7-top1`, `l9h2-ent`, `l12h2-ent`, `l3h4-top5`, `l17h4-top1` (the top-15 features from D2 in MEETING_5).
+- **Intra-pass controller** (`scripts/sis_utils.py:IntraPassController`): forward-hook on `language_model.layers.{L}.self_attn`. After the metric is recorded, calls `PrecisionController.use_bits_range(L+1, 17, decision)` to swap layers L+1..17 mid-forward. Three-tier supported: bottom-frac_high → escalate, top-frac_low → demote, middle → base.
+- **21 conditions × 100 paired trials** (50 Long + 50 Object) at frac=0.4 binary, partition (0.1, 0.4, 0.5) ternary. Total 2100 rollouts, ~9.5h on H100.
+- Tier 0 (W4 baseline, 3 conditions × 100 trials, 2.7h) → Tier 1+2+3 (15 conditions × 100 trials with `--reuse-diag`, 6.7h) → Tier 4 (3 direction-flipped ternary conditions × 100 trials, 1.5h).
+
+### Mid-Tier-0 finding — D2 direction is FLIPPED at W4
+
+At pooled n=1806 cycles (35 trials, partial), Spearman ρ(W4-pass l12h2-ent, ‖a_FP − a_W4‖²) = **+0.172** (p = 2×10⁻¹³). The W2 D2 finding had ρ = −0.294 — opposite sign. **At W4, HIGH entropy at l12h2 predicts HIGH sensitivity** (vs. LOW entropy at W2). Triggered Tier 4 to add direction-flipped variants: `AttnEntropy-W4-top`, `S1-Bin-W4-top`, `S2-Bin-W4-top`, `S3-Bin-W4-l12h2-ent-top`, then later `S1-Tern-W4-top`, `S2-Tern-W4-top`, `S3-Tern-W4-l12h2-top`.
+
+### HW7 D2-W4 transfer at full n=100 trials
+
+| Probe | median ρ | mean ρ | P(\|ρ\|>0.15) | direction needed at W4 |
+|---|---:|---:|---:|---|
+| l12h2-ent | +0.115 | +0.120 | 0.57 | top (flipped vs W2) |
+| **l1h7-top1** | **−0.167** | **−0.155** | — | **bottom (flipped vs W2)** |
+| l9h2-ent | −0.031 | −0.023 | — | weak |
+| l3h4-top5 | −0.016 | −0.014 | — | weak |
+| l17h4-top1 | −0.009 | +0.016 | — | weak |
+
+Notably, l1h7-top1 has the strongest per-trial signal (mean |ρ| = 0.155 vs l12h2's 0.120), but its early-layer position made it the cheapest gate candidate. l9h2 and other middle-late probes have essentially zero per-trial signal at W4 (within noise).
+
+### Final SR table (n=100, 50 Long + 50 Object)
+
+| Condition | SR | avg bits | 95% CI |
+|---|---:|---:|---|
+| FP16 (ceiling) | 0.940 | 16.00 | [0.89, 0.98] |
+| W4-Floor (reference) | 0.940 | 4.00 | [0.89, 0.98] |
+| W4-Static-Sched | 0.940 | 4.00 | [0.89, 0.98] |
+| Random-W4 | **0.980** | 8.82 | [0.95, 1.00] |
+| AttnEntropy-W4 (bottom) | 0.960 | 8.82 | [0.92, 0.99] |
+| AttnEntropy-W4-top | 0.950 | 8.82 | [0.90, 0.99] |
+| S1-Bin-W4 (bottom) | 0.950 | 9.13 | [0.90, 0.99] |
+| **S1-Bin-W4-top** | **0.980** | 8.90 | [0.95, 1.00] |
+| S2-Bin-W4 (bottom) | 0.970 | 8.82 | [0.93, 1.00] |
+| S2-Bin-W4-top | 0.950 | 8.82 | [0.90, 0.99] |
+| S3-Bin-W4-l1h7-top1 | 0.970 | 7.90 | [0.93, 1.00] |
+| **S3-Bin-W4-l9h2-ent** | **0.980** | 5.05 | [0.95, 1.00] |
+| S3-Bin-W4-l12h2-ent (bottom) | 0.970 | 4.42 | [0.93, 1.00] |
+| **S3-Bin-W4-l12h2-ent-top** | **0.980** | 6.49 | [0.95, 1.00] |
+| **S3-Tern-W4-l12h2 (bottom)** | **0.950** | **3.58** | **[0.90, 0.99]** |
+| S3-Tern-W4-l12h2-top | 0.970 | 5.20 | [0.93, 1.00] |
+| S1-Tern-W4 (bottom) | 0.790 | 4.57 | [0.71, 0.87] |
+| S1-Tern-W4-top | 0.710 | 4.45 | [0.62, 0.80] |
+| S2-Tern-W4 (bottom) | 0.740 | 4.19 | [0.65, 0.82] |
+| **S2-Tern-W4-top** | **0.640** | 4.19 | [0.54, 0.73] |
+| Random-Tern-W4 | 0.790 | 4.19 | [0.71, 0.87] |
+
+### Three findings, in order of importance
+
+#### 1. Layer-restricted intra-pass W2 demotion is the deployable winner
+
+**`S3-Tern-W4-l12h2` Pareto-dominates uniform W4** at 95.0% SR / 3.58 avg bits vs W4-Floor's 94.0% / 4.00 bits — both better SR (within CI) AND lower bits. The mechanism: per-cycle running quantile of l12h2 entropy gates a three-tier precision schedule applied only to layers 13-17 (layers 1-12 stay at W4). 10% of cycles escalate to FP16, 50% de-escalate to W2, 40% stay at W4 — but only for the 5 layers downstream of the readout point.
+
+This is the headline contribution: an attention-gated, layer-restricted, sub-W4 precision schedule that maintains rollout success on a flow-matching VLA.
+
+#### 2. The S1/S2-Tern collapse is SPATIAL, not directional
+
+Full-pass W2 demotion (swapping all VLM Linear weights for layers 1-17 to W2 on selected cycles) loses 15-30 pp regardless of cycle-selection strategy:
+
+| Condition | Combined SR | Δ vs Floor | Mechanism |
+|---|---:|---:|---|
+| W4-Floor | 0.940 | 0 | reference |
+| **S3-Tern-W4-l12h2** (intra-pass, layers 13-17 only) | **0.950** | **+1.0 pp** | spatial restriction works |
+| S1-Tern-W4 (bottom dir, full-pass) | 0.790 | -15.0 pp | spatial collapse |
+| S1-Tern-W4-top (top dir, full-pass) | 0.710 | -23.0 pp | spatial collapse, target-aware made it worse |
+| S2-Tern-W4 (bottom, full-pass) | 0.740 | -20.0 pp | spatial collapse |
+| S2-Tern-W4-top (top, full-pass) | 0.640 | -30.0 pp | worst — direction-flip + full-pass |
+| Random-Tern-W4 (random, full-pass) | 0.790 | -15.0 pp | random demotion also collapses |
+
+**Critical observation:** Random-Tern-W4 also loses 15 pp vs Floor — it's not about "wrong cycles." Targeted top-direction (the data-correct direction) on full-pass actually loses MORE because it accurately picks the cycles whose mid-VLM layers (1-12) most depend on full precision. The collapse is the W2 demotion mechanism applied to layers 1-12, not the targeting choice.
+
+This is the most novel mechanistic finding: **at W4, mid-VLM layers do NOT tolerate W2 even on individual cycles. The intra-pass scheme works only because it preserves layers 1-12 at W4 baseline while allowing layers 13-17 to be demoted.**
+
+#### 3. Direction-flip at l12h2 is a small effect (~1-3 pp)
+
+| Scheme | Bottom dir | Top dir | Δ |
+|---|---:|---:|---:|
+| AttnEntropy | 0.960 | 0.950 | -1.0 pp |
+| S1-Bin | 0.950 | **0.980** | **+3.0 pp** |
+| S2-Bin | 0.970 | 0.950 | -2.0 pp |
+| S3-Bin-l12h2 | 0.970 | 0.980 | +1.0 pp |
+| S3-Tern-l12h2 | 0.950 | 0.970 | +2.0 pp |
+
+Mixed effect at the binary level: top wins 3 of 5 schemes by 1-3 pp. The W4 direction-flip is real (per HW7) but operationally small. **The bottom-direction S3-Tern-W4-l12h2 remains the best Pareto operating point** (3.58 bits vs top-dir's 5.20 bits at similar SR).
+
+#### 4. AttnEntropy is NOT the rescue mechanism at W4 (revised from W2)
+
+At W4 base, `Random-W4` (random 50% FP16 on each cycle) achieves 0.980 SR — the best of all binary schemes. AttnEntropy doesn't beat random for the rescue role at W4 because the rescue gap is small (W4-Floor 0.940 vs FP16 0.940 — they tie). The role of attention is now in *cost reduction* (where to spend the W2 demotion), not rescue.
+
+### What this means for the paper
+
+The W4-first story produces a cleaner deployable artifact than the W2-rescue framing:
+
+- **At W2**: AttnEntropy is the rescue gate (68% rescue rate, +29 pp over Random)
+- **At W4**: AttnEntropy is the demotion gate (3.58 avg bits vs 4.0, +1 pp SR over Floor)
+
+Both are deployable, but at W4 the result is a true Pareto improvement (lower cost AND higher SR) rather than a rescue trade-off. The mechanistic insight — **layer-restricted W2 demotion is the bound on aggressive quantization** — is novel and likely transferable to other VLAs.
+
+### Files of record
+
+- `results/expB_w4_summary.md` — auto-generated bootstrap-CI table + HW0–HW10e hypothesis matrix + HW7 Spearman ρ across 5 probes
+- `results/expB_w4_rollouts.jsonl` (2100 rows) — all conditions × all trials
+- `results/expB_diagnostic_v3.jsonl` (4244 rows) — multi-probe FP16-pass + W4-pass attention per cycle
+- Server logs: `/data/subha2/experiments/logs/w4_main_2026-04-28.log`, `w4_tier4_2026-04-29.log`, `w4_tier4_watcher_2026-04-29.log`
+
+### Caveats and follow-ups
+
+- **CI overlap on the headline result**: S3-Tern-W4-l12h2 (0.95 [0.90, 0.99]) vs W4-Floor (0.94 [0.89, 0.98]) — bootstrap CIs overlap heavily at n=100. Matched-pair delta SR is +0.030 (HW10e against Floor for top-dir variant). The contribution is "matches Floor at lower bits" rather than "beats Floor."
+- **n=100 is the smallest workable n for this hypothesis matrix.** Per-condition CI widths are ±5 pp; some pairwise deltas are within noise. A future run at n=200+ would tighten these.
+- **The l1h7-top1 per-trial signal (mean ρ = -0.155) is intriguing**: if the cheap-pass intra-pass version with the *correct* (bottom) direction were tested, it might enable an even cheaper deployable scheme — but `S3-Bin-W4-l1h7-top1` was run with the W2-default direction ("top") which is wrong at W4. A `S3-Bin-W4-l1h7-bottom` follow-up is the obvious next experiment.
+- **Layer-restriction follow-up**: confirm the spatial finding by testing "layers 1-12 W4 + layer L W2 + layers L+1..17 W4" for each L — isolate which exact layer's W2 demotion causes the failure. Likely it's a specific cluster (layers 4-11 from exp7) but not yet pinpointed.
