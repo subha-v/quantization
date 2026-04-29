@@ -106,9 +106,9 @@ echo "--- Downloading LIBERO-PRO bundles from HuggingFace $HF_REPO ---"
 # The dataset is small (~hundreds of MB) so a full snapshot is simplest;
 # it's idempotent (skips already-downloaded files).
 cd "$OPENPI_DIR"
-uv pip install --quiet 'huggingface_hub>=0.20'
+"$OPENPI_DIR/.venv/bin/pip" install --quiet 'huggingface_hub>=0.20'
 
-uv run python -c "
+"$OPENPI_DIR/.venv/bin/python" -c "
 import os, shutil, sys
 from pathlib import Path
 from huggingface_hub import snapshot_download
@@ -203,7 +203,7 @@ echo ""
 echo "--- Verifying libero_*_temp suite registration ---"
 cd "$OPENPI_DIR"
 export PYTHONPATH="${PYTHONPATH:-}:$LIBERO_DIR"
-uv run python -c "
+"$OPENPI_DIR/.venv/bin/python" -c "
 from libero.libero import benchmark
 bd = benchmark.get_benchmark_dict()
 suites = sorted(bd.keys())
@@ -221,6 +221,6 @@ echo "=== LIBERO-PRO setup done ==="
 echo ""
 echo "Next:"
 echo "  CUDA_VISIBLE_DEVICES=<gpu> MUJOCO_GL=egl \\"
-echo "      uv run python \$EXPERIMENT_DIR/rollout.py \\"
+echo "      $OPENPI_DIR/.venv/bin/python \$EXPERIMENT_DIR/rollout.py \\"
 echo "          --single-rollout --suite Object --task-id 20 --seed 0 \\"
 echo "          --pro-config 'Object:x:0.2'"
