@@ -41,6 +41,8 @@ RESULTS_DIR = Path(utils.RESULTS_DIR)
 PROBE_KEYS = ("l1h7-top1", "l9h2-ent", "l12h2-ent", "l3h4-top5", "l17h4-top1")
 WINDOWS = (5, 10, 15)
 STATS = ("mean", "std", "max", "min", "slope")
+CHUNK_OVERLAP = 5   # pi0.5 LIBERO replan_steps=5 → 10-action chunk, 5 executed,
+                    # consecutive chunks overlap on the last 5 / first 5 actions.
 
 
 def _stats_over_window(values: list, K: int) -> dict:
@@ -63,12 +65,68 @@ def _stats_over_window(values: list, K: int) -> dict:
     return out
 
 
-def build_features_for_trial(diag_rows: list) -> dict:
+def chunk_variance(chunk: np.ndarray) -> float:
+    """Signal B: mean of per-DoF variance within a single 10x7 action chunk.
+    High variance = the model is unsure how the next 10 actions evolve."""
+    if chunk.ndim != 2 or chunk.shape[0] < 2:
+        return 0.0
+    return float(chunk.var(axis=0).mean())
+
+
+def chunk_sign_flips(chunk: np.ndarray) -> float:
+    """Signal C: fraction of consecutive (timestep, DoF) pairs where sign flips.
+    High rate = direction instability. Normalized to [0, 1]."""
+    if chunk.ndim != 2 or chunk.shape[0] < 2:
+        return 0.0
+    s = np.sign(chunk)
+    flips = int((s[1:] != s[:-1]).sum())
+    total = (chunk.shape[0] - 1) * chunk.shape[1]
+    return flips / max(1, total)
+
+
+def inter_chunk_discrepancy(chunk_t: np.ndarray, chunk_t1: np.ndarray,
+                            overlap: int = CHUNK_OVERLAP) -> float:
+    """Signal D: L2 distance between the overlap region of two consecutive
+    chunks. chunk_t[-overlap:] should match chunk_{t+1}[:overlap] if the model
+    is consistent across cycles. Normalized by sqrt(overlap * DoF) so it's a
+    per-element RMS magnitude comparable across configs."""
+    if chunk_t.ndim != 2 or chunk_t1.ndim != 2:
+        return 0.0
+    if chunk_t.shape[0] < overlap or chunk_t1.shape[0] < overlap:
+        return 0.0
+    diff = chunk_t[-overlap:] - chunk_t1[:overlap]
+    return float(np.sqrt((diff ** 2).mean()))
+
+
+def per_cycle_chunk_signals(chunks_for_trial: list) -> dict:
+    """For one trial's per-cycle chunk records (sorted by cycle_idx), compute
+    Signal B/C per cycle and Signal D per consecutive-cycle pair.
+    Returns three lists of per-cycle / per-pair scalars."""
+    chunks_for_trial = sorted(chunks_for_trial, key=lambda r: r.get("cycle_idx", 0))
+    arrs = []
+    for r in chunks_for_trial:
+        c = np.asarray(r.get("chunk", []), dtype=np.float32)
+        arrs.append(c)
+    sig_b = [chunk_variance(c) for c in arrs]
+    sig_c = [chunk_sign_flips(c) for c in arrs]
+    sig_d = [
+        inter_chunk_discrepancy(arrs[i], arrs[i + 1])
+        for i in range(len(arrs) - 1)
+    ]
+    return {"B_var": sig_b, "C_signflip": sig_c, "D_interchunk": sig_d}
+
+
+def build_features_for_trial(diag_rows: list, chunk_rows: list = None) -> dict:
     """Build a feature dict for one trial from its per-cycle V3 diagnostic
     records. Only deployable signals (W4-pass attention + sis); FP16-pass
     probes are NOT used as features (not available at runtime).
 
     Also computes oracle features from `mse_fp_w4` for ceiling comparison.
+
+    If `chunk_rows` is provided, additionally computes Phase B chunk-derived
+    signals (B = chunk variance, C = within-chunk sign-flip rate, D = inter-
+    chunk discrepancy). These are PURE-W4 signals (no FP16 dependency at
+    runtime) so they're fair-game deployable features.
     """
     diag_rows = sorted(diag_rows, key=lambda r: r.get("cycle_idx", 0))
 
@@ -105,14 +163,24 @@ def build_features_for_trial(diag_rows: list) -> dict:
                 feats[f"oracle_K{K}__{metric}__{s}"] = stats[s]
 
     feats["n_cycles_logged"] = len(diag_rows)
+
+    # Phase B chunk signals (B=variance, C=sign-flip, D=inter-chunk discrepancy)
+    if chunk_rows:
+        chunk_signals = per_cycle_chunk_signals(chunk_rows)
+        for K in WINDOWS:
+            for sig_name, sig_series in chunk_signals.items():
+                stats = _stats_over_window(sig_series, K)
+                for s in STATS:
+                    feats[f"chunk_K{K}__{sig_name}__{s}"] = stats[s]
+
     return feats
 
 
 # ---------------------------------------------------------------------------
 # Data loading
 # ---------------------------------------------------------------------------
-def load_data(diag_path: Path, rollouts_path: Path):
-    """Load and join V3 diagnostic + per-condition rollouts.
+def load_data(diag_path: Path, rollouts_path: Path, chunks_path: Path = None):
+    """Load and join V3 diagnostic + per-condition rollouts (and chunks if path given).
 
     Returns:
       trials: list of dicts, one per (suite, task_id, seed, episode_idx) trial,
@@ -131,6 +199,20 @@ def load_data(diag_path: Path, rollouts_path: Path):
         key = (r["suite"], r["task_id"], r["seed"], r["episode_idx"])
         diag_by_trial[key].append(r)
 
+    chunks_by_trial = defaultdict(list)
+    if chunks_path is not None and chunks_path.exists():
+        for line in chunks_path.read_text().splitlines():
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            key = (r["suite"], r["task_id"], r["seed"], r["episode_idx"])
+            chunks_by_trial[key].append(r)
+        utils.log(f"[trialgate] loaded chunk data for {len(chunks_by_trial)} trials "
+                  f"from {chunks_path.name}")
+    elif chunks_path is not None:
+        utils.log(f"[trialgate] WARNING: chunks path {chunks_path} not found; "
+                  f"chunk features will be absent")
+
     outcomes_by_trial = defaultdict(dict)
     for line in rollouts_path.read_text().splitlines():
         if not line.strip():
@@ -145,7 +227,8 @@ def load_data(diag_path: Path, rollouts_path: Path):
         outs = outcomes_by_trial.get(key, {})
         if not all(c in outs for c in REQUIRED_CONDS):
             continue
-        feats = build_features_for_trial(diag_by_trial[key])
+        chunk_rows = chunks_by_trial.get(key) if chunks_by_trial else None
+        feats = build_features_for_trial(diag_by_trial[key], chunk_rows=chunk_rows)
         trials.append({
             "trial_key": list(key),
             "features": feats,
@@ -299,6 +382,11 @@ def main():
                         "expB_w4__<tag>_rollouts.jsonl")
     p.add_argument("--results-dir", default=str(RESULTS_DIR),
                    help="overrides results dir if reading/writing elsewhere")
+    p.add_argument("--chunks-tag", default=None,
+                   help="suffix for chunk JSONL (expD_chunks__<tag>.jsonl). "
+                        "Defaults to --data-tag if a matching file exists. "
+                        "When set, Phase B chunk-derived signals (B/C/D) are "
+                        "added as a separate feature set in the comparison.")
     args = p.parse_args()
 
     utils.setup_logging()
@@ -308,23 +396,43 @@ def main():
     out_features = rdir / f"expD_trialgate_features__{args.data_tag}.jsonl"
     out_summary = rdir / f"expD_trialgate_summary__{args.data_tag}.md"
 
-    trials = load_data(diag_path, rollouts_path)
+    chunks_tag = args.chunks_tag or args.data_tag
+    chunks_path = rdir / f"expD_chunks__{chunks_tag}.jsonl"
+    if not chunks_path.exists():
+        chunks_path = None
 
-    # Build feature matrix. Two flavors: deployable (W4-pass + sis only) and
-    # oracle (also includes mse_fp_w4 features as a ceiling reference).
+    trials = load_data(diag_path, rollouts_path, chunks_path=chunks_path)
+
+    # Build feature matrix. Four flavors:
+    #   - attn_only      : W4-pass attention probes + SIS (Phase A baseline)
+    #   - chunks_only    : Phase B B/C/D signals only (Phase B core)
+    #   - combined       : attn_only + chunks_only (Phase A+B union)
+    #   - oracle         : mse_fp_w4 features (ceiling reference, not deployable)
     feature_names = sorted(trials[0]["features"].keys())
-    deployable_feats = [f for f in feature_names if not f.startswith("oracle_")
-                        and f != "n_cycles_logged"]
+    attn_feats = [f for f in feature_names
+                  if not f.startswith("oracle_")
+                  and not f.startswith("chunk_")
+                  and f != "n_cycles_logged"]
+    chunk_feats = [f for f in feature_names if f.startswith("chunk_")]
     oracle_feats = [f for f in feature_names if f.startswith("oracle_")]
+    combined_feats = attn_feats + chunk_feats
 
-    X_dep = np.array([[t["features"][f] for f in deployable_feats] for t in trials])
+    X_attn = np.array([[t["features"][f] for f in attn_feats] for t in trials])
+    X_chunks = (np.array([[t["features"][f] for f in chunk_feats] for t in trials])
+                if chunk_feats else np.empty((len(trials), 0)))
+    X_combined = (np.array([[t["features"][f] for f in combined_feats] for t in trials])
+                  if chunk_feats else X_attn)
     X_oracle = np.array([[t["features"][f] for f in oracle_feats] for t in trials])
     y_w4_fail = np.array([t["y_w4_fail"] for t in trials])
     y_rescuable = np.array([t["y_rescuable"] for t in trials])
 
-    utils.log(f"[trialgate] X_deployable shape: {X_dep.shape}, "
-              f"y_w4_fail pos: {int(y_w4_fail.sum())}/{len(y_w4_fail)}, "
-              f"y_rescuable pos: {int(y_rescuable.sum())}/{len(y_rescuable)}")
+    have_chunks = X_chunks.shape[1] > 0
+    utils.log(
+        f"[trialgate] feature matrices: attn={X_attn.shape} "
+        f"chunks={X_chunks.shape} combined={X_combined.shape} oracle={X_oracle.shape} | "
+        f"y_w4_fail pos: {int(y_w4_fail.sum())}/{len(y_w4_fail)}, "
+        f"y_rescuable pos: {int(y_rescuable.sum())}/{len(y_rescuable)}"
+    )
 
     # Persist features for inspection
     with open(out_features, "w") as fh:
@@ -340,8 +448,13 @@ def main():
 
     # ---- LOOCV detectors ----
     detectors = {}
+    feature_sets = [("attn", X_attn), ("oracle", X_oracle)]
+    if have_chunks:
+        feature_sets.extend([("chunks", X_chunks), ("combined", X_combined)])
     for label_name, y in [("y_w4_fail", y_w4_fail), ("y_rescuable", y_rescuable)]:
-        for X_name, X in [("deployable", X_dep), ("oracle", X_oracle)]:
+        for X_name, X in feature_sets:
+            if X.shape[1] == 0:
+                continue
             utils.log(f"[trialgate] LOOCV {label_name} | {X_name} | X.shape={X.shape}")
             y_proba, _ = loocv_predict(X, y)
             auc, lo, hi = auc_with_bootstrap_ci(y, y_proba)
@@ -355,8 +468,6 @@ def main():
     # ---- Simulated downstream SR for each detector + threshold ----
     ALPHAS = (0.05, 0.10, 0.20)
     sim_rows = []
-    headline_dep = detectors[("y_w4_fail", "deployable")]
-    headline_resc = detectors[("y_rescuable", "deployable")]
 
     base_outcomes = {
         "FP16":            np.array([t["outcomes"]["FP16"] for t in trials], dtype=int),
@@ -366,26 +477,30 @@ def main():
         "S3-Tern-W4-l12h2":np.array([t["outcomes"]["S3-Tern-W4-l12h2"] for t in trials], dtype=int),
     }
 
+    # Iterate over every (label, deployable feature set) pair we've trained.
+    sim_feature_sets = ["attn"] + (["chunks", "combined"] if have_chunks else [])
     for label_name in ("y_w4_fail", "y_rescuable"):
-        det = detectors[(label_name, "deployable")]
-        y_proba = det["y_proba"]
-        for alpha in ALPHAS:
-            thr = conformal_threshold(y_w4_fail, y_proba, alpha)
-            fire_mask = y_proba > thr
-            for rescue_cond in ("AttnEntropy-W4", "S3-Tern-W4-l12h2"):
-                sr, nfire, _ = simulate_gated_sr(trials, fire_mask, "W4-Floor", rescue_cond)
-                sim_rows.append({
-                    "label": label_name, "alpha": alpha, "threshold": thr,
-                    "n_fired": int(nfire),
-                    "rescue_cond": rescue_cond, "gated_sr": sr,
-                })
+        for X_name in sim_feature_sets:
+            if (label_name, X_name) not in detectors:
+                continue
+            det = detectors[(label_name, X_name)]
+            y_proba = det["y_proba"]
+            for alpha in ALPHAS:
+                thr = conformal_threshold(y_w4_fail, y_proba, alpha)
+                fire_mask = y_proba > thr
+                for rescue_cond in ("AttnEntropy-W4", "S3-Tern-W4-l12h2"):
+                    sr, nfire, _ = simulate_gated_sr(trials, fire_mask, "W4-Floor", rescue_cond)
+                    sim_rows.append({
+                        "label": label_name, "features": X_name, "alpha": alpha,
+                        "threshold": thr, "n_fired": int(nfire),
+                        "rescue_cond": rescue_cond, "gated_sr": sr,
+                    })
 
     # ---- Per-bucket breakdown of best gated detector ----
-    # "Best" = the (label, alpha) that maximizes gated AttnEntropy-W4 SR.
+    # "Best" = the (label, features, alpha) that maximizes gated AttnEntropy-W4 SR.
     best = max([r for r in sim_rows if r["rescue_cond"] == "AttnEntropy-W4"],
                key=lambda r: r["gated_sr"])
-    label = best["label"]; alpha = best["alpha"]
-    det = detectors[(label, "deployable")]
+    det = detectors[(best["label"], best["features"])]
     fire_mask = det["y_proba"] > best["threshold"]
 
     buckets = {"clean": [], "rescuable": [], "w4_better": [], "unrescuable": []}
@@ -443,13 +558,22 @@ def main():
     lines.append(f"_n trials = {len(trials)}_\n")
 
     lines.append("## Stage-1 detector AUC (LOOCV ridge LR, 95% bootstrap CI)\n")
-    lines.append("| Target | Features | AUC | 95% CI | Brier |")
-    lines.append("|---|---|---:|---|---:|")
-    for label in ("y_w4_fail", "y_rescuable"):
-        for fname in ("deployable", "oracle"):
-            d = detectors[(label, fname)]
+    lines.append("| Target | Features | n_feats | AUC | 95% CI | Brier |")
+    lines.append("|---|---|---:|---:|---|---:|")
+    feat_order = ["attn"] + (["chunks", "combined"] if have_chunks else []) + ["oracle"]
+    n_feats_by = {
+        "attn": X_attn.shape[1],
+        "chunks": X_chunks.shape[1],
+        "combined": X_combined.shape[1],
+        "oracle": X_oracle.shape[1],
+    }
+    for lbl in ("y_w4_fail", "y_rescuable"):
+        for fname in feat_order:
+            if (lbl, fname) not in detectors:
+                continue
+            d = detectors[(lbl, fname)]
             lines.append(
-                f"| `{label}` | {fname} | {d['auc']:.3f} | "
+                f"| `{lbl}` | {fname} | {n_feats_by[fname]} | {d['auc']:.3f} | "
                 f"[{d['auc_lo']:.3f}, {d['auc_hi']:.3f}] | {d['brier']:.3f} |"
             )
 
@@ -460,19 +584,19 @@ def main():
         v = base_outcomes[cond]
         lines.append(f"| {cond} | {len(v)} | {v.mean():.3f} |")
 
-    lines.append("\n## Simulated gated SR (deployable detector)\n")
-    lines.append("| Stage-1 target | α (FAR) | thr | n_fired | rescue cond | gated SR |")
-    lines.append("|---|---:|---:|---:|---|---:|")
+    lines.append("\n## Simulated gated SR (per detector)\n")
+    lines.append("| Stage-1 target | Features | α (FAR) | thr | n_fired | rescue cond | gated SR |")
+    lines.append("|---|---|---:|---:|---:|---|---:|")
     for r in sim_rows:
         lines.append(
-            f"| `{r['label']}` | {r['alpha']:.2f} | {r['threshold']:.3f} | "
+            f"| `{r['label']}` | {r['features']} | {r['alpha']:.2f} | {r['threshold']:.3f} | "
             f"{r['n_fired']}/{len(trials)} | {r['rescue_cond']} | {r['gated_sr']:.3f} |"
         )
 
     lines.append(
         f"\n## Per-bucket breakdown of best gated detector "
-        f"(target=`{best['label']}`, α={best['alpha']:.2f}, "
-        f"thr={best['threshold']:.3f})\n"
+        f"(target=`{best['label']}`, features=`{best['features']}`, "
+        f"α={best['alpha']:.2f}, thr={best['threshold']:.3f})\n"
     )
     lines.append("| Bucket | n | n_fired | fire rate | gated SR |")
     lines.append("|---|---:|---:|---:|---:|")
@@ -492,15 +616,28 @@ def main():
         )
 
     lines.append("\n## Read\n")
-    if headline_resc["auc"] > 0.65 and best["gated_sr"] > base_outcomes["AttnEntropy-W4"].mean():
-        lines.append("**Phase A directional pass.** Stage-1 carries detectable signal "
-                     "(AUC > 0.65 for at least one target) AND gated AttnEntropy-W4 "
-                     "beats ungated AttnEntropy-W4 in aggregate SR. "
-                     "Ready to rerun on the n=200 P1 data once that finishes.")
+    # Use the best deployable detector for the headline read.
+    best_resc_auc = max(
+        [detectors[(t, f)]["auc"]
+         for t in ("y_rescuable",) for f in feat_order
+         if (t, f) in detectors and f != "oracle"],
+        default=0.0,
+    )
+    aggregate_attn_sr = float(base_outcomes["AttnEntropy-W4"].mean())
+    if best_resc_auc > 0.65 and best["gated_sr"] > aggregate_attn_sr:
+        lines.append(
+            f"**Trial-gate directional pass.** Best deployable detector hits AUC "
+            f"{best_resc_auc:.2f} for `y_rescuable` AND simulated gated AttnEntropy-W4 "
+            f"({best['gated_sr']:.2f}) beats ungated AttnEntropy-W4 ({aggregate_attn_sr:.2f}). "
+            f"Ready to rerun on the n=200 P1 data once that finishes."
+        )
     else:
-        lines.append("**Phase A weak signal.** Stage-1 AUC is too low or the simulated "
-                     "gated SR fails to beat ungated AttnEntropy-W4. Consider Phase B "
-                     "(action-chunk signals B/C/D) before scaling to n=200.")
+        lines.append(
+            f"**Trial-gate weak signal.** Best deployable AUC for `y_rescuable` = "
+            f"{best_resc_auc:.2f}; best gated AttnEntropy-W4 SR = {best['gated_sr']:.2f} vs "
+            f"ungated {aggregate_attn_sr:.2f}. Stage-1 not strong enough to rescue at this "
+            f"sample size. Consider broader feature space, larger n, or new signal sources."
+        )
 
     out_summary.write_text("\n".join(lines) + "\n")
     utils.log(f"[trialgate] wrote {out_summary}")
