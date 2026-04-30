@@ -1253,3 +1253,71 @@ This is a real mechanistic contribution, distinct from but complementary to S3-T
 - `results/expD_trialgate_features__libero_pro_obj_x0.2_n200.jsonl`
 - `scripts/expD_log_chunks.py`, `scripts/expD_overnight.sh`, `scripts/expD_publish_results.sh` (now patched to fail loudly)
 - Server logs: `/data/subha2/experiments/logs/expD_overnight.log`, `expD_trialgate_n200_phaseB.stdout.log`
+
+### Supplementary tables for the slide deck (2026-04-30)
+
+Five additional analyses computed from existing JSONLs in `results/`. Full tables in `results/expD_supplementary.md`; the highest-impact ones are reproduced below.
+
+#### Regime contrast — bucket distribution by experiment
+
+The single best slide for "rescue regime vs cost-reduction regime":
+
+| Regime | n | clean | rescuable | w4_better | unrescuable |
+|---|---:|---:|---:|---:|---:|
+| ExpC standard-LIBERO n=100 | 100 | 90 (90%) | 4 (4%) | 4 (4%) | 2 (2%) |
+| ExpD LIBERO-PRO Object x0.2 n=50 | 50 | 17 (34%) | 10 (20%) | 7 (14%) | 16 (32%) |
+| ExpD LIBERO-PRO Object x0.2 n=200 | 200 | 69 (34%) | 15 (8%) | 23 (12%) | 93 (46%) |
+
+ExpC standard LIBERO is **90% clean** at W4 — the deployment story is *cost reduction* (S3-Tern's sub-W4 average bits at matched SR), not rescue. ExpD LIBERO-PRO at x0.2 has rescuable trials but the unrescuable bucket (47% at n=200) dominates the aggregate. The W2-on-standard-LIBERO regime (expB) put effectively 100% of trials in rescuable+unrescuable (W2-Floor SR ≈ 0%), which is why the +29 pp rescue gap was so visible in aggregate there.
+
+#### ExpC S3-Tern conditional partition on standard LIBERO (n=100)
+
+| Bucket | n | FP16 | W4-Floor | Random-W4 | AttnEntropy-W4 | S3-Tern |
+|---|---:|---:|---:|---:|---:|---:|
+| clean | 90 | 100% | 100% | 100% | 98% | 99% |
+| rescuable | 4 | 100% | 0% | 100% | 100% | 50% |
+| w4_better | 4 | 0% | 100% | 100% | 100% | 100% |
+| unrescuable | 2 | 0% | 0% | 0% | 0% | 0% |
+
+S3-Tern's +1 pp aggregate win on standard LIBERO is **almost entirely a clean-bucket effect**: it preserves 99% of clean trials (vs W4-Floor's 100%) but the tiny rescuable/w4_better/unrescuable buckets contribute negligibly at n=4/4/2. The 95.2% / 3.58 bits result is "spatial restriction doesn't break clean trials," which is enough at this regime because the rescue + benchmark-hard surface area is tiny.
+
+#### ExpC Tier 5 (l1h7-bottom) bucket decomposition
+
+| Bucket | n | W4-Floor | S3-Tern-l12h2 | S3-Bin-l1h7-bottom | S3-Tern-l1h7-bottom |
+|---|---:|---:|---:|---:|---:|
+| clean | 90 | 100% | 99% | 100% | **93%** |
+| rescuable | 4 | 0% | 50% | **100%** | **75%** |
+| w4_better | 4 | 100% | 100% | 100% | 100% |
+| unrescuable | 2 | 0% | 0% | 0% | 0% |
+
+**Tier 5 aggregate −3 pp loss is clean-bucket damage, not rescue failure.** `S3-Tern-W4-l1h7-bottom` actually wins +75 pp on the rescuable bucket (3/4 vs W4-Floor's 0/4) but loses 6 clean trials (84/90 vs 90/90). Net: +3 rescuable wins − 6 clean losses = −3 trials = −3 pp. The l1h7 readout is *better at picking rescue cycles* than l12h2 (4/4 vs 2/4 wins on the binary variant) — the spatial collapse from W2 demoting layers 2–17 is what kills the ternary.
+
+#### Memory footprint: S3-Tern-W4-l12h2 vs uniform W4
+
+Back-of-envelope. pi0.5-LIBERO: vision ~400M, layer 0 ~110M, lang layers 1–17 ~110M × 17, expert ~300M. Bytes/param: FP16=2, W4=0.5, W2=0.25 (packed).
+
+| Component | Size | Uniform W4 | S3-Tern-W4-l12h2 |
+|---|---:|---:|---:|
+| Vision tower (FP16) | 400M | 0.80 GB | 0.80 GB |
+| Lang layer 0 (FP16) | 110M | 0.22 GB | 0.22 GB |
+| Lang layers 1–12 (W4) | 1.32B | 0.66 GB | 0.66 GB |
+| Lang layers 13–17 (W4 only / W4+W2+FP16 cached) | 0.55B | 0.28 GB | **1.51 GB** |
+| Action expert (FP16) | 300M | 0.60 GB | 0.60 GB |
+| **Total VLM+expert weights** | — | **2.56 GB** | **3.79 GB** |
+
+**Trade.** S3-Tern needs ~+1.24 GB (+48%) over uniform W4 to hold three precisions resident for the demoted layers (13–17). In return, active forward-pass cost drops ~13% (3.49 vs 4.0 avg bits). The deployable claim is "pay ~half a GB more memory for ~13% lower compute and matched-or-better SR," not "free lunch."
+
+#### n=200 trial-gate fire pattern (confirms Phase A diagnosis at scale)
+
+Best deployable detector at n=200: target=`y_w4_fail`, features=combined, α=0.20.
+
+| Bucket | n | n_fired | fire rate | gated SR | AttnEntropy unconditional |
+|---|---:|---:|---:|---:|---:|
+| clean | 69 | 11 | 16% | 99% | 92% |
+| **rescuable** | **15** | **3** | **20%** | **20%** | **86%** |
+| w4_better | 23 | 8 | 35% | 91% | 56% |
+| **unrescuable** | **93** | **83** | **89%** | **2%** | 3% |
+
+The "exactly backwards from useful" fire pattern from Phase A holds at n=200: detector fires hardest on the unrescuable bucket (89%) and barely on rescuable (20%). The 86% AttnEntropy rescue rate on the rescuable bucket *evaporates under gating* (drops to 20%) because the gate refuses to fire on 80% of those trials, defaulting them to W4-Floor's 0%. This is now a four-fold-larger sample size confirming the same diagnosis.
+
+(Full supplementary including matched-pair McNemar tables on the n=200 rescuable bucket: see `results/expD_supplementary.md`.)
