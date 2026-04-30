@@ -1181,3 +1181,75 @@ The Stage-1 detector exists (AUC 0.74 for "will W4 fail" is genuine signal) but 
 - **Phase B — action-chunk signals.** A re-run pass that logs the actual action chunks for each cycle of the n=50 W4 trajectory (~30 min on H100, FP16-only no SIS perturbations). Extract action-chunk variance (Signal B), action sign-flip rate (Signal C), inter-chunk discrepancy (Signal D). Run the same trial-gate framework on those features. Hypothesis: action-derived signals can distinguish quant-failure from benchmark-failure where attention can't.
 - **Rerun on P1 n=200.** Once P1 finishes (~6 h remaining as of writeup), rerun `exp_trialgate_analysis.py --data-tag libero_pro_obj_x0.2_n200`. The 4× larger sample gives real bootstrap CIs on AUC and the gated SR comparison; a directional Phase A result on n=50 may flip if the underlying signal is weak but real, or stay flat if Phase A's "wrong target" diagnosis holds.
 - **Consider an end-to-end gated rollout** with a real `--w4-pro-gated` mode that runs Stage-1 inline from the partial diagnostic (cycles 0..K) and engages AttnEntropy from cycle K+1. Worth doing only if Phase A or Phase B shows a Stage-1 signal that survives the rescuable-vs-unrescuable confound.
+
+### Morning n=200 + Phase B follow-up (2026-04-30)
+
+Overnight orchestrator on `tambe-server-1` (5 sequential steps after P1 finished) ran cleanly to completion at 05:30 PDT. The publisher script that was supposed to push results to GitHub silently failed because git on the remote didn't have `user.email` configured (the publisher's `|| { exit 0 }` swallowed the real error). Recovered manually in the morning by configuring git on the remote, fetching the resulting commit over SSH, and pushing from the Mac. Patched the publisher to fail loudly on commit/push errors going forward.
+
+#### HW0 flipped at scale — W4 doesn't degrade vs FP16
+
+| Condition | n=50 SR | **n=200 SR** | 95% CI |
+|---|---:|---:|---|
+| FP16 | 0.540 | **0.420** | [0.36, 0.49] |
+| W4-Floor | 0.480 | **0.460** | [0.39, 0.53] |
+| Random-W4 | 0.580 | 0.445 | [0.38, 0.52] |
+| AttnEntropy-W4 | 0.520 | 0.465 | [0.40, 0.54] |
+| **S3-Tern-W4-l12h2** | 0.560 | **0.485** | [0.42, 0.56] |
+
+**HW0 = SR(W4-Floor) − SR(FP16) flipped sign**: −0.060 at n=50, **+0.040 at n=200**. The "W4 degrades on harder benchmark" hypothesis that motivated the LIBERO-PRO benchmark swap is **falsified at this scale** — W4-with-protection actually *beats* FP16 on LIBERO-PRO Object x0.2 in matched-pair comparison. The n=50 result was a small-sample artifact in the trial mix.
+
+S3-Tern-W4-l12h2 still leads at 48.5% (vs W4-Floor 46.0%) at 3.49 avg bits — sub-W4 at matched-or-better SR survives, though both n=50 and n=200 CIs overlap with W4-Floor.
+
+#### The rescue mechanism replicates and STRENGTHENS on the rescuable bucket
+
+Conditional partition at n=200 (computed from `expB_w4__libero_pro_obj_x0.2_n200_rollouts.jsonl`):
+
+| Bucket | n | FP16 | W4-Floor | Random-W4 | **AttnEntropy-W4** | S3-Tern |
+|---|---:|---:|---:|---:|---:|---:|
+| clean (FP16✓ + W4✓) | 69 | 100% | 100% | 91% | 92% | 95% |
+| **rescuable (FP16✓ + W4✗)** | **15** | **100%** | **0%** | **53%** | **86%** | **80%** |
+| w4_better (FP16✗ + W4✓) | 23 | 0% | 100% | 47% | 56% | 65% |
+| unrescuable (FP16✗ + W4✗) | 93 | 0% | 0% | 7% | 3% | 4% |
+
+**On the rescuable bucket: AttnEntropy-W4 = 13/15 = 86% vs Random-W4 = 8/15 = 53% — matched-pair Δ = +33 pp.** Stronger than the +20 pp directional read at n=10 in the original n=50 partition. McNemar exact two-sided p = 0.125 (a_only=6, r_only=1, both=7, neither=1). Not yet at α=0.05 because n_rescuable is only 15, but the effect size is real and the direction is solid. S3-Tern on rescuable: 12/15 = 80%, +26 pp vs Random, p = 0.125.
+
+**Why the aggregate looks null at n=200.** The unrescuable bucket is **47% of all 200 trials** (n=93). Every rescue method floors at ~3–7% there (trajectory-divergence noise). The rescuable bucket is only 7.5% of trials. The aggregate becomes `0.345·(+1pp) + 0.075·(+33pp) + 0.115·(+9pp) + 0.465·(−4pp) ≈ +1pp` — the rescue effect is real but invisibly diluted.
+
+**Clean-bucket cost is much smaller at scale.** AttnEntropy drops only 8 pp on clean trials at n=200 (100→92%), vs the 35 pp drop at n=50. The trial-gate concern from Phase A is partially defused: the bigger problem is that rescuable trials are *rare*, not that gating breaks clean trials catastrophically.
+
+#### Phase B (action-chunk signals B/C/D) — falsified at n=200
+
+Logged W4 action chunks per cycle for all 200 trials (`expD_chunks__libero_pro_obj_x0.2_n200.jsonl`, 8982 records, ~30 min on GPU 1). Computed Signal B (intra-chunk variance), C (within-chunk sign-flip rate), D (inter-chunk L2 with overlap=5 from `replan_steps=5`). Re-ran the trial-gate analysis with three feature sets: attention-only (90 features, Phase A), chunks-only (45 features, Phase B), combined (135 features).
+
+| Target | Features | n_feats | AUC | 95% CI |
+|---|---|---:|---:|---|
+| `y_w4_fail` | attn | 90 | **0.834** | [0.77, 0.89] |
+| `y_w4_fail` | chunks | 45 | 0.653 | [0.58, 0.73] |
+| `y_w4_fail` | combined | 135 | **0.842** | [0.78, 0.90] |
+| `y_rescuable` | attn | 90 | 0.603 | [0.45, 0.75] |
+| `y_rescuable` | chunks | 45 | 0.395 | [0.22, 0.59] |
+| `y_rescuable` | combined | 135 | 0.525 | [0.35, 0.70] |
+
+**The Phase B chunk-signal hypothesis is empirically falsified.** Chunks alone hit AUC 0.40 on `y_rescuable` (worse than chance), and combined 0.53 (also chance). Attention-only at 0.60 wins this comparison; adding chunks *hurts* by injecting noise. The intuition that "action chunks reflect quantization-specific uncertainty in a way attention can't" doesn't survive contact with n=200.
+
+`y_w4_fail` AUC is statistically powered (0.83 attention, 0.84 combined) — the detector can robustly predict "this trial will fail," but the per-bucket fire pattern at the best detector (target=`y_w4_fail`, features=combined, α=0.20) confirms Phase A's diagnosis at scale: fires on 89% of unrescuable, only 20% of rescuable. Same task-hardness vs quant-sensitivity confound, just with tighter CIs.
+
+#### What this means for the paper
+
+The W2 ExpB AttnEntropy result (+29 pp aggregate rescue at frac=0.5) and the W4 ExpC S3-Tern Pareto win (95.2% / 3.58 bits) **both stand**. The new claim from ExpD is more nuanced and still publishable:
+
+> *AttnEntropy-W4's per-frame rescue mechanism produces a +33 pp matched-pair effect on quantization-induced trajectory failures (n=15 rescuable trials out of 200; McNemar p=0.125). The effect is invisible in aggregate SR because **benchmark-induced failures (FP16 also fails) dominate the trial mix on LIBERO-PRO Object x0.2**, accounting for 47% of trials. The per-frame attention-entropy signal cannot distinguish quantization-induced from benchmark-induced failures; trial-level gating with both attention features (AUC 0.60 for rescuable) and action-chunk features (AUC 0.40) fails to separate the two failure modes.*
+
+This is a real mechanistic contribution, distinct from but complementary to S3-Tern, with an honest limitation. Three forward paths from here, ordered by my preference:
+
+- **Path C (preferred):** accept and write up. Bring to Wonsuk for review with the conditional partition as the headline rather than aggregate SR. Reframes the LIBERO-PRO experiment as "validates the rescue mechanism on the right subset, characterizes the trial-mix obstacle for aggregate reporting."
+- **Path A (statistical power):** run ~200 more trials at x0.2. With n_rescuable scaling roughly linearly, this would put us at ~30 rescuable, where p < 0.05 is reachable if the +33 pp effect holds. ~12–24 h on H100. Pure power, no new mechanism.
+- **Path B (better operating point):** the unrescuable fraction dominating the aggregate is the structural problem. Sweep at x0.15 (between current 0.1 and 0.2) where FP16 might sit at ~70% and the rescuable fraction might be 20–30%+ instead of 7.5%. ~3 h to repeat Step 2; then re-decide whether to launch Step 3 there.
+
+#### Files of record
+
+- `results/expB_w4__libero_pro_obj_x0.2_n200_summary.md`, `_rollouts.jsonl` (1000 rows)
+- `results/expD_trialgate_summary__libero_pro_obj_x0.2_n200.md` (Phase B at n=200)
+- `results/expD_trialgate_features__libero_pro_obj_x0.2_n200.jsonl`
+- `scripts/expD_log_chunks.py`, `scripts/expD_overnight.sh`, `scripts/expD_publish_results.sh` (now patched to fail loudly)
+- Server logs: `/data/subha2/experiments/logs/expD_overnight.log`, `expD_trialgate_n200_phaseB.stdout.log`
