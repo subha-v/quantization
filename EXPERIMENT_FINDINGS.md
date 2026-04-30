@@ -1029,3 +1029,93 @@ The two conditions cannot be jointly satisfied with the current quantization set
 1. **Layer-by-layer ternary sweep**: test L = 8, 10, 11, 13, 14, 15 to find the exact transition point where the spatial collapse begins. Currently jumps from "fails at L=1" to "works at L=12" — there's a continuous transition somewhere in between worth characterizing.
 2. **Conservative aggressive partitions at L=12**: `S3-Tern-W4-l12h2` with partitions (0.05, 0.25, 0.7) → ~3.0 avg bits, or (0, 0.4, 0.6) → no FP16 escalation at all (pure W2/W4 mix). The latter would test whether FP16 rescue is needed at L=12 or if the demotion side alone is sufficient.
 3. **Active expert quantization**: currently the action expert is FP16 throughout. A W4 action-expert would lower avg bits further; combined with S3-Tern-W4-l12h2 could push to ~2.5-3 effective bits.
+
+---
+
+## Experiment D — LIBERO-PRO at W4 (2026-04-29 → 30, in progress)
+
+**Why this exists.** ExpC's W4 conditions all tied at 94% SR on standard LIBERO. There's no rescue gap to close at W4 because pi0.5 doesn't degrade — the benchmark is saturated. Per Wonsuk + the LIBERO-PRO paper (arXiv:2510.03827, github.com/Zxy-MLlab/LIBERO-PRO), most VLAs memorize standard LIBERO. Wonsuk's question: "maybe 4-bit shows degradation as well for harder task?" Test by swapping the benchmark (not the model, not the quantization stack) into a regime where pi0.5 FP16 has actual headroom (~50–70% SR), so W4 has room to degrade and AttnEntropy has signal to detect.
+
+LIBERO-PRO ships static perturbed-init bundles per (suite, axis, magnitude). Only the Object suite has the configurable Figure-6 magnitudes (`libero_object_temp_x{0.1..0.5}` and `_y*`); other suites use a different YAML-driven engine, so all of ExpD is on Object.
+
+### Step 1 — integration smoke (2026-04-29)
+
+`scripts/setup_libero_pro.sh` clones LIBERO-PRO, overlays its `benchmark/__init__.py` + `libero_suite_task_map.py` to register `libero_<suite>_temp` task suites in the openpi LIBERO checkout, and downloads bundles from HuggingFace `zhouxueyang/LIBERO-Pro` (322 files; falls back to repo bundles if HF fails). `scripts/rollout.py` adds `--pro-config "Suite:axis:magnitude"` plus `set_libero_pro_config()` / `stage_libero_pro_files()` (fcntl-locked, sentinel-skipped, idempotent). When a Pro config is active for a suite, `make_libero_env()` routes to the `_temp` variant after staging the right bundle. Unflagged invocations are byte-identical.
+
+5-trial smoke at `--pro-config "Object:x:0.2"` ran cleanly: bundle staged, env constructed from `libero_object_temp`, MuJoCo rendered, policy generated actions for "pick up the alphabet soup and place it in the basket". One trial timed out — expected at this magnitude.
+
+### Step 2 — operating point sweep (2026-04-29)
+
+`scripts/find_operating_point.py` ran pi0.5 FP16 on Object × magnitudes {0.1, 0.2, 0.3} × 50 trials each (150 FP16 rollouts, 45 min on GPU 0).
+
+| Magnitude | FP16 SR | 95% CI |
+|---|---:|---|
+| x0.1 | 0.880 | [0.78, 0.96] |
+| x0.2 | 0.500 | [0.36, 0.64] |
+| x0.3 | 0.480 | [0.34, 0.62] |
+
+x0.1 saturated; x0.2 and x0.3 statistically tied near 50%. **Picked x0.2** as the operating point — pi0.5 sits near the published Figure-6 ~50% range, leaving W4 clear headroom both ways.
+
+### Step 3 — focused 5-condition expC subset at x0.2, n=50 (2026-04-30, complete)
+
+Re-used `scripts/expB_sis_validation.py --w4-pro --pro-config "Object:x:0.2" --frac 0.5 --ternary-partition "0.1,0.4,0.5" --out-tag libero_pro_obj_x0.2`. Same model, same quantization stack, same diagnostic V3 + intra-pass driver, just routed through the perturbed Object suite. 5 conditions × 50 trials = 250 rollouts, ~3.5 h on GPU 0.
+
+#### Aggregate SR — looks like a null
+
+| Condition | SR | 95% CI | avg bits |
+|---|---:|---|---:|
+| FP16 | 0.540 | [0.40, 0.68] | 16.0 |
+| W4-Floor | 0.480 | [0.34, 0.62] | 4.0 |
+| Random-W4 (50% FP16, random) | 0.580 | [0.44, 0.72] | 10.0 |
+| AttnEntropy-W4 (bottom-50% l12h2 entropy) | 0.520 | [0.38, 0.66] | 10.0 |
+| **S3-Tern-W4-l12h2** (intra-pass three-tier) | **0.560** | [0.42, 0.70] | **3.49** |
+
+Matched-pair deltas: HW0 = SR(W4-Floor) − SR(FP16) = −0.060 (W4 *does* degrade vs FP16, in the right direction); HW6 = SR(AttnEntropy-W4) − SR(Random-W4) = −0.060 (the rescue gate apparently underperforms random). At face value this looks like the standard-LIBERO null carries over: W4 barely degrades, AttnEntropy doesn't beat random.
+
+D2-W4 transfer at this regime: per-trial Spearman ρ(l12h2-ent W4-pass, ‖a_FP − a_W4‖²) median = +0.224, mean = +0.207, P(|ρ|>0.15) = 0.74 — *stronger* than the standard-LIBERO W4 transfer (~+0.115). The mechanistic signal is real but doesn't yet convert into rollout-level rescue.
+
+#### The conditional partition (P3) — the aggregate hides the signal
+
+Mentor critique: aggregate SR averages over trials whose outcomes have nothing to do with quantization. Of the 50 W4-Floor failures, how many would FP16 also fail? On those, no precision gate can rescue.
+
+Partitioned by (FP16, W4-Floor) outcome:
+
+| Bucket | n | FP16 | W4-Floor | Random-W4 | AttnEntropy-W4 | S3-Tern |
+|---|---:|---:|---:|---:|---:|---:|
+| FP16✓ + W4✓ (no rescue needed) | 17 | 100% | 100% | 88% | **65%** | 82% |
+| FP16✓ + W4✗ (**rescuable / quant-hard**) | **10** | **100%** | **0%** | **60%** | **80%** | **50%** |
+| FP16✗ + W4✓ (W4-better) | 7 | 0% | 100% | 71% | 57% | **86%** |
+| FP16✗ + W4✗ (**unrescuable / benchmark-hard**) | **16** | **0%** | **0%** | **19%** | **19%** | **19%** |
+
+Five findings:
+
+1. **62% of W4 failures (16/26) are benchmark-hard** — FP16 also fails. No precision gate can rescue these. They drag the AttnEntropy-W4 aggregate down because every override condition just inherits the unrescuable failure rate.
+
+2. **On the rescuable subset (n=10): AttnEntropy-W4 80% > Random-W4 60% — a +20 pp matched-pair gap** in the same direction as the W2 expB +29 pp result. n=10 is too small for significance (McNemar p ≈ 0.69), but the directional confirmation is exactly the predicted mechanism.
+
+3. **All three rescue conditions HURT in the clean bucket.** AttnEntropy-W4 loses 35 pp (drops from 100% → 65%); S3-Tern loses 18 pp; Random loses 12 pp. The cost is precision-switching itself perturbing the trajectory off-path on cycles that didn't need it. AttnEntropy suffers worst — the same gate that picks "high-sensitivity" rescue frames in rescuable trials misfires as "high-sensitivity disruption" in clean trials. **Implication: deployable rescue needs a gate that fires only when W4 is actually failing, not unconditionally on bottom-50%-by-entropy.**
+
+4. **The 19% floor on unrescuable trials is fundamental.** All three rescue conditions hit exactly 3/16. That's the random-perturbation success rate when both pure-precision schedules fail — mixed-precision schedules visit different states than pure-W4 or pure-FP16 trajectories. Every paper claim about "rescue rate" needs to subtract this floor.
+
+5. **S3-Tern's +8 pp over W4-Floor decomposes as (−3 clean, +5 rescuable, −1 W4-better, +3 unrescuable).** The +5 from real rescue is the largest piece — the W2-demotion gate is doing real work — but ~40% of the gain is trajectory-divergence luck on unrescuable trials. The honest framing is "majority-rescue, partly-luck" rather than pure Pareto improvement.
+
+#### In progress (launched 2026-04-30)
+
+Both running on tambe-server-1 in parallel:
+
+- **P1 — n=200 at x0.2 on GPU 0** (`expB_w4__libero_pro_obj_x0.2_n200_*`). Same 5 W4 conditions, four-fold trial budget. Target: bring rescuable-bucket n from 10 → ~40 so McNemar can resolve the +20 pp AttnEntropy vs Random gap. ETA ~7h total wall time. *Partial at n=37 trials*: AttnEntropy-W4 4/5 (80%), Random-W4 1/5 (20%) on rescuable subset — the +60 pp partial gap is even stronger than the n=10 read but n=5 is preliminary.
+- **P2 — n=100 at x0.4 on GPU 1** (`expB_w4__libero_pro_obj_x0.4_n100_*`). Same conditions, harder magnitude. Tests whether the conditional rescue replicates across difficulty. ETA ~3.5h. *Partial at n=35 trials*: bucket distribution is **7 clean / 1 rescuable / 2 W4-better / 25 unrescuable** — at x0.4 essentially every failure is benchmark-hard. Likely an "operating point too far past the FP16 cliff" finding; the rescue-question is unanswerable here because the rescuable-subset n is ~3 even at full n=100.
+
+#### What this experiment is testing, in one paragraph
+
+Standard LIBERO doesn't surface W4 degradation, so AttnEntropy-W4 has nothing to rescue. LIBERO-PRO's position perturbation creates a regime where pi0.5 FP16 sits at ~50% SR — a hard-but-not-collapsed benchmark. **The hypothesis Wonsuk asked us to test is: in this harder regime, does W4 degrade enough that AttnEntropy can rescue it?** The aggregate-SR n=50 read is ambiguous (W4 degrades 6 pp, AttnEntropy underperforms Random by 6 pp). The conditional partition reveals the real mechanism: most failures are benchmark-hard (no gate helps), but on the trials where W4 actually breaks AttnEntropy *can* rescue (80% vs Random's 60%). The n=200 follow-up is the statistical power test on that conditional gap. The x0.4 follow-up tests if the same mechanism replicates at a different magnitude.
+
+#### Files of record
+
+- `scripts/setup_libero_pro.sh`, `scripts/find_operating_point.py` — new
+- `scripts/rollout.py`, `scripts/expB_sis_validation.py` — extended with `--pro-config`, `--w4-pro`/`--w2-pro`, `--out-tag`, `--pro-n-per-suite`
+- `results/libero_pro_operating_point.md`, `.jsonl` — Step 2
+- `results/expB_w4__libero_pro_obj_x0.2_{rollouts,summary}.{jsonl,md}`, `expB_diagnostic_v3__libero_pro_obj_x0.2.jsonl` — Step 3 n=50 (complete)
+- `results/expB_w4__libero_pro_obj_x0.2_n200_*` — P1 (in progress)
+- `results/expB_w4__libero_pro_obj_x0.4_n100_*` — P2 (in progress)
+- Server logs: `/data/subha2/experiments/logs/expB_w4_pro_x0.2_n200.log`, `expB_w4_pro_x0.4_n100.log`
