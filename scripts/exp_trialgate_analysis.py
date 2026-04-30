@@ -471,7 +471,8 @@ def main():
 
     lines.append(
         f"\n## Per-bucket breakdown of best gated detector "
-        f"(target=`{label}`, α={alpha:.2f})\n"
+        f"(target=`{best['label']}`, α={best['alpha']:.2f}, "
+        f"thr={best['threshold']:.3f})\n"
     )
     lines.append("| Bucket | n | n_fired | fire rate | gated SR |")
     lines.append("|---|---:|---:|---:|---:|")
