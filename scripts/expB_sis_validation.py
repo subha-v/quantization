@@ -2081,6 +2081,11 @@ def pro_full_trials(pro_config: dict, n_per_suite: int = 50):
     Splits `n_per_suite` evenly over the suite's 10 tasks (5 episodes each by
     default for n=50 per suite). Same (suite, task, seed, ep) shape as
     full_trials(); only the suite list is parameterized.
+
+    Seed formula uses `eps_per_task` as the multiplier so seeds stay unique
+    within a suite for any n_per_suite (not just 50). With matched-pair noise
+    generation in SeededInferContext (base_seed * 100_000 + cycle), seed
+    collisions would inject identical noise across distinct trials.
     """
     out = []
     eps_per_task = max(1, n_per_suite // 10)
@@ -2091,7 +2096,7 @@ def pro_full_trials(pro_config: dict, n_per_suite: int = 50):
         for task_off in range(10):
             for ep in range(eps_per_task):
                 global_task_id = base + task_off
-                seed = task_off * 10 + ep
+                seed = task_off * eps_per_task + ep
                 out.append((suite, global_task_id, seed, ep))
     return out
 
@@ -2216,6 +2221,9 @@ def main():
                    help="suffix appended to W4 diagnostic + rollout + summary filenames "
                         "(e.g. 'libero_pro_obj0.2_goal0.3' → expB_w4_<tag>_rollouts.jsonl). "
                         "Defaults: no suffix (overwrites the existing standard-LIBERO files).")
+    p.add_argument("--pro-n-per-suite", type=int, default=50,
+                   help="number of trials per LIBERO-PRO suite for --w4-pro / --w2-pro. "
+                        "Trials are 10 tasks × (n // 10) episodes each. n=200 → 20 ep/task.")
 
     args = p.parse_args()
 
@@ -2309,7 +2317,7 @@ def main():
         elif args.w4_pro:
             if not pro_cfg:
                 p.error("--w4-pro requires --pro-config 'Suite:axis:mag ...'")
-            trials = pro_full_trials(pro_cfg, n_per_suite=50)
+            trials = pro_full_trials(pro_cfg, n_per_suite=args.pro_n_per_suite)
             if args.conditions and args.conditions != ["all"]:
                 unknown = [c for c in args.conditions if c not in ALL_CONDITIONS]
                 if unknown:
@@ -2376,7 +2384,7 @@ def main():
     elif args.w2_pro:
         if not pro_cfg:
             p.error("--w2-pro requires --pro-config 'Suite:axis:mag ...'")
-        trials = pro_full_trials(pro_cfg, n_per_suite=50)
+        trials = pro_full_trials(pro_cfg, n_per_suite=args.pro_n_per_suite)
         if args.conditions and args.conditions != ["all"]:
             unknown = [c for c in args.conditions if c not in ALL_CONDITIONS]
             if unknown:
