@@ -73,10 +73,21 @@ cd "$REPO"
 git add -- "${copied[@]/#/results/}"
 git status --short
 
-git commit -m "ExpD overnight: publish n=50 + n=200 trial-gate summaries + Phase B chunk results" || {
-    echo "Nothing to commit (already up to date)"
-    exit 0
-}
+if ! git commit -m "ExpD overnight: publish n=50 + n=200 trial-gate summaries + Phase B chunk results" 2>&1 | tee /tmp/expD_commit.log; then
+    if grep -q "nothing to commit" /tmp/expD_commit.log; then
+        echo "Nothing to commit (already up to date) — exiting OK"
+        exit 0
+    fi
+    echo "ERROR: git commit failed for a non-trivial reason; bailing"
+    cat /tmp/expD_commit.log
+    exit 1
+fi
 
 git push origin "$BRANCH" 2>&1 | tail -5
+push_rc=${PIPESTATUS[0]}
+if [ "$push_rc" -ne 0 ]; then
+    echo "ERROR: git push failed (exit $push_rc). The commit is local on $(hostname)." >&2
+    echo "Recover with: git fetch ssh://$(whoami)@$(hostname)$REPO $BRANCH && git push origin <commit>" >&2
+    exit 1
+fi
 banner "Publish DONE at $(date)"
