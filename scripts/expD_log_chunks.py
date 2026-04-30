@@ -36,10 +36,31 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 if SCRIPT_DIR not in sys.path:
     sys.path.insert(0, SCRIPT_DIR)
 
+import json
 import utils
 import rollout as rollout_mod
 from sis_utils import PrecisionController
 from expB_sis_validation import pro_full_trials, SeededInferContext
+
+
+def trials_from_rollouts(rollouts_path: Path) -> list:
+    """Extract the unique (suite, task_id, seed, episode_idx) trial set from
+    an existing rollouts JSONL. Use this to keep the chunk run aligned with
+    a previously-completed experiment regardless of which seed formula
+    `pro_full_trials` happens to use at the moment."""
+    seen = []
+    seen_set = set()
+    with open(rollouts_path) as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            r = json.loads(line)
+            key = (r["suite"], int(r["task_id"]), int(r["seed"]), int(r["episode_idx"]))
+            if key not in seen_set:
+                seen_set.add(key)
+                seen.append(key)
+    return seen
 
 
 def run_chunk_logging_trial(policy, model, ctrl, suite, task_id, seed, episode_idx, out_path):
@@ -84,6 +105,11 @@ def main():
     p.add_argument("--pro-config", default="Object:x:0.2")
     p.add_argument("--pro-n-per-suite", type=int, default=50)
     p.add_argument("--out-tag", default="libero_pro_obj_x0.2")
+    p.add_argument("--match-rollouts", default=None,
+                   help="path to an existing expB_w4__<tag>_rollouts.jsonl. When set, "
+                        "the trial set is read from that file (ignoring --pro-n-per-suite) "
+                        "so chunks join cleanly with prior outcomes regardless of any "
+                        "seed-formula changes in pro_full_trials.")
     args = p.parse_args()
 
     utils.setup_logging()
@@ -92,8 +118,13 @@ def main():
     rollout_mod.set_libero_pro_config(pro_cfg)
     utils.log(f"[expD-chunks] LIBERO-PRO config: {pro_cfg}")
 
-    trials = pro_full_trials(pro_cfg, n_per_suite=args.pro_n_per_suite)
-    utils.log(f"[expD-chunks] {len(trials)} trials")
+    if args.match_rollouts:
+        rollouts_path = Path(args.match_rollouts)
+        trials = trials_from_rollouts(rollouts_path)
+        utils.log(f"[expD-chunks] matched {len(trials)} trials from {rollouts_path.name}")
+    else:
+        trials = pro_full_trials(pro_cfg, n_per_suite=args.pro_n_per_suite)
+        utils.log(f"[expD-chunks] {len(trials)} trials from pro_full_trials")
 
     out_path = Path(utils.RESULTS_DIR) / f"expD_chunks__{args.out_tag}.jsonl"
     if out_path.exists():
