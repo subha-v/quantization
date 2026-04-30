@@ -1119,3 +1119,65 @@ Standard LIBERO doesn't surface W4 degradation, so AttnEntropy-W4 has nothing to
 - `results/expB_w4__libero_pro_obj_x0.2_n200_*` — P1 (in progress)
 - `results/expB_w4__libero_pro_obj_x0.4_n100_*` — P2 (in progress)
 - Server logs: `/data/subha2/experiments/logs/expB_w4_pro_x0.2_n200.log`, `expB_w4_pro_x0.4_n100.log`
+
+### P2 killed; pivoted to trial-gate analysis (2026-04-30)
+
+P2 (n=100 at x0.4) was killed at 49/100 trials done because the partial bucket distribution was 25 unrescuable / 1 rescuable / 7 clean / 2 w4_better — at full n=100 the rescuable subset would have been ~3 trials, far too few to test the +20 pp gap. x0.4 is past the FP16 cliff; the rescue-detection question is unanswerable at this magnitude. The compute is reallocated to a Phase A trial-gate analysis on the existing n=50 data (no new rollouts).
+
+### Phase A — Stage-1 trial-gate detector on n=50 (2026-04-30)
+
+**Motivation.** The aggregate-vs-conditional split from P3 reveals that AttnEntropy-W4 has an **asymmetric cost**: it rescues 80% of the rescuable-bucket trials but breaks 35% of the clean-bucket trials, because the per-cycle gate fires unconditionally regardless of whether the trial actually needs rescuing. Literature (FIPER, "Shifting Uncertainty," "Failure Detection Without Failure Data") points to a **two-stage detector**: Stage-1 ("is this rollout heading toward W4 failure?") gates Stage-2 (the existing per-cycle AttnEntropy demotion). Without Stage-1, the clean-bucket cost cancels the rescuable-bucket win in aggregate. This sub-experiment tests whether such a Stage-1 signal is extractable from existing data — purely from the first K cycles of the W4-base diagnostic, no new rollouts.
+
+**Method (`scripts/exp_trialgate_analysis.py`).** 90 features per trial: 5 attention probes (l1h7-top1, l9h2-ent, l12h2-ent, l3h4-top5, l17h4-top1) + SIS, each over K ∈ {5, 10, 15} cycles, summarized by {mean, std, max, min, slope}. Only W4-pass values (deployable at runtime); FP16-pass deliberately excluded since FP16 isn't running in deployment. Logistic regression with L2 + class balancing, evaluated by leave-one-out CV (50 folds). FIPER-style conformal threshold calibrated on the W4-Floor-success subset (FAR ≤ α). Two binary targets: `y_w4_fail` (W4-Floor failed; pos 26/50) and `y_rescuable` (FP16 succeeds AND W4-Floor fails; pos 10/50).
+
+#### Headline result — Stage-1 detects task difficulty, not quant sensitivity
+
+| Target | AUC | 95% CI | Brier |
+|---|---:|---|---:|
+| `y_w4_fail` (deployable) | **0.740** | [0.593, 0.865] | 0.204 |
+| `y_rescuable` (deployable) | **0.455** | [0.227, 0.697] | 0.254 |
+| `y_w4_fail` (oracle: mse_fp_w4) | 0.569 | [0.409, 0.723] | 0.273 |
+| `y_rescuable` (oracle: mse_fp_w4) | 0.390 | [0.182, 0.617] | 0.258 |
+
+Stage-1 AUC of **0.74 for "will W4 fail"** — moderate but real signal from early-cycle attention. But AUC of **0.46 for "rescuable"** — chance, with the lower 95% bound below 0.30. The detector predicts task difficulty in general, not the rescuable subset specifically. The early-cycle oracle (`mse_fp_w4` quantization MSE) is even *worse* on both targets — its early-trajectory readings don't predict the late-trajectory outcome.
+
+#### The fire pattern confirms the diagnosis
+
+Per-bucket breakdown of the best deployable detector (`y_w4_fail`, α=0.20, threshold=0.548, fires on 21/50 trials):
+
+| Bucket | n | n_fired | fire rate | gated SR | Right answer? |
+|---|---:|---:|---:|---:|---|
+| clean (FP16✓ + W4✓) | 17 | 2 | 12% | 100% | ✅ correct: low fire rate, preserves clean trials |
+| **rescuable (FP16✓ + W4✗)** | **10** | **2** | **20%** | **10%** | ❌ should fire HERE; almost never does |
+| w4_better (FP16✗ + W4✓) | 7 | 3 | 43% | 86% | partially OK (no firing means W4 retained) |
+| **unrescuable (FP16✗ + W4✗)** | **16** | **14** | **88%** | **12%** | ❌ should NOT fire here; fires almost always |
+
+The detector's fire pattern is **exactly backwards from useful**: it fires hardest on the unrescuable bucket (88%) where rescue can't help anyway, and least on the rescuable bucket (20%) where rescue would have +20 pp impact. Translation: early-cycle attention metrics correlate with intrinsic task difficulty, which captures benchmark-hard trials more cleanly than W4-quantization-hard trials.
+
+#### Gated SR matches ungated SR — Stage-1 changes nothing
+
+Simulated gated AttnEntropy-W4: 52% (matches ungated 52%, McNemar p=1.000). Even at α=0.20 — the most permissive false-alarm budget — the gated detector and the unconditional baseline give the same matched-pair outcomes. Random-W4 still wins at 58% by pure trajectory-divergence luck.
+
+| Comparison | A only | B only | Δ SR | McNemar p |
+|---|---:|---:|---:|---:|
+| Gated-AttnEnt vs AttnEnt-W4 | 8 | 8 | +0.000 | 1.000 |
+| Gated-AttnEnt vs W4-Floor | 3 | 1 | +0.040 | 0.625 |
+| Gated-AttnEnt vs Random-W4 | 4 | 7 | −0.060 | 0.549 |
+
+#### What this means
+
+The Stage-1 detector exists (AUC 0.74 for "will W4 fail" is genuine signal) but **it's measuring the wrong thing**. Early-cycle attention metrics encode *task difficulty*, which captures both quantization-induced and benchmark-induced failures in one pool. Since the unrescuable bucket is 60% of W4 failures (16/26), any "predict W4 failure" detector trained at this scale will fire mostly on those trials — exactly where rescue can't help. The same problem afflicts the per-cycle AttnEntropy gate (low entropy → high "sensitivity" → escalate), which is why ungated AttnEntropy didn't beat random in the n=50 aggregate.
+
+**The signal we need is one that distinguishes quantization-failure from benchmark-failure** — and at deploy time, the only candidates are signals derived from the policy's *output* (action chunks), not its *internals* (attention). Action chunks are precision-affected: under W4 the action chunk diverges from the FP16 chunk, and that divergence (or its proxies — chunk variance, sign-flip rate, inter-chunk discrepancy) is the only quantity at deploy time that's specific to quantization rather than task hardness. This is exactly the Phase B signal set FIPER and "Shifting Uncertainty" propose.
+
+#### Files of record
+
+- `scripts/exp_trialgate_analysis.py` (new, ~510 LOC) — re-runnable on n=200 data once P1 finishes via `--data-tag libero_pro_obj_x0.2_n200`.
+- `results/expD_trialgate_summary__libero_pro_obj_x0.2.md` — full table including all 12 (target × α × rescue-condition) simulated SR rows.
+- `results/expD_trialgate_features__libero_pro_obj_x0.2.jsonl` — per-trial feature matrix + labels for inspection.
+
+#### Open follow-ups
+
+- **Phase B — action-chunk signals.** A re-run pass that logs the actual action chunks for each cycle of the n=50 W4 trajectory (~30 min on H100, FP16-only no SIS perturbations). Extract action-chunk variance (Signal B), action sign-flip rate (Signal C), inter-chunk discrepancy (Signal D). Run the same trial-gate framework on those features. Hypothesis: action-derived signals can distinguish quant-failure from benchmark-failure where attention can't.
+- **Rerun on P1 n=200.** Once P1 finishes (~6 h remaining as of writeup), rerun `exp_trialgate_analysis.py --data-tag libero_pro_obj_x0.2_n200`. The 4× larger sample gives real bootstrap CIs on AUC and the gated SR comparison; a directional Phase A result on n=50 may flip if the underlying signal is weak but real, or stay flat if Phase A's "wrong target" diagnosis holds.
+- **Consider an end-to-end gated rollout** with a real `--w4-pro-gated` mode that runs Stage-1 inline from the partial diagnostic (cycles 0..K) and engages AttnEntropy from cycle K+1. Worth doing only if Phase A or Phase B shows a Stage-1 signal that survives the rescuable-vs-unrescuable confound.
