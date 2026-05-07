@@ -47,6 +47,11 @@ CONDITIONS = [
     ("A6_BF16_INT4K_INT8V", "bf16",   4,  8),
     ("A7_BF16_INT2KV",     "bf16",    2,  2),
     ("A8_AWQ_INT4KV",      "awq",     4,  4),
+    # Experiment C — K/V isolation: each leaves one side at BF16, quantizes the other.
+    ("C2_1_BF16K_INT4V",   "bf16",   16,  4),
+    ("C2_2_INT4K_BF16V",   "bf16",    4, 16),
+    ("C2_3_BF16K_INT2V",   "bf16",   16,  2),
+    ("C2_4_INT2K_BF16V",   "bf16",    2, 16),
 ]
 
 
@@ -60,6 +65,29 @@ def run(args):
     eval_items = filter_items(items, split["eval"])
     if args.limit:
         eval_items = eval_items[: args.limit]
+    if args.stratified_limit:
+        # Bucket-proportional sub-sample preserving short/mid/long/very_long ratios.
+        # The split list is grouped by bucket, so plain --limit slices unevenly.
+        by_bucket: dict[str, list] = {}
+        for it in eval_items:
+            by_bucket.setdefault(it.duration_bucket, []).append(it)
+        total = len(eval_items)
+        chosen, picks = [], []
+        for bucket, pool in by_bucket.items():
+            n_pick = round(args.stratified_limit * len(pool) / total)
+            picks.append((bucket, n_pick, pool))
+        # Fix rounding off-by-one against the largest bucket
+        diff = args.stratified_limit - sum(n for _, n, _ in picks)
+        if diff != 0:
+            largest_idx = max(range(len(picks)), key=lambda i: len(picks[i][2]))
+            b, n, p = picks[largest_idx]
+            picks[largest_idx] = (b, n + diff, p)
+        for bucket, n_pick, pool in picks:
+            chosen.extend(pool[:n_pick])
+        eval_items = chosen
+        bucket_counts = {b: sum(1 for it in eval_items if it.duration_bucket == b)
+                         for b in {it.duration_bucket for it in eval_items}}
+        print(f"[expA] stratified_limit={args.stratified_limit} bucket_counts={bucket_counts}")
     print(f"[expA] eval_items={len(eval_items)}")
 
     out_jsonl = RESULTS_DIR / f"expA_rollouts_{args.model.split('/')[-1]}.jsonl"
@@ -174,7 +202,11 @@ def main():
     ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--frames", type=int, nargs="+", default=[64, 128])
     ap.add_argument("--limit", type=int, default=0,
-                    help="Cap eval items (0 = all).")
+                    help="Cap eval items (0 = all). Slices the bucket-grouped list "
+                         "as-is, so usually only first N items by bucket order.")
+    ap.add_argument("--stratified_limit", type=int, default=0,
+                    help="Cap eval items to N total, proportionally stratified across "
+                         "duration buckets. 0 = disabled.")
     ap.add_argument("--append", action="store_true",
                     help="Append to existing JSONL instead of overwriting.")
     ap.add_argument("--conditions", nargs="+", default=[c[0] for c in CONDITIONS])

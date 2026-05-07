@@ -387,6 +387,52 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
+## Qwen2.5-VL × LongVideoBench — Experiment C: K/V isolation mini-sweep (2026-05-07)
+
+**Headline: K-quantization is the killer at INT4; V is essentially free.** Four conditions on 100 stratified eval items each, leaving one of K or V at BF16 and quantizing the other:
+
+| Condition | K bits | V bits | acc | BF16-correct preserved |
+|---|---:|---:|---:|---:|
+| **C2.1** BF16-K + INT4-V | 16 | 4 | **0.530** | **0.945** |
+| C2.2 INT4-K + BF16-V | 4 | 16 | 0.290 | 0.218 |
+| C2.3 BF16-K + INT2-V | 16 | 2 | 0.210 | 0.182 |
+| C2.4 INT2-K + BF16-V | 2 | 16 | 0.330 | 0.364 |
+
+For paired comparison on the same 100 items: BF16 ceiling = 0.550, A5 (INT4/INT4) = 0.210, A7 (INT2/INT2) = 0.210.
+
+**Two-regime asymmetry:**
+- **At INT4**: K-fragile. C2.1 (BF16-K) lands within 2 pp of the BF16 ceiling and preserves 94.5% of BF16-correct items. **The full Exp-A 30 pp rescue gap is recoverable simply by leaving K at full precision.** Mirror C2.2 (BF16-V) lifts only 8 pp off the floor.
+- **At INT2**: asymmetry flips — V is the worse side. Neither C2.3 nor C2.4 crosses the rescue midpoint, but C2.4 (V kept BF16) is +12 pp over C2.3. Consistent with Exp A's surprise that A7 INT2-ternary slightly outperforms A5 INT4: ternary {−s, 0, +s} preserves K-row sign+scale per channel (what attention's "key match" needs); INT2 V loses too much value-magnitude information for the attention×value matmul.
+
+**Implication:** the next experiment is *not* a richer KV tier set, and *not* {INT2, INT4, BF16} routing — it's **K-side outlier handling at INT4** (KIVI per-channel K + per-token V; AKVQ-VL static K outlier extraction; post-RoPE K-channel calibration). Once K is fixed, V can stay at INT4 with effectively no accuracy loss.
+
+### Implementation
+
+- `qwen/scripts/expA_baseline.py` — extended `CONDITIONS` with 4 `C2_*` rows and added `--stratified_limit N` for proportional bucket sub-sampling.
+- `qwen/scripts/run_expC_kv_isolation.sh` — single-step orchestrator (modeled on `run_resume.sh`).
+- `qwen/scripts/expC_analyze.py` — paired-comparison analysis on the 100-item C2 universe with auto-classified diagnosis (K-fragile / V-fragile / joint).
+- `qwen/scripts/expC0_diagnostics.py` — no-compute diagnostics from existing JSONLs (A5↔A7 complementarity, B6/B8/B9/B10 selected-block coverage, paired Δ-margin vs uniform floors).
+
+Full writeup, paired tables, and diagnosis text in `QWEN_EXPERIMENTS.md` → "Experiment C — K/V isolation mini-sweep". Companion no-compute diagnostics in "Experiment C0".
+
+### Running on tambe-server-1
+
+```bash
+# After git pull and venv activation (qwen_venv):
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+source /data/subha2/experiments/qwen_venv/bin/activate
+nvidia-smi  # confirm an unused GPU
+tmux new -s qwen-expC
+CUDA_VISIBLE_DEVICES=<idx> EXPC_N_ITEMS=100 \
+    bash /data/subha2/quantization/qwen/scripts/run_expC_kv_isolation.sh
+# ~22 min for 4 conditions × 100 items × 64 frames.
+# Analysis (after sync back locally):
+python3 qwen/scripts/expC_analyze.py \
+    --jsonl qwen/results/expA_rollouts_Qwen2.5-VL-7B-Instruct.jsonl \
+    --out   qwen/results/expC_kv_isolation_summary.md
+```
+
 ## Qwen2.5-VL × LongVideoBench KV-cache experiments (staged 2026-05-06)
 
 Pivot from the saturated pi0.5/LIBERO line (where `Static-W2-l13-17` already hits 100% on standard LIBERO Long, leaving no rescue gap for AttnEntropy) to **Qwen2.5-VL-7B-Instruct on LongVideoBench-val**, where the model is unsaturated (54.7%) and long-video produces thousands of visual tokens, so KV-cache precision matters. The novelty thesis shifts from "AttnEntropy rescues weight quant" to: **attention entropy can allocate per-(layer, head, token) KV-cache *precision* better than uniform / random / attention-mass / MEDA-style baselines.**

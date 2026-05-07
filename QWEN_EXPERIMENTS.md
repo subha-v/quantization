@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-07:** **Both experiments complete.** Exp A (8/8 conditions × 200 eval items) and Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits, plus B10 in flight). Total: ~3200 rollouts of routed/baseline data, plus 33,600 (item × layer × KV-head) diagnostic signal rows.
+**Status as of 2026-05-07:** **Three experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), and Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits). Total: ~3600 rollouts of routed/baseline data, plus 33,600 (item × layer × KV-head) diagnostic signal rows.
 
 ## Headline
 
@@ -20,6 +20,14 @@
 > **Diagnosis.** The 30 pp rescue gap is real, but at avg=4 with {INT2, BF16}, **86% of the cache must be at INT2**, and INT2 fundamentally breaks long-video VLM attention regardless of which 14% gets BF16 protection. The bottleneck is not which blocks to route to BF16 — it's that uniform INT2 alone is unrecoverably destructive in this model.
 >
 > **Implications for next steps.** The next step is *not* more routing. It's a richer tier set (e.g., {INT2, INT4, BF16} so 70%+ of the cache can sit at INT4 instead of INT2), or a stronger K/V quantizer baseline (KIVI-style per-channel K + per-token V; AKVQ-VL outlier reduction). Once uniform-INT4 is no longer at chance, routing to {INT4, BF16} or {INT2, INT4, BF16} can be revisited.
+>
+> **Exp C K/V isolation — STRONG ASYMMETRY at INT4.** On 100 stratified eval items per condition (frame budget unchanged at 64):
+>
+> 8. **K is the killer at INT4. V is essentially free at INT4.** C2.1 (K=BF16, V=INT4) lands at **53.0%** — within 2 pp of the BF16 ceiling (55.0% on the same 100 items) — and preserves **94.5%** of BF16-correct items. The mirror condition C2.2 (K=INT4, V=BF16) collapses to **29.0%**, only 8 pp above the A5 INT4-K/INT4-V floor. Δ vs A5 is +32.0 pp for C2.1 and +8.0 pp for C2.2. **The entire 30 pp rescue gap from Exp A is recoverable by leaving K alone.**
+> 9. **At INT2, fragility flips and is per-side on both axes.** C2.3 (K=BF16, V=INT2) sits at **21.0%** (Δ vs A7 = +0.0 pp); C2.4 (K=INT2, V=BF16) at **33.0%** (Δ vs A7 = +12.0 pp). Neither crosses the rescue midpoint, but the *direction* of the asymmetry has reversed — V is the worse side at INT2. Mechanistically consistent with Exp A's surprise that A7 INT2 ternary slightly outperforms A5 INT4: ternary {−s, 0, +s} preserves K-row sign+scale exactly (which is what attention's "key match" needs), while INT2 V loses too much value-magnitude information for the attention×value matmul.
+> 10. **Margin tracks accuracy.** C2.1 mean answer margin = +0.674 vs the 100-item BF16 ceiling +0.712. Logits are genuinely moving toward the right answer, not just flipping argmax. C2.2 margin = −0.850, basically tied with A5's −0.871.
+>
+> **Implication.** The next experiment is *not* a richer KV tier set, and *not* {INT2, INT4, BF16} routing. It's **K-side outlier reduction at INT4** (KIVI-style per-channel K, AKVQ-VL static outlier extraction, or post-RoPE channel-wise K calibration). The naive symmetric per-channel quantizer is broken specifically on K; once K is properly quantized, V can stay at INT4 with effectively no accuracy loss — that gives ~10 KV bits avg without the 30 pp Exp A collapse.
 
 The methodology gates: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (smoke threshold 1e-3) — `FakeQuantKVCache.update()` feeds the SDPA matmul as designed. Diagnostic pass produces 0 NaN entropy/residual rows on 33,600 (item × L × H) signals; `bf16_pred ≠ uniform_int2_pred` on 90%+ of items, confirming the routing decisions are operating on real signal.
 
@@ -215,6 +223,64 @@ Not "smarter routing" — **a richer tier set or stronger baseline quantizer**.
 
 The Exp B framework, signals, and metrics are reusable: once a less-destructive baseline quantizer is in place, drop it into `fake_quantize_kv` and re-run `run_expB_online.sh` — same diagnostic JSONL, same routing logic, same summary table.
 
+## Experiment C0 — no-compute diagnostics (2026-05-07)
+
+Three diagnostics run on existing JSONLs, before committing to any further compute. Full output at `qwen/results/expC0_diagnostics.md`.
+
+1. **A5 (INT4) ↔ A7 (INT2) item-level complementarity.** Of 200 eval items, INT4 was correct on 42, INT2 on 54, both on 13. Symmetric difference = 70 items (35%). Jaccard = 0.157 (near-disjoint). **Oracle union ceiling = 41.5%**, vs A5 alone 21.0% and A7 alone 27.0%. → A {INT2, INT4, BF16} tier set has real, non-trivial headroom (+14.5 pp over best single-tier anchor) *if* a router can pick the right tier per block.
+
+2. **Selected-block coverage for B6/B8/B9/B10.** Every routed method protects ≤ 13 of 28 layers; B6 StaticEntropy is fully deterministic (16 stable / 96 never blocks across all 200 items, by construction). B10 OnlineNeed-AQ is the most spread (head-Hbits = 4.47 / 6.81 uniform) and shifts to earlier layers (L1-L11) — but still failed at 21.0%. **Concentration is descriptively true but mechanistically irrelevant**; spreading didn't rescue accuracy.
+
+3. **Per-condition answer margin.** All routed methods have *negative* paired Δ-margin vs uniform INT4/INT2 floors on the BF16-correct subset: B6 −0.170, B8 −0.181, B9 −0.157, B10 −0.269 (vs A5). **Routing isn't even directionally helpful at avg=4 with {INT2, BF16}** — the routed logits sit *further* from the correct answer than uniform INT4/INT2 do on the same items.
+
+**C0 conclusion:** sharpens the next-step claim from "richer tier set" to "richer tier set is *necessary* — without it routing has no signal headroom to express, regardless of method." Motivates Exp C K/V isolation as the cheapest test that could redirect the research path.
+
+## Experiment C — K/V isolation mini-sweep (2026-05-07)
+
+A6 in Exp A (INT4-K + INT8-V at 25.0%) tested asymmetric K/V but still quantized **both** sides, so it could not isolate which side is the actual fragility driver. Exp C runs four conditions that each leave one of K or V at full BF16 precision and quantize the other, on the same 100-item stratified eval subset (proportional bucket counts: short 16 / mid 16 / long 34 / very_long 34 = 100). Frame budget 64, model `Qwen2.5-VL-7B-Instruct`.
+
+### Conditions and results (n=100 each, 64 frames)
+
+| ID | K bits | V bits | avg KV bits | n | acc | 95% CI | BF16-correct preserved | mean margin |
+|---|---:|---:|---:|---:|---:|---|---:|---:|
+| C2.1 `BF16K_INT4V` | 16 | 4 | 10.00 | 100 | **0.530** | [0.430, 0.630] | 0.945 (n=55) | +0.674 |
+| C2.2 `INT4K_BF16V` | 4 | 16 | 10.00 | 100 | 0.290 | [0.210, 0.380] | 0.218 (n=55) | −0.850 |
+| C2.3 `BF16K_INT2V` | 16 | 2 | 9.00 | 100 | 0.210 | [0.140, 0.290] | 0.182 (n=55) | −1.277 |
+| C2.4 `INT2K_BF16V` | 2 | 16 | 9.00 | 100 | 0.330 | [0.240, 0.420] | 0.364 (n=55) | −0.820 |
+
+### Paired comparison vs Exp A anchors (restricted to the same 100 item_ids)
+
+| Condition | n | acc | 95% CI | mean margin |
+|---|---:|---:|---|---:|
+| A1 BF16 ceiling | 100 | 0.550 | [0.460, 0.640] | +0.712 |
+| A5 INT4-K + INT4-V | 100 | 0.210 | [0.130, 0.290] | −0.871 |
+| A6 INT4-K + INT8-V | 100 | 0.280 | [0.200, 0.370] | −1.033 |
+| A7 INT2-K + INT2-V | 100 | 0.210 | [0.130, 0.290] | −1.092 |
+
+### Diagnosis — two-regime asymmetry
+
+**At INT4 (avg = 10 KV bits): K-fragile.** C2.1 (K=BF16, V=INT4) at 0.530 is within 2 pp of the BF16 ceiling on the same 100 items (0.550), with 94.5% BF16-correct preservation and answer margin +0.674 vs ceiling +0.712. The mirror C2.2 (K=INT4, V=BF16) at 0.290 sits only 8 pp above the A5 INT4/INT4 floor — keeping V at BF16 does almost nothing if K is at INT4. Δ vs A5: **+32.0 pp** for C2.1, **+8.0 pp** for C2.2. **The full Exp-A 30 pp rescue gap is recoverable simply by leaving K at full precision.**
+
+**At INT2 (avg = 9 KV bits): asymmetry flips, but both sides break.** C2.3 (K=BF16, V=INT2) collapses to 0.210 (Δ vs A7 = +0.0 pp); C2.4 (K=INT2, V=BF16) sits at 0.330 (Δ vs A7 = +12.0 pp, BF16-correct preserved 0.364). Neither crosses the rescue midpoint of 0.380, but the *direction* of the asymmetry is reversed — at 2-bit, V is the *worse* side to quantize. This is mechanistically consistent with Exp A's surprise that A7 INT2 ternary (27.0%) slightly outperforms A5 INT4 (21.0%): ternary {−s, 0, +s} preserves K-row sign+scale per channel, which is exactly what attention's "key match" structure depends on. INT2 V loses too much value-magnitude information for the attention×value matmul.
+
+### Implications
+
+1. **The naive symmetric per-channel quantizer is broken specifically on K at INT4.** V at INT4 is essentially free in this setting. Until that is fixed, *any* routing scheme that tolerates symmetric INT4 K-quantization will lose 30 pp regardless of which subset of (layer, head) blocks it elevates.
+2. **Next experiment is K-side outlier handling, not richer tiers and not routing.** Concrete options, in order of cost: (a) KIVI-style asymmetric K/V layout (per-channel K, per-token V); (b) AKVQ-VL static outlier extraction on K only; (c) post-RoPE K-channel calibration. All target the K-fragility specifically and should drop the symmetric INT4-K floor (currently 21.0%) into a regime where the C2.1 result (53.0%) is recoverable at avg ≈ 4 bits, not avg ≈ 10.
+3. **Exp B's routing infrastructure is reusable.** Once a K-fragility-aware quantizer is plugged into `fake_quantize_kv`, the diagnostic JSONL + scoring + V2 BitController stack from Exp B can be re-run unchanged. The bottleneck has been the per-side fragility floor, not the routing signals.
+
+### Files of record (Exp C)
+
+- `qwen/scripts/expA_baseline.py` — extended with 4 C2 conditions and `--stratified_limit` flag.
+- `qwen/scripts/run_expC_kv_isolation.sh` — single-step orchestrator (modeled on `run_resume.sh`).
+- `qwen/scripts/expC_analyze.py` — paired-comparison analysis on the 100-item C2 universe.
+- `qwen/scripts/expC0_diagnostics.py` — no-compute diagnostics from existing JSONLs.
+- `qwen/results/expA_rollouts_Qwen2.5-VL-7B-Instruct.jsonl` — appended with 400 C2 rows; total now 8 × 200 + 4 × 100 = 2000 rows.
+- `qwen/results/expA_summary_Qwen2.5-VL-7B-Instruct.md` — combined A1-A8 + C2.1-C2.4 table.
+- `qwen/results/expC_kv_isolation_summary.md` — paired-on-100 comparison + diagnosis.
+- `qwen/results/expC_kv_isolation.progress.log` — full server progress log.
+- `qwen/results/expC0_diagnostics.md` — no-compute diagnostic output.
+
 ## Methodological lessons learned (cumulative)
 
 1. **`torch>=2.10` ships CUDA-13 wheels that silently fall back to CPU on driver 12.6.** Pinned to `torch==2.5.1+cu124`. Calibration "completed" in 7 seconds the first time because the model was on CPU.
@@ -232,6 +298,11 @@ qwen-expB-online (tmux session, GPU 0) — PIPELINE COMPLETE (4h 8min total)
 ├── ✅ STEP 2  static_entropy_risk aggregated from cal-only (n_cal=100, 2 sec)
 ├── ✅ STEP 3  routed eval — 8 of 8 routed conditions complete (B2 ×3, B4, B6, B7, B8, B9; ~17 min each)
 └── ✅ STEP 4  B10 OnlineNeed-AQ (diagnostic upper bound, 13:46)
+
+qwen-expC (tmux session, GPU 0) — PIPELINE COMPLETE (~22 min total)
+└── ✅ STEP 1  K/V isolation: 4 conditions × 100 stratified eval items × 64 frames
+              C2.1 BF16K/INT4V → 0.530, C2.2 INT4K/BF16V → 0.290,
+              C2.3 BF16K/INT2V → 0.210, C2.4 INT2K/BF16V → 0.330
 ```
 
 ## Files of record
