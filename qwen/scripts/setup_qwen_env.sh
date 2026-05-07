@@ -35,9 +35,16 @@ fi
 source "$VENV_DIR/bin/activate"
 
 uv pip install --upgrade pip
+# torch >= 2.10 ships with CUDA 13 wheels by default which require driver
+# >= 12.8; tambe-server-1 currently has driver 12.6, so we pin to torch 2.5.1
+# + cu124 (forward-compatible with 12.6). Check `nvidia-smi` driver version
+# locally before bumping these versions.
 uv pip install \
-  "torch>=2.4" \
-  "torchvision" \
+  "torch==2.5.1" \
+  "torchvision==0.20.1" \
+  --index-url https://download.pytorch.org/whl/cu124
+
+uv pip install \
   "transformers>=4.49.0,<4.55" \
   "qwen-vl-utils[decord]" \
   "accelerate>=0.30" \
