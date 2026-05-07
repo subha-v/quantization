@@ -329,6 +329,54 @@ CUDA_VISIBLE_DEVICES=<idx> uv run python \
 
 The decision points are documented in the plan: W4-Floor SR < FP16 SR by ≥ 10 pp confirms W4 degrades on harder tasks (the headline hypothesis); AttnEntropy-W4 SR > Random-W4 SR with non-overlapping bootstrap CIs confirms the rescue gate works at W4 in this regime.
 
+## Path 1 — Static vs Dynamic Late-Layer W2 Comparison (staged 2026-05-06)
+
+The S3-Tern-W4-l12h2 Pareto claim (95% SR / 3.58 avg bits vs W4-Floor's 94% / 4.0) has a methodological hole: it was never compared to a **static late-layer W2 baseline** (layers 13-17 always W2, no gating). If a static schedule matches S3-Tern at the same parameter-weighted bits, the AttnEntropy gating contributes nothing — the gain is purely the spatial restriction already established by exp2. This experiment closes that gap.
+
+### Eight new conditions in `scripts/expB_sis_validation.py`
+
+All operate on the late layer range = PaliGemma decoder layers 13-17 (5 layers). Layers 1-12 stay W4; layer 0 + vision tower stay FP16-protected (PrecisionController default).
+
+| Condition | Mechanism |
+|---|---|
+| `Static-W2-l13-17` | Layers 13-17 W2 every cycle, every trial. Trial-level install via `PrecisionController.use_bits_range(13, 17, 2)`. No per-cycle swap. |
+| `Random-Bin-W2-l13-17-{f25,f50,f75}` | On a random fraction of cycles (seeded), layers 13-17 → W2; rest → W4. Three operating points. |
+| `AttnEnt-Bin-W2-l13-17-{f25,f50,f75}` | On bottom-frac% by W4-pass `l12h2` entropy, layers 13-17 → W2. Same direction as S3-Tern (W2 D2 default). |
+| `Hybrid-Static-W2-AttnEnt-FP16-f50` | Layers 13-17 W2 base + bottom-50% l12h2-ent cycles escalated to FP16 on layers 13-17. Tests whether dynamic adds value on top of static. |
+
+### What's new in the script
+
+- `L_LATE_START = 13`, `L_LATE_END = 17`, `LATE_LAYER_FRACS = (0.25, 0.5, 0.75)`, `LATE_LAYER_W2_CONDITIONS` constants.
+- `_layer_param_counts(model)` and `_avg_bits_param_weighted(...)` — parameter-weighted average-bits accounting (formula: per-cycle weighted mean of P_protected·16 + P_early·bits(early) + P_late·bits(late) / P_total). Reported alongside the existing cycle-weighted `condition_avg_bits` so all conditions sit on a comparable Pareto axis.
+- `override_rollout(...)` extended with `base_layer_range_install`, `late_range_per_cycle`, `late_range`, `early_pin` kwargs. Backward-compatible defaults (existing per-cycle whole-model schedules behave identically).
+- `build_masks_w4(...)` builds Random-Bin and AttnEnt-Bin schedules using a new `{"_kind": "late_range", ...}` schedule shape.
+- `run_seed_w4(...)` dispatches Static, Hybrid, and the late_range schedule shape to the new `override_rollout` path.
+- `analyze_w4(...)` summary table now reports `avg bits (param-weighted)` alongside cycle-weighted bits.
+- 8 new HW tags (HW12a-h) in the matched-pair hypothesis matrix covering the static-vs-dynamic comparisons.
+
+### Run order
+1. **n=20 pilot** (Static-W2-l13-17 only, ~1 h) — confirms Static doesn't catastrophically collapse before committing the full compute budget.
+2. **Standard LIBERO n=100, 8 conditions** (~3.5 h, ~800 rollouts) — the Pareto-sweep comparison.
+3. **LIBERO-PRO Object x0.2 n=200** (conditional on Phase 2 results, ~7 h).
+
+```bash
+# n=20 pilot:
+CUDA_VISIBLE_DEVICES=<idx> uv run python scripts/expB_sis_validation.py \
+    --w4-schemes --conditions Static-W2-l13-17 \
+    --trial-range 0:20 --reuse-diag --out-tag static_pilot_n20
+
+# Full Pareto sweep (8 conditions × 100 trials = 800 rollouts):
+CUDA_VISIBLE_DEVICES=<idx> uv run python scripts/expB_sis_validation.py \
+    --w4-schemes --conditions \
+        Static-W2-l13-17 \
+        Random-Bin-W2-l13-17-f25 Random-Bin-W2-l13-17-f50 Random-Bin-W2-l13-17-f75 \
+        AttnEnt-Bin-W2-l13-17-f25 AttnEnt-Bin-W2-l13-17-f50 AttnEnt-Bin-W2-l13-17-f75 \
+        Hybrid-Static-W2-AttnEnt-FP16-f50 \
+    --reuse-diag --out-tag static_dynamic_n100
+```
+
+Plan in `/Users/subha/.claude/plans/let-s-go-ahead-and-snoopy-lighthouse.md`. Implementation in commits on branch `overnight-2026-04-29-w4-first`.
+
 ## Key References
 
 - **QVLA** (ICLR 2026) — Action-centric channel-wise quantization for AR VLAs

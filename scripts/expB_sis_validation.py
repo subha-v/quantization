@@ -149,6 +149,17 @@ ALL_CONDITIONS = [
     # at lower avg_bits / matching SR.
     "S3-Bin-W4-l1h7-bottom",        # 38 — intra-pass at l1h7 top1, BOTTOM direction (W4-correct)
     "S3-Tern-W4-l1h7-bottom",       # 39 — intra-pass three-tier at l1h7 top1, BOTTOM direction
+    # ---- 2026-05-06 Path 1: Static vs dynamic late-layer W2 comparison ----
+    # Tests whether dynamic AttnEntropy gating contributes anything beyond a
+    # static "layers 13-17 always W2" schedule at matched parameter-weighted bits.
+    "Static-W2-l13-17",                       # 40 — layers 13-17 W2 every cycle, no gating
+    "Random-Bin-W2-l13-17-f25",               # 41 — random 25% of cycles, layers 13-17 → W2
+    "Random-Bin-W2-l13-17-f50",               # 42 — random 50% of cycles, layers 13-17 → W2
+    "Random-Bin-W2-l13-17-f75",               # 43 — random 75% of cycles, layers 13-17 → W2
+    "AttnEnt-Bin-W2-l13-17-f25",              # 44 — bottom-25% l12h2-ent, layers 13-17 → W2
+    "AttnEnt-Bin-W2-l13-17-f50",              # 45 — bottom-50% l12h2-ent, layers 13-17 → W2
+    "AttnEnt-Bin-W2-l13-17-f75",              # 46 — bottom-75% l12h2-ent, layers 13-17 → W2
+    "Hybrid-Static-W2-AttnEnt-FP16-f50",      # 47 — layers 13-17 W2 base + bottom-50% → FP16
 ]
 
 # Legacy pilot conditions (frac=0.5 results live under old labels in the previous JSONLs)
@@ -183,6 +194,18 @@ W4_PROBE_CONDITIONS = {
     "Probe-W4-l1h7-top1", "Probe-W4-l9h2-ent",
     "Probe-W4-l3h4-top5", "Probe-W4-l17h4-top1",
 }
+# 2026-05-06 Path 1 — Static vs dynamic late-layer W2 comparison.
+# Late range = PaliGemma decoder layers 13-17 (5 layers). Layers 1-12 stay W4,
+# layer 0 + vision tower stay FP16-protected (PrecisionController default).
+L_LATE_START = 13
+L_LATE_END   = 17
+LATE_LAYER_FRACS = (0.25, 0.50, 0.75)
+LATE_LAYER_W2_CONDITIONS = {
+    "Static-W2-l13-17",
+    "Random-Bin-W2-l13-17-f25", "Random-Bin-W2-l13-17-f50", "Random-Bin-W2-l13-17-f75",
+    "AttnEnt-Bin-W2-l13-17-f25", "AttnEnt-Bin-W2-l13-17-f50", "AttnEnt-Bin-W2-l13-17-f75",
+    "Hybrid-Static-W2-AttnEnt-FP16-f50",
+}
 # All W4 conditions that need the V3 diagnostic (W4-pass entropy + multi-probe).
 W4_ALL_CONDITIONS = (
     {"W4-Floor", "W4-Static-Sched"}
@@ -190,6 +213,7 @@ W4_ALL_CONDITIONS = (
     | W4_INTRAPASS_CONDITIONS
     | W4_TERN_CONDITIONS
     | W4_PROBE_CONDITIONS
+    | LATE_LAYER_W2_CONDITIONS
 )
 # Mapping from intra-pass condition name to (layer, head, metric) — used to
 # instantiate IntraPassController with the right probe.
@@ -473,25 +497,82 @@ def override_rollout(
     override_set=None,
     precision_per_cycle=None,
     default_precision: str = "w2",
+    base_layer_range_install=None,
+    late_range_per_cycle=None,
+    late_range=(L_LATE_START, L_LATE_END),
+    early_pin=(1, 12, "w4"),
     verbose: bool = False,
 ):
     """Replay the same (suite, task_id, seed, episode_idx) starting state with a
     per-cycle weight precision schedule.
 
-    Two equivalent ways to specify the schedule (legacy `override_set` kept for
-    backwards compat with the original 8 conditions):
+    Three modes (mutually exclusive):
 
-      override_set: set[int]          — binary {default, FP16}; cycles in the
-                                        set go to FP16, others use `default_precision`.
-      precision_per_cycle: dict[int,str] — full per-cycle map; values ∈
-                                        {"fp16", "w4", "w2"}. Cycles not present
-                                        in the map fall back to `default_precision`.
+      (1) Whole-model per-cycle schedule (existing):
+        override_set: set[int]          — binary {default, FP16}; cycles in the
+                                          set go to FP16, others use default_precision.
+        precision_per_cycle: dict[int,str] — full per-cycle map ("fp16"/"w4"/"w2").
 
-    Both default_precision values must be installable on `ctrl` (FP16 is always
-    available; "w4" requires the controller was built with bits_list=(2, 4)).
+      (2) Static layer-range install (new, 2026-05-06):
+        base_layer_range_install=(start, end, prec)
+            — install once before rollout starts; layers stay at `prec` for
+              every cycle. Combine with `early_pin` to pin layers 1..L-1 once.
+
+      (3) Per-cycle late-range swap (new, 2026-05-06):
+        late_range_per_cycle: dict[int, str]
+            — only swap layers in `late_range` per cycle (other layers stay at
+              the precision installed by `base_layer_range_install` or
+              `early_pin`). Used by Random-Bin-W2-l13-17, AttnEnt-Bin-W2-l13-17.
+              Hybrid combines (2)+(3): base install of W2 on late range +
+              per-cycle escalation to FP16 on selected cycles.
 
     Returns the rollout_record.
     """
+    use_late_range_path = (
+        base_layer_range_install is not None or late_range_per_cycle is not None
+    )
+
+    if use_late_range_path:
+        if override_set is not None or precision_per_cycle:
+            raise ValueError(
+                "base_layer_range_install / late_range_per_cycle are mutually "
+                "exclusive with override_set / precision_per_cycle"
+            )
+        # Reset to FP16 first so we have a known clean baseline before per-layer pinning.
+        ctrl.use_fp16()
+        if early_pin is not None:
+            e_start, e_end, e_prec = early_pin
+            ctrl.use_bits_range(int(e_start), int(e_end), e_prec.lower())
+        if base_layer_range_install is not None:
+            b_start, b_end, b_prec = base_layer_range_install
+            ctrl.use_bits_range(int(b_start), int(b_end), b_prec.lower())
+
+        cycle_idx = [-1]
+        l_start, l_end = late_range
+
+        def pre_infer_callback(t):
+            cycle_idx[0] += 1
+            if late_range_per_cycle is None:
+                return  # static install is sticky; nothing to swap per cycle
+            prec = late_range_per_cycle.get(cycle_idx[0])
+            if prec is None:
+                return  # leave at base install
+            ctrl.use_bits_range(int(l_start), int(l_end), prec.lower())
+
+        seeded = SeededInferContext(policy, model, base_seed=seed)
+        with seeded:
+            rec = rollout_mod.run_rollout(
+                policy,
+                task_id=task_id,
+                suite=suite,
+                seed=seed,
+                episode_idx=episode_idx,
+                pre_infer_callback=pre_infer_callback,
+                verbose=False,
+            )
+        return rec
+
+    # ----- Existing whole-model per-cycle path -----
     if override_set is not None and precision_per_cycle is not None:
         raise ValueError("pass either override_set or precision_per_cycle, not both")
     if override_set is not None:
@@ -549,6 +630,84 @@ def _avg_bits(precision_per_cycle: dict, n_cycles: int, default_precision: str) 
         else:
             total += BITS_BY_PRECISION[prec.lower()]
     return total / n_cycles
+
+
+# 2026-05-06 — parameter-weighted avg bits for the late-layer W2 comparison.
+# Existing `_avg_bits` treats every cycle as a single whole-model precision and
+# averages over cycles. Late-range schemes mix per-layer precisions within a
+# cycle, so the comparable metric is param-weighted bits per cycle, then mean
+# over cycles. Comparable across Static/Bin/Hybrid AND any whole-model scheme.
+_LAYER_PARAM_COUNT_CACHE: dict = {}
+
+
+def _layer_param_counts(model) -> dict:
+    """Return {layer_idx: total numel of Linear weights at language_model.layers.{i}}.
+    Also returns "__fp16_protected__" key counting Linear params outside the
+    PaliGemma decoder layers (vision tower, projector, action expert).
+    Cached by id(model)."""
+    import re as _re
+    key = id(model)
+    if key in _LAYER_PARAM_COUNT_CACHE:
+        return _LAYER_PARAM_COUNT_CACHE[key]
+    counts: dict = {}
+    fp16_protected = 0
+    pat = _re.compile(r"\.language_model\.layers\.(\d+)\.")
+    for name, m in model.named_modules():
+        if not isinstance(m, torch.nn.Linear):
+            continue
+        n_params = m.weight.numel()
+        match = pat.search(name)
+        if match:
+            i = int(match.group(1))
+            counts[i] = counts.get(i, 0) + n_params
+        else:
+            fp16_protected += n_params
+    counts["__fp16_protected__"] = fp16_protected
+    _LAYER_PARAM_COUNT_CACHE[key] = counts
+    return counts
+
+
+def _avg_bits_param_weighted(
+    layer_param_counts: dict,
+    early_prec: str,
+    late_prec_per_cycle: list,
+    late_range: tuple = (L_LATE_START, L_LATE_END),
+    early_range: tuple = (1, 12),
+    protected_layer_idx: int = 0,
+) -> float:
+    """Parameter-weighted average bits across cycles for late-range schedules.
+
+    bits_per_cycle = (P_protected*16 + P_early*bits(early_prec)
+                      + P_late*bits(late_prec_for_cycle)) / P_total
+    avg = mean(bits_per_cycle, cycles)
+
+    For whole-model schemes (every cycle the same prec on all decoder layers),
+    pass `early_prec=prec` and `late_prec_per_cycle=[prec]*n_cycles` and the
+    formula degenerates to the cycle-weighted mean — a single comparable axis.
+    """
+    if not late_prec_per_cycle:
+        return float("nan")
+    p_protected = int(layer_param_counts.get("__fp16_protected__", 0))
+    p_protected += int(layer_param_counts.get(protected_layer_idx, 0))
+    p_early = sum(
+        int(layer_param_counts.get(i, 0))
+        for i in range(early_range[0], early_range[1] + 1)
+    )
+    p_late = sum(
+        int(layer_param_counts.get(i, 0))
+        for i in range(late_range[0], late_range[1] + 1)
+    )
+    p_total = p_protected + p_early + p_late
+    if p_total == 0:
+        return float("nan")
+    bits_early = BITS_BY_PRECISION[early_prec.lower()]
+    total = 0.0
+    for prec in late_prec_per_cycle:
+        bits_late = BITS_BY_PRECISION[prec.lower()]
+        total += (
+            p_protected * 16 + p_early * bits_early + p_late * bits_late
+        ) / p_total
+    return total / len(late_prec_per_cycle)
 
 
 # ---------------------------------------------------------------------------
@@ -1025,6 +1184,45 @@ def build_masks_w4(
         )
         masks[cond_name] = _lag_one(s2_probe, n)  # lag-1 (Scheme 1) for cheap deployability
 
+    # ---- 2026-05-06 Path 1: Late-layer W2 schemes (static-vs-dynamic test) ----
+    # Schedule format for these schemes:
+    #   {"_kind": "late_range", "default_late": "w4",
+    #    "late_per_cycle": {cycle_idx: "w2"}}
+    # The "_kind" sentinel signals run_seed_w4 to dispatch via the late-range
+    # path of override_rollout. Layers 1..12 are pinned to W4 once at trial
+    # start; layers 13..17 swap between "default_late" and the per-cycle override.
+    # `attn_w4` was set above (line ~970) to W4-pass l12h2 entropy per cycle;
+    # bottom-direction matches S3-Tern-W4-l12h2 (W2 D2 default).
+    for late_frac in LATE_LAYER_FRACS:
+        frac_label = f"f{int(round(late_frac * 100)):02d}"
+        k_late = max(0, int(round(late_frac * n)))
+
+        # Random binary: pick frac% of cycles uniformly to demote layers 13-17 → W2.
+        # Distinct seed offset per frac so f25/f50/f75 picks aren't nested.
+        rng_late = _random.Random(seed * 6151 + int(round(late_frac * 1000)))
+        rand_late_idx = (
+            set(rng_late.sample(range(n), k_late)) if k_late > 0 else set()
+        )
+        masks[f"Random-Bin-W2-l13-17-{frac_label}"] = {
+            "_kind": "late_range",
+            "default_late": "w4",
+            "late_per_cycle": {i: "w2" for i in rand_late_idx},
+        }
+
+        # AttnEnt binary: bottom-frac% by W4-pass l12h2 entropy → demote.
+        # Uses the existing `attn_w4` list (W4-pass entropies) to keep this
+        # comparable to S3-Tern-W4-l12h2's gating signal.
+        bottom_idx = _topk_indices(attn_w4, k_late, largest=False)
+        masks[f"AttnEnt-Bin-W2-l13-17-{frac_label}"] = {
+            "_kind": "late_range",
+            "default_late": "w4",
+            "late_per_cycle": {i: "w2" for i in bottom_idx},
+        }
+
+    # Static-W2-l13-17 and Hybrid-* don't go through build_masks_w4 — they're
+    # dispatched directly in run_seed_w4 (Static doesn't need a mask; Hybrid's
+    # mask shape mixes W2 base with FP16 escalation).
+
     return masks
 
 
@@ -1165,6 +1363,7 @@ def run_seed_w4(
         precision_per_cycle = {}
         n_overrides = 0
         avg_bits = float("nan")
+        avg_bits_param = float("nan")
         intrapass_decisions = None
 
         if cond == "FP16":
@@ -1241,6 +1440,116 @@ def run_seed_w4(
             finally:
                 intrapass_ctrl_obj.uninstall()
 
+        elif cond == "Static-W2-l13-17":
+            # Static late-layer W2: layers 13-17 W2 every cycle, layers 1-12 W4,
+            # layer 0 + vision FP16-protected. Trial-level install; no per-cycle
+            # swap. Requires diagnostic to know n_cycles for matched-pair join.
+            if not w4_per_cycle:
+                utils.log(f"[expB-W4] WARN: {cond} needs n_cycles from diagnostic; skipping")
+                continue
+            n_cycles = len(w4_per_cycle)
+            layer_pc = _layer_param_counts(model)
+            avg_bits_param = _avg_bits_param_weighted(
+                layer_pc, early_prec="w4",
+                late_prec_per_cycle=["w2"] * n_cycles,
+            )
+            avg_bits = avg_bits_param  # no whole-model cycle precision; use param-weighted
+            n_overrides = n_cycles  # every cycle has the late demotion installed
+            t0 = time.time()
+            utils.log(
+                f"[expB-W4] {cond} seed={seed} task={task_id} ep={episode_idx} "
+                f"n_cycles={n_cycles} avg_bits_param={avg_bits_param:.2f}"
+            )
+            rec = override_rollout(
+                policy, model, ctrl,
+                suite, task_id, seed, episode_idx,
+                base_layer_range_install=(L_LATE_START, L_LATE_END, "w2"),
+                verbose=verbose,
+            )
+            utils.log(
+                f"[expB-W4] {cond} done success={rec.success} steps={rec.steps} "
+                f"wall={time.time()-t0:.1f}s"
+            )
+
+        elif cond == "Hybrid-Static-W2-AttnEnt-FP16-f50":
+            # Hybrid: layers 13-17 W2 base + bottom-50% by W4-pass l12h2-ent
+            # cycles escalated to FP16 on layers 13-17. Tests dynamic-on-static.
+            if not w4_per_cycle:
+                utils.log(f"[expB-W4] WARN: {cond} needs diagnostic; skipping")
+                continue
+            n_cycles = len(w4_per_cycle)
+            attn_w4_scores = []
+            for c in w4_per_cycle:
+                probes = c.get("attn_probes_w4", {})
+                attn_w4_scores.append(probes.get("l12h2-ent"))
+            k_late = max(0, int(round(0.5 * n_cycles)))
+            bottom_set = _topk_indices(attn_w4_scores, k_late, largest=False)
+            late_per_cycle_dict = {
+                i: ("fp16" if i in bottom_set else "w2") for i in range(n_cycles)
+            }
+            layer_pc = _layer_param_counts(model)
+            avg_bits_param = _avg_bits_param_weighted(
+                layer_pc, early_prec="w4",
+                late_prec_per_cycle=[late_per_cycle_dict[i] for i in range(n_cycles)],
+            )
+            avg_bits = avg_bits_param
+            n_overrides = sum(1 for v in late_per_cycle_dict.values() if v == "fp16")
+            t0 = time.time()
+            utils.log(
+                f"[expB-W4] {cond} seed={seed} task={task_id} ep={episode_idx} "
+                f"|fp16_escalations|={n_overrides}/{n_cycles} "
+                f"avg_bits_param={avg_bits_param:.2f}"
+            )
+            rec = override_rollout(
+                policy, model, ctrl,
+                suite, task_id, seed, episode_idx,
+                base_layer_range_install=(L_LATE_START, L_LATE_END, "w2"),
+                late_range_per_cycle=late_per_cycle_dict,
+                verbose=verbose,
+            )
+            utils.log(
+                f"[expB-W4] {cond} done success={rec.success} steps={rec.steps} "
+                f"wall={time.time()-t0:.1f}s"
+            )
+
+        elif (
+            isinstance(masks.get(cond), dict)
+            and masks[cond].get("_kind") == "late_range"
+        ):
+            # Late-range schedules from build_masks_w4: Random-Bin-W2-l13-17-*
+            # and AttnEnt-Bin-W2-l13-17-*. Schedule shape:
+            #   {"_kind": "late_range", "default_late": "w4",
+            #    "late_per_cycle": {cycle_idx: "w2"}}
+            sched = masks[cond]
+            late_per_cycle_input = sched["late_per_cycle"]
+            default_late = sched["default_late"]
+            late_per_cycle_dict = {
+                i: late_per_cycle_input.get(i, default_late) for i in range(n_cycles)
+            }
+            layer_pc = _layer_param_counts(model)
+            avg_bits_param = _avg_bits_param_weighted(
+                layer_pc, early_prec="w4",
+                late_prec_per_cycle=[late_per_cycle_dict[i] for i in range(n_cycles)],
+            )
+            avg_bits = avg_bits_param
+            n_overrides = sum(1 for v in late_per_cycle_dict.values() if v != default_late)
+            t0 = time.time()
+            utils.log(
+                f"[expB-W4] {cond} seed={seed} task={task_id} ep={episode_idx} "
+                f"|overrides|={n_overrides}/{n_cycles} avg_bits_param={avg_bits_param:.2f}"
+            )
+            rec = override_rollout(
+                policy, model, ctrl,
+                suite, task_id, seed, episode_idx,
+                base_layer_range_install=(L_LATE_START, L_LATE_END, default_late),
+                late_range_per_cycle=late_per_cycle_dict,
+                verbose=verbose,
+            )
+            utils.log(
+                f"[expB-W4] {cond} done success={rec.success} steps={rec.steps} "
+                f"wall={time.time()-t0:.1f}s"
+            )
+
         else:
             # Override-style W4-base condition (Random-W4, AttnEntropy-W4, S1/S2-Bin/Tern-W4, Probe-W4-*)
             if cond not in masks:
@@ -1285,6 +1594,9 @@ def run_seed_w4(
             "n_overrides": int(n_overrides),
             "n_cycles": int(n_cycles),
             "condition_avg_bits": float(avg_bits) if avg_bits == avg_bits else None,
+            "condition_avg_bits_param": (
+                float(avg_bits_param) if avg_bits_param == avg_bits_param else None
+            ),
             "ternary_partition": list(ternary_partition) if cond.endswith("-Tern-W4") or cond == "S3-Tern-W4-l12h2" else None,
         }
         if intrapass_decisions is not None:
@@ -1441,13 +1753,17 @@ def analyze_w4():
 
     # ---- Overall SR table ----
     lines.append("## Overall success rate (95% bootstrap CI, n_boot=10k)\n")
-    lines.append("| Condition | n | success rate | 95% CI | avg bits |")
-    lines.append("|---|---:|---:|---|---:|")
+    lines.append("| Condition | n | success rate | 95% CI | avg bits | avg bits (param-weighted) |")
+    lines.append("|---|---:|---:|---|---:|---:|")
     avg_bits_by_cond = defaultdict(list)
+    avg_bits_param_by_cond = defaultdict(list)
     for r in rows:
         b = r.get("condition_avg_bits")
         if b is not None:
             avg_bits_by_cond[r["condition"]].append(b)
+        bp = r.get("condition_avg_bits_param")
+        if bp is not None:
+            avg_bits_param_by_cond[r["condition"]].append(bp)
     for cond in ALL_CONDITIONS:
         if cond not in by_cond:
             continue
@@ -1455,7 +1771,12 @@ def analyze_w4():
         m, lo, hi = _bootstrap_ci(vals)
         bits = avg_bits_by_cond.get(cond, [])
         bits_str = f"{np.mean(bits):.2f}" if bits else "—"
-        lines.append(f"| {cond} | {len(vals)} | {m:.3f} | [{lo:.3f}, {hi:.3f}] | {bits_str} |")
+        bits_param = avg_bits_param_by_cond.get(cond, [])
+        bits_param_str = f"{np.mean(bits_param):.2f}" if bits_param else "—"
+        lines.append(
+            f"| {cond} | {len(vals)} | {m:.3f} | [{lo:.3f}, {hi:.3f}] | "
+            f"{bits_str} | {bits_param_str} |"
+        )
 
     # ---- Per-suite SR table ----
     lines.append("\n## Per-suite success rate\n")
@@ -1511,6 +1832,15 @@ def analyze_w4():
         ("HW11b", "S3-Bin-W4-l1h7-bottom", "S3-Bin-W4-l12h2-ent", "l1h7 bottom vs l12h2 bottom — earlier layer better?"),
         ("HW11c", "S3-Tern-W4-l1h7-bottom", "S3-Tern-W4-l12h2", "l1h7 bottom ternary vs l12h2 bottom ternary"),
         ("HW11d", "S3-Tern-W4-l1h7-bottom", "W4-Floor", "l1h7 ternary vs W4-Floor (cheap-pass Pareto test)"),
+        # 2026-05-06 Path 1: static-vs-dynamic late-layer W2 comparison
+        ("HW12a", "Static-W2-l13-17", "W4-Floor", "Is layers-13-17-always-W2 safe? (spatial-restriction sanity)"),
+        ("HW12b", "AttnEnt-Bin-W2-l13-17-f50", "Random-Bin-W2-l13-17-f50", "Does AttnEntropy beat random for W2 demotion at frac=0.5?"),
+        ("HW12c", "AttnEnt-Bin-W2-l13-17-f25", "Random-Bin-W2-l13-17-f25", "AttnEnt vs Random at frac=0.25 (cheaper bits)"),
+        ("HW12d", "AttnEnt-Bin-W2-l13-17-f75", "Random-Bin-W2-l13-17-f75", "AttnEnt vs Random at frac=0.75 (more demotion)"),
+        ("HW12e", "AttnEnt-Bin-W2-l13-17-f50", "Static-W2-l13-17", "Does AttnEntropy gating beat full static demotion?"),
+        ("HW12f", "Hybrid-Static-W2-AttnEnt-FP16-f50", "Static-W2-l13-17", "Does dynamic FP16 escalation add value on top of static?"),
+        ("HW12g", "Hybrid-Static-W2-AttnEnt-FP16-f50", "S3-Tern-W4-l12h2", "Hybrid binary vs S3-Tern (existing dynamic ternary)"),
+        ("HW12h", "Static-W2-l13-17", "S3-Tern-W4-l12h2", "Static late-W2 vs S3-Tern at near-matched bits — methodological hole closure"),
     ]
     for tag, a, b, q in pairs:
         if a not in by_cond_full or b not in by_cond_full:
