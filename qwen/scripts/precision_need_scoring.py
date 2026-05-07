@@ -272,8 +272,10 @@ def _cli():
     static = aggregate_static_risk(args.diagnostic, args.num_layers, args.num_kv_heads)
     save_static_risk(static, args.out)
     print(f"[scoring] n_cal={static['n_cal']} -> {args.out}")
-    print(f"  mean_entropy_LH range: [{static['mean_entropy_LH'].nanmin():.3f}, "
-          f"{static['mean_entropy_LH'].nanmax():.3f}]")
+    valid = static["mean_entropy_LH"][~torch.isnan(static["mean_entropy_LH"])]
+    if valid.numel() > 0:
+        print(f"  mean_entropy_LH range: [{valid.min():.3f}, {valid.max():.3f}] "
+              f"(n_valid={valid.numel()}/{static['mean_entropy_LH'].numel()})")
 
 
 if __name__ == "__main__":
