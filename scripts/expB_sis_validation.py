@@ -1288,8 +1288,11 @@ def run_seed_w4(
 
     # Conditions that require the V3 W4 diagnostic (any condition that needs
     # per-cycle attention probes or per-cycle ‖a_FP - a_W4‖² targets).
+    # 2026-05-06: LATE_LAYER_W2_CONDITIONS need n_cycles from the diagnostic
+    # even though Static itself doesn't read attention; AttnEnt-Bin/Hybrid do.
     NEEDS_W4_DIAG = (
-        W4_BIN_CONDITIONS | W4_TERN_CONDITIONS | W4_PROBE_CONDITIONS | {"AttnEntropy-W4"}
+        W4_BIN_CONDITIONS | W4_TERN_CONDITIONS | W4_PROBE_CONDITIONS
+        | LATE_LAYER_W2_CONDITIONS | W4_INTRAPASS_CONDITIONS | {"AttnEntropy-W4"}
     )
     # Conditions that need an FP16 baseline rollout.
     NEEDS_FP16_BASELINE = {"FP16"}
