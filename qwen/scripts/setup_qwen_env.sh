@@ -37,6 +37,7 @@ source "$VENV_DIR/bin/activate"
 uv pip install --upgrade pip
 uv pip install \
   "torch>=2.4" \
+  "torchvision" \
   "transformers>=4.49.0,<4.55" \
   "qwen-vl-utils[decord]" \
   "accelerate>=0.30" \
