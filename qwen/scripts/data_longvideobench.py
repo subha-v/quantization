@@ -40,10 +40,12 @@ class LVBItem:
 
 # ---------------- duration bucketing ----------------
 
+# Duration buckets aligned with LongVideoBench's official duration_group field
+# (verified against lvb_val.json: groups 15/60/600/3600 with 189/172/412/564 items).
 DURATION_BUCKETS = [
-    ("short", 15, 60),
-    ("mid", 60, 180),
-    ("long", 180, 600),
+    ("short", 0, 15),
+    ("mid", 15, 60),
+    ("long", 60, 600),
     ("very_long", 600, 3600),
 ]
 STRATA_TARGETS = {"short": 50, "mid": 50, "long": 100, "very_long": 100}  # 300 total
