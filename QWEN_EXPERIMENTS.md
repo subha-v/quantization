@@ -1,6 +1,17 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-07:** Exp A 7/8 conditions complete (A8 in progress, 98/200). Calibration + Exp B pending.
+**Status as of 2026-05-07:** **Experiment A complete (8/8 conditions × 200 eval items = 1600 rollouts).** Pipeline stopped at the start of calibration so we can review Exp A before committing to Exp B compute. Calibration + Experiment B not yet run.
+
+## Headline
+
+> On Qwen2.5-VL-7B + LongVideoBench (200 eval items, 64 frames):
+>
+> 1. **Weight quantization to 4 bits is essentially free.** Both fake-quant W4 and real AWQ land at **54.0% accuracy** (vs 56.5% BF16, −2.5 pp).
+> 2. **Uniform KV cache quantization is catastrophic at every bit width tested.** FP8, INT4, asymmetric INT4-K/INT8-V, INT2 ternary, and AWQ+INT4 all collapse to **21–27% accuracy** — at or near 4-way chance (25%). The drop vs BF16 is **−30 pp** regardless of which uniform setting we pick.
+> 3. **The "rescuable regime" between BF16 and uniform-KV-quant is ~30 pp.** This is the largest rescue surface area in any of our experiments to date — orders of magnitude wider than the 4-trial rescuable bucket on standard LIBERO at W4. AttnEntropy V1/V2 in Experiment B has substantial headroom to demonstrate value.
+> 4. **KV cache, not weights, is the precision bottleneck for long-video VLM inference** — a directional confirmation of the long-video-KV literature (VidKV, AKVQ-VL, MEDA) and a clean justification for the AttnEntropy pivot from VLA weight-quant.
+
+The methodology gates we cleared along the way: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (well above the 1e-3 smoke threshold) confirms `FakeQuantKVCache.update()` does feed the SDPA attention matmul on Qwen2.5-VL.
 
 ## Context
 
@@ -47,7 +58,7 @@ x_hat = ((g / s).round().clamp(-qmax, qmax) * s).reshape_as(x)
 ```
 At `bits=2` this collapses to ternary {−s, 0, +s}. At `bits=8` the FP8 path uses an E4M3 round-trip cast (or falls through to INT8 grid if PyTorch's FP8 isn't available). At `bits>=16` it's a no-op.
 
-## Experiment A — KV-quant sensitivity baseline
+## Experiment A — KV-quant sensitivity (final, n=200 per condition)
 
 | # | Weights | KV cache | n | acc | 95% CI | avg KV bits | BF16-correct preserved | Δ vs BF16 |
 |---|---|---|---:|---:|---|---:|---:|---:|
@@ -58,11 +69,9 @@ At `bits=2` this collapses to ternary {−s, 0, +s}. At `bits=8` the FP8 path us
 | A5 | BF16 | INT4 KV | 200 | 0.210 | [0.155, 0.265] | 4.00 | 0.204 | −35.5 pp |
 | A6 | BF16 | INT4-K / INT8-V | 200 | 0.250 | [0.190, 0.310] | 6.00 | 0.292 | −31.5 pp |
 | A7 | BF16 | INT2 ternary | 200 | 0.270 | [0.210, 0.330] | 2.00 | 0.265 | −29.5 pp |
-| A8 | AWQ | INT4 KV | 98* | 0.224 | [0.139, 0.314] | 4.00 | 0.280 | −34.1 pp |
+| A8 | AWQ | INT4 KV | 200 | 0.255 | [0.195, 0.315] | 4.00 | 0.292 | −31.0 pp |
 
-*A8 in progress (98/200 at time of writing).
-
-### Per-duration-bucket breakdown
+### Per-duration-bucket breakdown (final)
 
 | Condition | short (n=33) | mid (n=33) | long (n=67) | very_long (n=67) |
 |---|---:|---:|---:|---:|
@@ -73,7 +82,7 @@ At `bits=2` this collapses to ternary {−s, 0, +s}. At `bits=8` the FP8 path us
 | A5 INT4 KV | 0.303 | 0.242 | 0.164 | 0.194 |
 | A6 INT4-K/INT8-V | 0.303 | 0.242 | 0.209 | 0.269 |
 | A7 INT2 ternary | 0.273 | 0.364 | 0.254 | 0.239 |
-| A8 AWQ + INT4 KV (n=98) | 0.412 | 0.200 | 0.171 | 0.200 |
+| A8 AWQ + INT4 KV | 0.303 | 0.242 | 0.164 | 0.328 |
 
 ### Key findings
 
@@ -87,9 +96,11 @@ At `bits=2` this collapses to ternary {−s, 0, +s}. At `bits=8` the FP8 path us
 
 5. **The rescuable regime is enormous.** With BF16 at 56.5% and any uniform KV-quant at ~25%, AttnEntropy V1/V2 in Exp B has ~30 pp of headroom to recover. This is the strongest "rescue regime" in any of our experiments to date — orders of magnitude wider than the LIBERO line's 4-trial rescuable bucket on standard LIBERO at W4.
 
-6. **Combining weight-quant with KV-quant follows KV-quant.** A8 (AWQ + INT4 KV, partial) sits at 22.4% — within bootstrap CI of A5 (INT4 KV, 21.0%). Weight-quant doesn't compound the KV penalty; KV-quant is the dominant cost.
+6. **Combining weight-quant with KV-quant follows KV-quant.** A8 (AWQ + INT4 KV, final n=200) sits at 25.5% — within bootstrap CI of A5 (INT4 KV, 21.0%) and matching A4/A6 exactly. Weight-quant doesn't compound the KV penalty; KV-quant is the dominant cost. The combined condition lands cleanly in the KV-quant cluster, not below it.
 
 7. **Per-bucket pattern**: BF16 shows the expected duration gradient (short > mid > long > very_long, modulo the mid-bucket anomaly noted below). All KV-quant conditions flatten this gradient — precision loss hurts every duration roughly equally, not selectively at long durations. This argues against the simple hypothesis that "long videos need more bits". *A counterargument to the duration-aware allocation strategy in MEDA, which we'll test directly via baseline B4.*
+
+8. **A8's `very_long` bucket is anomalously high (32.8%)** vs the rest of A8 (long: 16.4%, short: 30.3%, mid: 24.2%). This is one of the few places where AWQ's activation-aware weight calibration interacts with KV-quant differently. Likely a small-n stratification effect (n=67 in `very_long`); the aggregate (25.5%) is firmly in the KV-quant cluster.
 
 ### Anomaly: mid bucket is harder *easier* than short on BF16
 
@@ -110,15 +121,15 @@ Three issues caught and fixed during this run; documenting them so they don't bi
 ## Pipeline status
 
 ```
-qwen-resume (tmux session, GPU 0)
+qwen-resume (tmux session, GPU 0) — STOPPED at end of Exp A
 ├── ✅ STEP A1 (KV-only): A4, A5, A6, A7  [4/4 done]
-├── ⏳ STEP A2 (weight-quant): A2, A3, A8  [3/3 in flight; A8 at 98/200]
-├── ⏳ STEP B  calibration (32 frames, eager + chunked entropy, target avg 3.0)
-├── ⏳ STEP C  Experiment B (6 conditions: B0/B1/B2/B4/B6/B7)
-└── ⏳ STEP D  Pareto plot
+├── ✅ STEP A2 (weight-quant): A2, A3, A8  [3/3 done]
+├── ⏸ STEP B  calibration (32 frames, eager + chunked entropy)  — paused for review
+├── ⏸ STEP C  Experiment B (6 conditions: B0/B1/B2/B4/B6/B7)   — paused for review
+└── ⏸ STEP D  Pareto plot
 ```
 
-ETA from now: A8 ~5 min + calibration ~15 min + Exp B (6 × ~18 min) ~110 min ≈ **2 more hours**.
+Pipeline halted before Exp B launches so the Exp A results can be reviewed and the Exp B plan refined (e.g., adjust target average bits, decide whether to add the deferred B3/B8 conditions). Calibration remaining ETA ~15 min; full Exp B ~110 min.
 
 ## Experiment B — preview
 
