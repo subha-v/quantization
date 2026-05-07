@@ -135,10 +135,11 @@ def score_item(
         )
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
-    answer_ids = answer_token_ids(processor)
+    n_options = len(item.candidates)
+    answer_ids = answer_token_ids(processor, n=n_options)
     first_logits = out.scores[0]  # [1, vocab]
     logprobs = torch.log_softmax(first_logits.float(), dim=-1)[0, answer_ids].tolist()
-    pred = int(max(range(4), key=lambda i: logprobs[i]))
+    pred = int(max(range(n_options), key=lambda i: logprobs[i]))
 
     return ScoreResult(
         item_id=item.id,

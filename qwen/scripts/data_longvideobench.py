@@ -103,13 +103,18 @@ def _normalize(rec: dict, root: Path) -> Optional[LVBItem]:
     if bucket is None:
         return None
     cand = rec.get("candidates") or rec.get("options") or rec.get("choices")
-    if cand is None or len(cand) != 4:
+    # LongVideoBench has 3-, 4-, and 5-way MCQ items (verified against lvb_val.json:
+    # 4 cands -> 353, 5 cands -> 983, 3 cands -> 1). Accept any in [2, 5].
+    if cand is None or not (2 <= len(cand) <= 5):
         return None
     correct = rec.get("correct_choice", rec.get("answer", rec.get("label")))
     if correct is None:
         return None
     if isinstance(correct, str):
-        correct = "ABCD".index(correct.strip().upper())
+        correct = "ABCDE".index(correct.strip().upper())
+    correct = int(correct)
+    if not (0 <= correct < len(cand)):
+        return None
     return LVBItem(
         id=rid,
         video_path=str(vid_path),
@@ -117,7 +122,7 @@ def _normalize(rec: dict, root: Path) -> Optional[LVBItem]:
         duration_bucket=bucket,
         question=str(rec.get("question") or ""),
         candidates=[str(c) for c in cand],
-        correct_choice=int(correct),
+        correct_choice=correct,
         subtitle_path=rec.get("subtitle_path"),
         raw=rec,
     )
@@ -180,7 +185,7 @@ def filter_items(items: list[LVBItem], ids: list[str]) -> list[LVBItem]:
 
 # ---------------- prompt formatting ----------------
 
-OPTION_LETTERS = ["A", "B", "C", "D"]
+OPTION_LETTERS = ["A", "B", "C", "D", "E"]
 
 
 def format_mcq_messages(item: LVBItem, n_frames: int, max_pixels: int = 360 * 420) -> list[dict]:
@@ -188,11 +193,15 @@ def format_mcq_messages(item: LVBItem, n_frames: int, max_pixels: int = 360 * 42
 
     Returns a single-turn user message with one video + the question prompt.
     The processor + qwen_vl_utils.process_vision_info handle the rest.
+    Supports any 2-5-way MCQ (LongVideoBench has both 4- and 5-way items).
     """
-    options_text = "\n".join(f"{letter}. {cand}" for letter, cand in zip(OPTION_LETTERS, item.candidates))
+    n = len(item.candidates)
+    letters = OPTION_LETTERS[:n]
+    options_text = "\n".join(f"{letter}. {cand}" for letter, cand in zip(letters, item.candidates))
+    letter_list = ", ".join(letters)
     user_text = (
         f"{item.question}\n\nOptions:\n{options_text}\n\n"
-        f"Answer with a single letter from A, B, C, D."
+        f"Answer with a single letter from {letter_list}."
     )
     return [
         {
@@ -210,15 +219,15 @@ def format_mcq_messages(item: LVBItem, n_frames: int, max_pixels: int = 360 * 42
     ]
 
 
-def answer_token_ids(processor) -> list[int]:
-    """Resolve the single-token IDs for 'A', 'B', 'C', 'D' under Qwen2.5-VL's tokenizer.
+def answer_token_ids(processor, n: int = 5) -> list[int]:
+    """Resolve single-token IDs for the first n option letters (default 5: A..E).
 
-    Falls back to encoding ' A', ' B', ' C', ' D' if the bare letter is multi-token
-    (Qwen tokenizers usually map 'A' to a single token, but we don't trust it).
+    Falls back to encoding ' <letter>' if the bare letter is multi-token (Qwen
+    tokenizers usually map 'A' to a single token, but we don't trust it).
     """
     tok = processor.tokenizer
     ids: list[int] = []
-    for letter in OPTION_LETTERS:
+    for letter in OPTION_LETTERS[:n]:
         for cand in (letter, " " + letter):
             tids = tok.encode(cand, add_special_tokens=False)
             if len(tids) == 1:
