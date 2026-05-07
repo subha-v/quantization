@@ -4,6 +4,12 @@ Shared MCQ scorer for Qwen2.5-VL on LongVideoBench.
 Loads model + processor (BF16 weights or AWQ), runs prefill with the supplied
 FakeQuantKVCache, scores the four answer-token logits, returns prediction +
 per-sample diagnostics. Writes per-sample JSONL to results/.
+
+Per-item progress is flushed to stdout every `--progress-every` items (default
+10) with running accuracy + ETA. The `summary_callback` (set by drivers) is
+invoked every `--summary-every` items (default 25) so summary.md stays current
+while a long run is still going. A timestamped milestone is appended to the
+progress.log alongside the JSONL.
 """
 from __future__ import annotations
 
@@ -11,8 +17,9 @@ import json
 import time
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import torch
 
@@ -152,6 +159,14 @@ def score_item(
 
 # ---------------- batch driver ----------------
 
+def _append_progress(progress_log: Path, line: str) -> None:
+    progress_log.parent.mkdir(parents=True, exist_ok=True)
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    with open(progress_log, "a") as f:
+        f.write(f"[{ts}] {line}\n")
+        f.flush()
+
+
 def run_condition(
     model,
     processor,
@@ -165,10 +180,27 @@ def run_condition(
     avg_kv_bits: Optional[float] = None,
     entropy_hook_factory=None,
     record_logits_first_n: int = 0,
+    progress_every: int = 10,
+    summary_every: int = 25,
+    summary_callback: Optional[Callable[[Path], None]] = None,
 ) -> list[ScoreResult]:
-    """Run one condition over a list of items; append per-sample rows to out_jsonl."""
+    """Run one condition over a list of items; append per-sample rows to out_jsonl.
+
+    Periodically:
+      - prints `[condition] i/N acc=X.XXX latency=Yms ETA=Zm` every `progress_every` items
+      - calls `summary_callback(out_jsonl)` every `summary_every` items so the
+        markdown summary stays current while the run is in flight
+      - appends a timestamped milestone to <out_jsonl>.progress.log
+    """
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    progress_log = out_jsonl.with_name(out_jsonl.stem + ".progress.log")
+
+    n = len(items)
+    _append_progress(progress_log, f"START {condition} frames={n_frames} n_items={n}")
+    t_start = time.perf_counter()
     results: list[ScoreResult] = []
+    n_correct = 0
+
     with open(out_jsonl, "a") as f:
         for i, it in enumerate(items):
             r = score_item(
@@ -181,6 +213,36 @@ def run_condition(
             f.write(r.to_jsonl() + "\n")
             f.flush()
             results.append(r)
-    n_correct = sum(int(r.is_correct) for r in results)
-    print(f"[{condition}] frames={n_frames} acc={n_correct}/{len(results)}={n_correct/max(1,len(results)):.3f}")
+            n_correct += int(r.is_correct)
+
+            done = i + 1
+            if done % progress_every == 0 or done == n:
+                elapsed = time.perf_counter() - t_start
+                rate = elapsed / done
+                eta = max(0.0, rate * (n - done))
+                acc = n_correct / done
+                eta_str = str(timedelta(seconds=int(eta)))
+                line = (f"[{condition}] frames={n_frames} {done}/{n} "
+                        f"acc={acc:.3f} latency={r.latency_ms:.0f}ms "
+                        f"elapsed={timedelta(seconds=int(elapsed))} ETA={eta_str}")
+                print(line, flush=True)
+                _append_progress(progress_log, line)
+
+            if summary_callback is not None and done % summary_every == 0:
+                try:
+                    summary_callback(out_jsonl)
+                except Exception as e:
+                    _append_progress(progress_log, f"WARN summary_callback failed: {e!r}")
+
+    if summary_callback is not None:
+        try:
+            summary_callback(out_jsonl)
+        except Exception as e:
+            _append_progress(progress_log, f"WARN final summary_callback failed: {e!r}")
+
+    final_acc = n_correct / max(1, n)
+    final_line = (f"DONE {condition} frames={n_frames} acc={n_correct}/{n}={final_acc:.3f} "
+                  f"wall={timedelta(seconds=int(time.perf_counter() - t_start))}")
+    print(f"[{condition}] {final_line}", flush=True)
+    _append_progress(progress_log, final_line)
     return results

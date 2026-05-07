@@ -191,14 +191,18 @@ def run(args):
 
     for n_frames in args.frames:
         for name, controller, avg_bits, needs_hook in conditions:
-            print(f"[expB] {name} frames={n_frames} avg_bits={avg_bits:.2f}")
+            print(f"[expB] {name} frames={n_frames} avg_bits={avg_bits:.2f}", flush=True)
             hook_factory = entropy_hook if needs_hook else None
             run_condition(
                 model, processor, eval_items, n_frames=n_frames,
                 controller=controller, condition=f"{name}_frames{n_frames}",
                 model_id=args.model, out_jsonl=out_jsonl, avg_kv_bits=avg_bits,
                 entropy_hook_factory=hook_factory,
+                progress_every=args.progress_every,
+                summary_every=args.summary_every,
+                summary_callback=summarize,
             )
+            summarize(out_jsonl)
 
     summarize(out_jsonl)
 
@@ -264,6 +268,8 @@ def main():
     ap.add_argument("--conditions", nargs="+",
                     default=["B0", "B1", "B2", "B3", "B4", "B6", "B7", "B8"])
     ap.add_argument("--split_file", type=Path, default=DEFAULT_SPLIT_FILE)
+    ap.add_argument("--progress_every", type=int, default=10)
+    ap.add_argument("--summary_every", type=int, default=25)
     args = ap.parse_args()
     run(args)
 

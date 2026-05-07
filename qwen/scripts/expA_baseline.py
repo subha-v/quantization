@@ -104,7 +104,8 @@ def run(args):
                                        default_k_bits=kb, default_v_bits=vb)
             controller.set_global(k_bits=kb, v_bits=vb)
             avg_bits = avg_bits_for(kb, vb, num_layers, 4)
-            print(f"[expA] {name} frames={n_frames} kb={kb} vb={vb} avg={avg_bits:.2f}")
+            print(f"[expA] {name} frames={n_frames} kb={kb} vb={vb} avg={avg_bits:.2f}",
+                  flush=True)
             run_condition(
                 model, processor, eval_items, n_frames=n_frames,
                 controller=controller,
@@ -113,7 +114,12 @@ def run(args):
                 out_jsonl=out_jsonl,
                 avg_kv_bits=avg_bits,
                 record_logits_first_n=args.record_logits_first_n,
+                progress_every=args.progress_every,
+                summary_every=args.summary_every,
+                summary_callback=summarize,
             )
+            # Final summary regen after each (condition × frames) so file is current
+            summarize(out_jsonl)
 
     summarize(out_jsonl)
 
@@ -176,6 +182,10 @@ def main():
     ap.add_argument("--record_logits_first_n", type=int, default=0,
                     help="For the first N items per condition, record full first-token logits "
                          "(used by smoke test for the BF16-vs-INT2 logits-differ assertion).")
+    ap.add_argument("--progress_every", type=int, default=10,
+                    help="Print stdout progress + ETA every N items.")
+    ap.add_argument("--summary_every", type=int, default=25,
+                    help="Regenerate summary.md every N items so user can tail mid-run.")
     args = ap.parse_args()
     run(args)
 

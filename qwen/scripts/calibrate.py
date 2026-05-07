@@ -6,6 +6,11 @@ examples, then derives bit-allocation thresholds for V1/V2/V3 controllers
 targeting a specified average KV-bit budget. Writes a frozen JSON file under
 qwen/calibration/.
 
+Progress is logged every `--progress-every` items (default 10) with elapsed +
+ETA + running-mean per-layer entropy. Every `--snapshot-every` items (default
+25) the current per-layer entropy snapshot is dumped to
+calibration/<...>_inflight.json so the user can monitor convergence.
+
 Usage:
     python calibrate.py --model Qwen/Qwen2.5-VL-7B-Instruct \
                         --frames 64 --target_avg_bits 3.0
@@ -14,6 +19,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
@@ -98,14 +105,55 @@ def run(args):
                                     default_k_bits=16, default_v_bits=16)
     cache = FakeQuantKVCache(bf16_controller)
 
+    inflight_path = CALIBRATION_DIR / f"thresholds_{args.model.split('/')[-1]}_avg{args.target_avg_bits:.1f}_frames{args.frames}_inflight.json"
+    inflight_path.parent.mkdir(parents=True, exist_ok=True)
+    progress_log = CALIBRATION_DIR / f"calibrate_{args.model.split('/')[-1]}_frames{args.frames}.progress.log"
+
+    def _log_line(msg):
+        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        print(f"[calibrate] {msg}", flush=True)
+        with open(progress_log, "a") as f:
+            f.write(f"[{ts}] {msg}\n"); f.flush()
+
+    _log_line(f"START n_cal={len(cal_items)} model={args.model} frames={args.frames} target_avg_bits={args.target_avg_bits}")
+    t_start = time.perf_counter()
+    n_correct = 0
+
     with entropy_hook(model, cache) as _hook:
         for i, it in enumerate(cal_items):
             r = score_item(model, processor, it, n_frames=args.frames,
                            controller=bf16_controller,
                            condition=f"cal_bf16_frames{args.frames}",
                            model_id=args.model)
-            if i % 10 == 0:
-                print(f"[calibrate] {i}/{len(cal_items)} acc-so-far={int(r.is_correct)}")
+            n_correct += int(r.is_correct)
+            done = i + 1
+            if done % args.progress_every == 0 or done == len(cal_items):
+                elapsed = time.perf_counter() - t_start
+                rate = elapsed / done
+                eta = max(0.0, rate * (len(cal_items) - done))
+                # Running mean per-layer entropy (current state of cache)
+                from attn_entropy_hook import aggregate_layer_entropy
+                running_ent = aggregate_layer_entropy(cache)
+                ent_min = float(torch.nanquantile(running_ent, 0.0))
+                ent_max = float(torch.nanquantile(running_ent, 1.0))
+                _log_line(f"{done}/{len(cal_items)} acc={n_correct/done:.3f} "
+                          f"layer_ent[min,max]=[{ent_min:.3f},{ent_max:.3f}] "
+                          f"elapsed={timedelta(seconds=int(elapsed))} "
+                          f"ETA={timedelta(seconds=int(eta))}")
+            if done % args.snapshot_every == 0:
+                from attn_entropy_hook import (
+                    aggregate_layer_entropy as _ale,
+                    aggregate_layer_head_entropy as _alhe,
+                )
+                snap = {
+                    "items_done": done,
+                    "items_total": len(cal_items),
+                    "running_acc": n_correct / done,
+                    "layer_entropy": _ale(cache).tolist(),
+                    "layer_head_entropy": _alhe(cache).tolist(),
+                }
+                with open(inflight_path, "w") as f:
+                    json.dump(snap, f, indent=2)
 
     layer_ent = aggregate_layer_entropy(cache)         # [L]
     layer_head_ent = aggregate_layer_head_entropy(cache)  # [L, num_q_heads]
@@ -155,6 +203,10 @@ def main():
     ap.add_argument("--frames", type=int, default=64)
     ap.add_argument("--target_avg_bits", type=float, default=3.0)
     ap.add_argument("--split_file", type=Path, default=DEFAULT_SPLIT_FILE)
+    ap.add_argument("--progress_every", type=int, default=10,
+                    help="Log progress every N items.")
+    ap.add_argument("--snapshot_every", type=int, default=25,
+                    help="Dump in-flight per-layer entropy snapshot every N items.")
     args = ap.parse_args()
     run(args)
 
