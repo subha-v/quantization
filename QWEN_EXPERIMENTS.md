@@ -1,17 +1,27 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-07:** **Experiment A complete (8/8 conditions × 200 eval items = 1600 rollouts).** Pipeline stopped at the start of calibration so we can review Exp A before committing to Exp B compute. Calibration + Experiment B not yet run.
+**Status as of 2026-05-07:** **Both experiments complete.** Exp A (8/8 conditions × 200 eval items) and Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits, plus B10 in flight). Total: ~3200 rollouts of routed/baseline data, plus 33,600 (item × layer × KV-head) diagnostic signal rows.
 
 ## Headline
 
-> On Qwen2.5-VL-7B + LongVideoBench (200 eval items, 64 frames):
+> **Exp A — Setup confirmed.** On Qwen2.5-VL-7B + LongVideoBench (200 eval items, 64 frames):
 >
-> 1. **Weight quantization to 4 bits is essentially free.** Both fake-quant W4 and real AWQ land at **54.0% accuracy** (vs 56.5% BF16, −2.5 pp).
-> 2. **Uniform KV cache quantization is catastrophic at every bit width tested.** FP8, INT4, asymmetric INT4-K/INT8-V, INT2 ternary, and AWQ+INT4 all collapse to **21–27% accuracy** — at or near 4-way chance (25%). The drop vs BF16 is **−30 pp** regardless of which uniform setting we pick.
-> 3. **The "rescuable regime" between BF16 and uniform-KV-quant is ~30 pp.** This is the largest rescue surface area in any of our experiments to date — orders of magnitude wider than the 4-trial rescuable bucket on standard LIBERO at W4. AttnEntropy V1/V2 in Experiment B has substantial headroom to demonstrate value.
-> 4. **KV cache, not weights, is the precision bottleneck for long-video VLM inference** — a directional confirmation of the long-video-KV literature (VidKV, AKVQ-VL, MEDA) and a clean justification for the AttnEntropy pivot from VLA weight-quant.
+> 1. **Weight quantization to 4 bits is essentially free.** Fake-quant W4 and real AWQ both at **54.0%** (BF16 = 56.5%, Δ = −2.5 pp).
+> 2. **Uniform KV cache quantization is catastrophic at every bit width tested.** FP8 / INT4 / INT4-K-INT8-V / INT2 / AWQ+INT4 all collapse to **21–27%** — at or near 4-way chance.
+> 3. **30 pp "rescuable regime"** between BF16 (56.5%) and any uniform KV-quant (~25%). The largest rescue surface area in any of our experiments.
+>
+> **Exp B Online Precision-Need Routing — NEGATIVE RESULT.** At matched avg=4 KV bits with the {INT2, BF16} tier set (16/112 BF16 blocks, 96/112 INT2 blocks):
+>
+> 4. **No routing strategy at avg=4 with {INT2, BF16} recovers above the worst uniform baseline.** Random (3 seeds), MEDA-style layer entropy, per-(layer, KV-head) StaticEntropy (both directions), per-item OnlineResidual, and the multiplicative `OnlineNeed-Static` and `OnlineNeed-AQ` controllers all land in **[19.5%, 27.0%]** — the same band as Exp A's INT2/INT4 anchors.
+> 5. **PNIG (the headline novelty metric) is NEGATIVE.** `acc(B9 OnlineNeed-Static) − max(acc(B6 StaticEntropy), acc(B8 OnlineResidual)) = 19.5 − 26.5 = −7.0 pp`. The multiplicative interaction *worsens* over its components rather than improving on them.
+> 6. **Direction of static entropy is uninformative on Qwen long-video.** B6 (low-entropy → BF16) = 24.5% vs B7 (high-entropy → BF16) = 27.0%. Direction gap = −2.5 pp; flipped is *slightly* better. Opposite of the pi0.5 W2 finding (where low entropy was the right direction with a +27 pp gap), so the directionality claim does not transfer.
+> 7. **Per-item OnlineResidual marginally beats StaticEntropy** (B8 26.5% > B6 24.5%) but the gap is ≪ bootstrap noise.
+>
+> **Diagnosis.** The 30 pp rescue gap is real, but at avg=4 with {INT2, BF16}, **86% of the cache must be at INT2**, and INT2 fundamentally breaks long-video VLM attention regardless of which 14% gets BF16 protection. The bottleneck is not which blocks to route to BF16 — it's that uniform INT2 alone is unrecoverably destructive in this model.
+>
+> **Implications for next steps.** The next step is *not* more routing. It's a richer tier set (e.g., {INT2, INT4, BF16} so 70%+ of the cache can sit at INT4 instead of INT2), or a stronger K/V quantizer baseline (KIVI-style per-channel K + per-token V; AKVQ-VL outlier reduction). Once uniform-INT4 is no longer at chance, routing to {INT4, BF16} or {INT2, INT4, BF16} can be revisited.
 
-The methodology gates we cleared along the way: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (well above the 1e-3 smoke threshold) confirms `FakeQuantKVCache.update()` does feed the SDPA attention matmul on Qwen2.5-VL.
+The methodology gates: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (smoke threshold 1e-3) — `FakeQuantKVCache.update()` feeds the SDPA matmul as designed. Diagnostic pass produces 0 NaN entropy/residual rows on 33,600 (item × L × H) signals; `bf16_pred ≠ uniform_int2_pred` on 90%+ of items, confirming the routing decisions are operating on real signal.
 
 ## Context
 
@@ -118,51 +128,136 @@ Three issues caught and fixed during this run; documenting them so they don't bi
 
 4. **Chunked entropy computation** to avoid OOM during calibration: `_entropy_from_attn` now chunks over the query dim and accumulates a `[H]` FP32 buffer instead of materializing the full `[B, H, Q, K]` FP32 tensor (~3 GB at H=28, Q=K=3000).
 
+## Experiment B — Online Precision-Need Routing (final, 2026-05-07)
+
+After Exp A established the rescue gap, Experiment B was rewritten from the original static V1/V2 plan to test the online-precision-need hypothesis directly:
+
+> `precision_need = semantic/query importance × quantization difficulty`
+>
+> Given a specific input video, can we identify which KV blocks are both important for the current answer and hard to quantize, and spend BF16 precision only there?
+
+### Setup
+
+- **Tier set:** {INT2, BF16}. FP8 dropped (Exp A's A4 collapsed to chance, so it's not a reliable rescue tier in our fake-quant impl).
+- **Granularity:** layer × KV-head (V2). Qwen2.5-VL-7B has 28 × 4 = 112 blocks.
+- **Budget:** target avg = 4 KV bits → `p_BF16 = (4 − 2) / (16 − 2) = 14.3%` → **16 of 112 blocks at BF16, 96 at INT2**.
+- **Architecture (two-pass per item):**
+  1. **Diagnostic pass** (BF16 + eager attention) on 100 cal + 200 eval items at 64 frames. Captures per-(layer, KV-head): `entropy_mean` (over all queries), `entropy_answer_query` (last query position), `aq_topk_mass` (top-32 mass at last query), `kv_residual_int2` (Frobenius residual ‖K − Q2(K)‖_F / ‖K‖_F under simulated INT2). Also runs uniform INT4 / INT2 forwards to bake `bf16_pred`, `uniform_int4_pred`, `uniform_int2_pred` into the JSONL.
+  2. **Routed eval pass** (SDPA, fast). For each (condition, item), compute per-(layer, KV-head) score → top-16 → BF16, rest → INT2 → V2 BitController → score the MCQ.
+- **Split safety:** `StaticEntropyRisk` aggregated from cal-rows only (`split == "cal"` assert in `aggregate_static_risk`); eval signals used only as per-item online inputs.
+
+### Conditions
+
+All routed conditions allocate exactly 16 of 112 (L, h) blocks to BF16. Same 200 eval items as Exp A.
+
+| ID | Method | Score per (L, h) | Source |
+|---|---|---|---|
+| A1 reused | BF16 KV (ceiling) | — | Exp A |
+| A5 reused | Uniform INT4 KV (matched-avg anchor) | — | Exp A |
+| A7 reused | Uniform INT2 KV (floor) | — | Exp A |
+| B2 | Random-V2 (3 seeds) | random | per-seed |
+| B4 | MEDA-style layer entropy | layer-mean entropy → top-4 layers BF16 | cal |
+| B6 | StaticEntropy-V2 | percentile_rank(−mean entropy) (low → BF16) | cal |
+| B7 | FlippedEntropy-V2 (symmetry control) | percentile_rank(+mean entropy) (high → BF16) | cal |
+| B8 | OnlineResidual-V2 | kv_residual_int2 | per-eval-item |
+| B9 | **OnlineNeed-Static-V2** | percentile_rank(static_low) × percentile_rank(residual) | cal × per-item |
+| B10 | **OnlineNeed-AQ-V2** | percentile_rank(−aq_topk_mass) × percentile_rank(residual) | per-item |
+
+### Results (n=200 per condition; A1/A5/A7 reused from Exp A)
+
+| ID | Condition | n | acc | 95% CI | avg KV bits | BF16-pres | flip-rec INT4 | flip-rec INT2 | damage |
+|---|---|---:|---:|---|---:|---:|---:|---:|---:|
+| A1 | BF16 (ceiling) | 200 | **0.565** | [0.495, 0.635] | 16.00 | 1.000 | — | — | — |
+| A5 | Uniform INT4 | 200 | 0.210 | [0.155, 0.265] | 4.00 | 0.204 | — | — | — |
+| A7 | Uniform INT2 | 200 | 0.270 | [0.210, 0.330] | 2.00 | 0.265 | — | — | — |
+| B2 | Random seed=0 | 200 | 0.255 | [0.195, 0.320] | 4.00 | 0.260 | 0.253 (n=83) | 0.244 (n=78) | 0.706 (n=17) |
+| B2 | Random seed=1 | 200 | 0.200 | [0.145, 0.255] | 4.00 | 0.260 | 0.265 (n=83) | 0.205 (n=78) | 0.765 (n=17) |
+| B2 | Random seed=2 | 200 | 0.245 | [0.185, 0.305] | 4.00 | 0.210 | 0.181 (n=83) | 0.128 (n=78) | 0.647 (n=17) |
+| B4 | MEDA-style layer entropy | 199 | 0.236 | [0.181, 0.291] | 4.00 | 0.182 | 0.220 (n=82) | 0.156 (n=77) | 1.000 (n=17) |
+| B6 | StaticEntropy-V2 (low → BF16) | 200 | 0.245 | [0.185, 0.310] | 4.00 | 0.310 | 0.337 (n=83) | 0.333 (n=78) | 0.824 (n=17) |
+| B7 | FlippedEntropy-V2 (high → BF16) | 200 | 0.270 | [0.210, 0.330] | 4.00 | 0.300 | 0.301 (n=83) | 0.269 (n=78) | 0.706 (n=17) |
+| B8 | OnlineResidual-V2 | 200 | 0.265 | [0.205, 0.330] | 4.00 | 0.280 | 0.289 (n=83) | 0.282 (n=78) | 0.765 (n=17) |
+| **B9** | **OnlineNeed-Static-V2** | 200 | **0.195** | [0.140, 0.250] | 4.00 | 0.210 | 0.229 (n=83) | 0.192 (n=78) | 0.882 (n=17) |
+| **B10** | **OnlineNeed-AQ-V2** | 200 | **0.210** | [0.150, 0.270] | 4.00 | 0.200 | 0.193 (n=83) | 0.167 (n=78) | 0.765 (n=17) |
+
+### Headline metrics
+
+| Metric | Formula | Value |
+|---|---|---:|
+| BF16 ceiling | acc(A1) | 0.565 |
+| Uniform INT4 anchor (matched avg=4) | acc(A5) | 0.210 |
+| Random mean (B2 ×3 seeds) | mean over seeds | 0.233 |
+| Static-vs-random gap | acc(B6) − mean(B2) | +1.2 pp |
+| **Direction gap** | acc(B6) − acc(B7) | **−2.5 pp** *(flipped slightly better — opposite of pi0.5)* |
+| OnlineResidual-vs-static | acc(B8) − acc(B6) | +2.0 pp |
+| **OCG** (online conditioning gain) | acc(B9) − acc(B6) | **−5.0 pp** |
+| **PNIG** (precision-need interaction gain) | acc(B9) − max(acc(B6), acc(B8)) | **−7.0 pp** |
+| **AQ-vs-Static interaction** | acc(B10) − acc(B9) | **+1.5 pp** *(answer-query-driven routing slightly less destructive than static-entropy-driven, but both worst overall)* |
+| Best routed acc | max over B2-B10 | 0.270 (B7 FlippedEntropy) |
+| Worst routed acc | min over B2-B10 | 0.195 (B9 OnlineNeed-Static) |
+
+### Diagnosis
+
+The 30 pp rescue gap (BF16 56.5% → uniform INT4/INT2 ~25%) is real, but at avg=4 with the {INT2, BF16} tier set:
+- **86% of the cache must be at INT2** (96/112 blocks), and INT2 is unrecoverable for long-video VLM attention regardless of which 14% gets BF16 protection.
+- All 8 routed conditions land in [19.5%, 27.0%] — within the bootstrap CI of A5 (INT4) and A7 (INT2).
+- The multiplicative interaction (B9, B10) doesn't help and slightly hurts — selecting blocks that are "important AND hard to quantize" concentrates BF16 in a tight subset that doesn't compensate for the 86% INT2 floor.
+- StaticEntropy direction is uninformative (B6 ≈ B7 within noise), so the pi0.5 W2 directionality (low entropy → high sensitivity) does not transfer.
+- BF16-correct preservation across routed conditions: 0.182–0.310. Even the best preservation (B6/B7 at 0.30+) means 70% of BF16-correct items still flip wrong under the routed quantization — confirming that 96/112 INT2 blocks corrupt attention enough to break most originally-correct answers.
+
+### Implication for next steps
+
+Not "smarter routing" — **a richer tier set or stronger baseline quantizer**.
+
+1. **Richer tier set: {INT2, INT4, BF16}.** At avg=4 with this set, most blocks can sit at INT4 (which already collapses but is *less* destructive per-block than INT2), and a small fraction at BF16. Preliminary expectation: if INT4-anchored routing recovers some accuracy, the routing signal becomes meaningful — not because the signals improved, but because the floor is no longer at chance.
+2. **KIVI-style asymmetric K/V layout.** Per-channel K + per-token V (currently we use per-channel along head_dim for both). The KIVI paper reports this matters for video-LLMs.
+3. **AKVQ-VL-style outlier reduction.** The catastrophic INT2/INT4 collapse on Qwen2.5-VL+long-video may be driven by post-RoPE K-channel outliers; standard outlier-aware static methods are documented to recover most of that gap.
+
+The Exp B framework, signals, and metrics are reusable: once a less-destructive baseline quantizer is in place, drop it into `fake_quantize_kv` and re-run `run_expB_online.sh` — same diagnostic JSONL, same routing logic, same summary table.
+
+## Methodological lessons learned (cumulative)
+
+1. **`torch>=2.10` ships CUDA-13 wheels that silently fall back to CPU on driver 12.6.** Pinned to `torch==2.5.1+cu124`. Calibration "completed" in 7 seconds the first time because the model was on CPU.
+2. **Qwen2.5-VL's SDPA forward returns `attn_weights=None` regardless of `output_attentions=True`.** The kwarg is vestigial. Diagnostic pass loads with `attn_implementation="eager"` to capture attention weights.
+3. **Memory hygiene under co-tenant pressure.** A1 finished cleanly then A2 OOM'd 7 seconds later (cumulative cache fragmentation). Added `gc.collect() + torch.cuda.empty_cache()` every 5 items inside `run_inference.run_condition`. Also wrote in-place `fake_quantize_weights_w4` (no `saved` clone) to avoid a 28 GB peak during the swap.
+4. **Chunked entropy for long sequences.** `_entropy_from_attn` chunks over the query dim; full FP32 attention tensor at H=28, Q=K=3000 is ~3 GB and OOMs under tlandeg's 50 GB co-tenant. Chunked accumulator is ~86 MB.
+5. **Eval-leakage discipline in routing experiments.** `aggregate_static_risk` hard-asserts `split == "cal"`. Easy to get wrong; should always be a code-level invariant.
+6. **Auto-detect `(num_layers, num_kv_heads)` from the loaded model** rather than CLI defaults — Qwen2.5-VL-3B is 36×2, Qwen2.5-VL-7B is 28×4, and a hardcoded default silently corrupts the V2 BitController shape on the wrong model.
+
 ## Pipeline status
 
 ```
-qwen-resume (tmux session, GPU 0) — STOPPED at end of Exp A
-├── ✅ STEP A1 (KV-only): A4, A5, A6, A7  [4/4 done]
-├── ✅ STEP A2 (weight-quant): A2, A3, A8  [3/3 done]
-├── ⏸ STEP B  calibration (32 frames, eager + chunked entropy)  — paused for review
-├── ⏸ STEP C  Experiment B (6 conditions: B0/B1/B2/B4/B6/B7)   — paused for review
-└── ⏸ STEP D  Pareto plot
+qwen-expB-online (tmux session, GPU 0) — PIPELINE COMPLETE (4h 8min total)
+├── ✅ STEP 1  diagnostic pass on cal+eval (33 + 66 min, eager attention)
+├── ✅ STEP 2  static_entropy_risk aggregated from cal-only (n_cal=100, 2 sec)
+├── ✅ STEP 3  routed eval — 8 of 8 routed conditions complete (B2 ×3, B4, B6, B7, B8, B9; ~17 min each)
+└── ✅ STEP 4  B10 OnlineNeed-AQ (diagnostic upper bound, 13:46)
 ```
-
-Pipeline halted before Exp B launches so the Exp A results can be reviewed and the Exp B plan refined (e.g., adjust target average bits, decide whether to add the deferred B3/B8 conditions). Calibration remaining ETA ~15 min; full Exp B ~110 min.
-
-## Experiment B — preview
-
-Will run after Exp A finishes. Tests at matched ~3 avg KV bits:
-
-| # | Method | Granularity |
-|---|---|---|
-| B0 | Uniform INT4 (4 bits) | — (Pareto anchor) |
-| B1 | Uniform INT2 (2 bits) | — (Pareto anchor) |
-| B2 | Random mixed INT2/INT4 → ~3 avg | layer (3 seeds) |
-| B4 | MEDA-style entropy bit budget | layer |
-| **B6** | **AttnEntropy V1** | **per-layer**, tertile-binned to {2, 4, 8} bits |
-| **B7** | **AttnEntropy V2** | **per-(layer, KV-head)**, tertile-binned |
-
-**B3 (attention-mass token protection) and B8 (V3 token-level)** are deferred — they require live attention weights during evaluation, which Qwen2.5-VL's SDPA backend doesn't expose. A v2 round will plumb eager attention through `expB_attnentropy.py` to enable them.
-
-### Success criterion (Exp B)
-
-At matched avg ≈ 3 KV bits, AttnEntropy V1 (B6) and V2 (B7) must:
-1. Pareto-dominate (a) Uniform INT4 (B0) and Uniform INT2 (B1), (b) Random mixed (B2), (c) MEDA-style entropy bit budget (B4).
-2. Recover a substantial fraction of the 30 pp BF16-vs-uniform-quant gap. Even partial recovery (e.g., reaching 35% from 25% baseline at avg=3 bits) would be a real result given the unprecedentedly large rescue surface area on this benchmark.
 
 ## Files of record
 
-- `qwen/scripts/fake_quant_kv_cache.py` — `BitController` + `FakeQuantKVCache` (the core primitive)
-- `qwen/scripts/run_inference.py` — MCQ scorer with progress logging + memory hygiene
-- `qwen/scripts/expA_baseline.py` — Experiment A driver (8 conditions × 200 eval items)
-- `qwen/scripts/expB_attnentropy.py` — Experiment B driver
-- `qwen/scripts/calibrate.py` — calibration with eager attention + chunked entropy
-- `qwen/scripts/run_resume.sh` — resume orchestrator after the OOM
-- `qwen/results/expA_rollouts_Qwen2.5-VL-7B-Instruct.jsonl` — 1498 rollouts so far (8 conditions × 200 items, A8 partial)
-- `qwen/results/expA_summary_Qwen2.5-VL-7B-Instruct.md` — auto-regenerated summary table
-- `qwen/calibration/split_seed0.json` — frozen 100/200 split
-- `EXPERIMENT_FINDINGS.md` — pi0.5/LIBERO findings + Path 1 interim n=64 results
+**Core primitives:**
+- `qwen/scripts/fake_quant_kv_cache.py` — `BitController` (V1/V2 modes) + `FakeQuantKVCache` (DynamicCache subclass with per-(layer, KV-head) bit assignment).
+- `qwen/scripts/run_inference.py` — MCQ scorer + memory hygiene every 5 items.
+- `qwen/scripts/diagnostic_pass.py` — `DiagnosticCache` + `DiagnosticAttentionHook` + 3-forward-per-item diagnostic with reference predictions.
+- `qwen/scripts/precision_need_scoring.py` — `aggregate_static_risk` (cal-only assertion), `compute_score` for 7 methods, `top_k_mask`, `bits_from_mask`.
+- `qwen/scripts/expB_online.py` — Exp B online routing driver with auto-detection of model dims.
+- `qwen/scripts/run_expB_online.sh` — orchestrator (diagnostic → static aggregate → routed eval).
+- `qwen/scripts/smoke_expB_online.sh` — 3B + 5 cal/eval items + 32 frames smoke with hard assertions.
 
-Plan: `/Users/subha/.claude/plans/you-can-make-a-parallel-crown.md`.
+**Drivers (Exp A):**
+- `qwen/scripts/expA_baseline.py` — 8-condition KV-quant sensitivity.
+- `qwen/scripts/run_resume.sh` — orchestrator that cleanly recovered from the A1→A2 OOM.
+
+**Results:**
+- `qwen/results/expA_rollouts_Qwen2.5-VL-7B-Instruct.jsonl` — 1600 rollouts (8 × 200).
+- `qwen/results/expA_summary_Qwen2.5-VL-7B-Instruct.md` — Exp A summary.
+- `qwen/results/diagnostic_signals.jsonl` — 33,600 (item × layer × KV-head) signal rows (300 items × 28 × 4).
+- `qwen/results/expB_online_rollouts.jsonl` — ~1600 routed rollouts (8 conditions × 200 items).
+- `qwen/results/expB_online_summary.md` — Exp B summary table.
+- `qwen/calibration/split_seed0.json` — frozen 100/200 stratified split.
+- `qwen/calibration/static_entropy_risk.json` — frozen cal-only static entropy maps (low + high direction).
+
+**Cross-experiment references:**
+- `EXPERIMENT_FINDINGS.md` — pi0.5/LIBERO findings + Path 1 interim n=64 results.
+- Plan: `/Users/subha/.claude/plans/you-can-make-a-parallel-crown.md`.
