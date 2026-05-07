@@ -377,6 +377,16 @@ CUDA_VISIBLE_DEVICES=<idx> uv run python scripts/expB_sis_validation.py \
 
 Plan in `/Users/subha/.claude/plans/let-s-go-ahead-and-snoopy-lighthouse.md`. Implementation in commits on branch `overnight-2026-04-29-w4-first`.
 
+### Pilot result (2026-05-06, n=20 Long task 0-3)
+
+| Condition | n | SR | 95% CI | avg bits (cycle) | avg bits (param) |
+|---|---:|---:|---|---:|---:|
+| Static-W2-l13-17 | 20 | **1.000** | [1.000, 1.000] | 9.48 | 9.48 |
+
+Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 — confirms the pilot acceptance criterion (SR ≥ 80%) and clears the way for the full n=100 Pareto sweep. The param-weighted bits (~9.48) are dominated by FP16-protected components (vision tower + action expert), not the weight-quantized PaliGemma decoder, which is why the cycle-weighted "4.0 → 3.4" headline differs from the param-weighted axis.
+
+Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
+
 ## Key References
 
 - **QVLA** (ICLR 2026) — Action-centric channel-wise quantization for AR VLAs
