@@ -27,11 +27,16 @@ if [ ! -f "$THRESH_FILE" ]; then
   python calibrate.py --model "$MODEL" --frames "${FRAMES%% *}" --target_avg_bits "$TARGET_AVG"
 fi
 
-echo "[main] Experiment A: 8 conditions × frames=$FRAMES"
-python expA_baseline.py --model "$MODEL" --frames $FRAMES
+PROGRESS_EVERY="${MAIN_PROGRESS:-10}"
+SUMMARY_EVERY="${MAIN_SUMMARY_EVERY:-25}"
+
+echo "[main] Experiment A: 8 conditions × frames=$FRAMES (progress every $PROGRESS_EVERY items, summary every $SUMMARY_EVERY)"
+python expA_baseline.py --model "$MODEL" --frames $FRAMES \
+    --progress_every "$PROGRESS_EVERY" --summary_every "$SUMMARY_EVERY"
 
 echo "[main] Experiment B: 9 conditions @ avg=$TARGET_AVG × frames=$FRAMES"
-python expB_attnentropy.py --model "$MODEL" --frames $FRAMES --target_avg_bits "$TARGET_AVG"
+python expB_attnentropy.py --model "$MODEL" --frames $FRAMES --target_avg_bits "$TARGET_AVG" \
+    --progress_every "$PROGRESS_EVERY" --summary_every "$SUMMARY_EVERY"
 
 # Pareto plot uses both expA and expB JSONLs at the larger frame budget
 PLOT_FRAMES="${FRAMES##* }"
