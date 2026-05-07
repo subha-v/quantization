@@ -92,7 +92,21 @@ def percentile_rank(scores: torch.Tensor) -> torch.Tensor:
 # Static-risk aggregation (cal only — eval leakage guard)
 # ===================================================================
 
-def aggregate_static_risk(diagnostic_path: Path, num_layers: int, num_kv_heads: int) -> dict:
+def infer_dims_from_jsonl(diagnostic_path: Path) -> tuple[int, int]:
+    """Returns (num_layers, num_kv_heads) inferred from max(layer)+1 / max(kv_head)+1 in the JSONL."""
+    max_L, max_h = 0, 0
+    with open(diagnostic_path) as f:
+        for line in f:
+            line = line.strip()
+            if not line: continue
+            r = json.loads(line)
+            max_L = max(max_L, int(r.get("layer", 0)))
+            max_h = max(max_h, int(r.get("kv_head", 0)))
+    return max_L + 1, max_h + 1
+
+
+def aggregate_static_risk(diagnostic_path: Path, num_layers: Optional[int] = None,
+                          num_kv_heads: Optional[int] = None) -> dict:
     """Mean per-(layer, KV-head) entropy from cal items only. Returns:
         {
           "n_cal": int,
@@ -102,6 +116,10 @@ def aggregate_static_risk(diagnostic_path: Path, num_layers: int, num_kv_heads: 
         }
     Asserts that no eval row contributes — strict split safety.
     """
+    if num_layers is None or num_kv_heads is None:
+        nL, nH = infer_dims_from_jsonl(diagnostic_path)
+        num_layers = num_layers or nL
+        num_kv_heads = num_kv_heads or nH
     sums = torch.zeros(num_layers, num_kv_heads)
     counts = torch.zeros(num_layers, num_kv_heads)
     n_cal = 0
@@ -265,8 +283,10 @@ def _cli():
     import argparse
     ap = argparse.ArgumentParser()
     ap.add_argument("--diagnostic", type=Path, required=True)
-    ap.add_argument("--num_layers", type=int, default=28)
-    ap.add_argument("--num_kv_heads", type=int, default=4)
+    ap.add_argument("--num_layers", type=int, default=None,
+                    help="Default: inferred from JSONL max(layer)+1")
+    ap.add_argument("--num_kv_heads", type=int, default=None,
+                    help="Default: inferred from JSONL max(kv_head)+1")
     ap.add_argument("--out", type=Path, required=True)
     args = ap.parse_args()
     static = aggregate_static_risk(args.diagnostic, args.num_layers, args.num_kv_heads)

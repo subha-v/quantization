@@ -353,6 +353,22 @@ def main():
     from run_inference import load_model
     model, processor = load_model(args.model, dtype="bfloat16",
                                   attn_impl="sdpa", device_map="auto")
+    # Auto-detect from model config; override the num_layers/num_kv_heads CLI defaults
+    lm = getattr(model, "language_model", None) or model.model.language_model
+    layers = lm.layers if hasattr(lm, "layers") else lm.model.layers
+    detected_num_layers = len(layers)
+    detected_num_kv_heads = getattr(model.config, "num_key_value_heads", args.num_kv_heads)
+    if detected_num_layers != args.num_layers or detected_num_kv_heads != args.num_kv_heads:
+        print(f"[expB_online] auto-detected num_layers={detected_num_layers} num_kv_heads={detected_num_kv_heads} "
+              f"(overriding args {args.num_layers}/{args.num_kv_heads})", flush=True)
+    args.num_layers = detected_num_layers
+    args.num_kv_heads = detected_num_kv_heads
+    # Re-aggregate static_risk if shape mismatches
+    if static["mean_entropy_LH"].shape != (args.num_layers, args.num_kv_heads):
+        print(f"[expB_online] static_risk shape {tuple(static['mean_entropy_LH'].shape)} != "
+              f"({args.num_layers}, {args.num_kv_heads}); re-aggregating", flush=True)
+        static = aggregate_static_risk(args.diagnostic, args.num_layers, args.num_kv_heads)
+        save_static_risk(static, args.static_risk)
 
     # 6. Run conditions
     if not args.append and args.out.exists():
