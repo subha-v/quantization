@@ -19,19 +19,27 @@ import math
 import torch
 
 
-def _entropy_from_attn(attn_weights: torch.Tensor) -> torch.Tensor:
+def _entropy_from_attn(attn_weights: torch.Tensor, chunk_size: int = 256) -> torch.Tensor:
     """attn_weights: [B, num_q_heads, q_len, k_len] -> [num_q_heads] entropy per head.
 
     Normalized by log(k_len) so values are in [0, 1] and comparable across runs.
+
+    Memory-efficient: chunks over the query dim and accumulates in FP32 so we
+    never materialize a [B, H, Q, K] FP32 tensor (which is ~3 GB at H=28, Q=K=3000).
     """
     eps = 1e-12
-    a = attn_weights.detach().float()
+    a = attn_weights.detach()
     if a.size(0) > 1:
         a = a[:1]
-    k_len = max(2, a.size(-1))
-    norm = math.log(k_len)
-    h = -(a * (a + eps).log()).sum(dim=-1).mean(dim=(0, 2)) / norm
-    return h.cpu()
+    B, H, Q, K = a.shape
+    norm = math.log(max(2, K))
+    h_acc = torch.zeros(H, dtype=torch.float32, device=a.device)
+    for q_start in range(0, Q, chunk_size):
+        q_end = min(q_start + chunk_size, Q)
+        chunk = a[:, :, q_start:q_end, :].float()  # [1, H, chunk, K]
+        ent_chunk = -(chunk * (chunk + eps).log()).sum(dim=-1)  # [1, H, chunk]
+        h_acc += ent_chunk.sum(dim=(0, 2))
+    return (h_acc / max(1, Q) / norm).cpu()
 
 
 class MultiLayerEntropyHook:
