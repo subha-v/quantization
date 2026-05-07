@@ -387,6 +387,58 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
+## Qwen2.5-VL × LongVideoBench KV-cache experiments (staged 2026-05-06)
+
+Pivot from the saturated pi0.5/LIBERO line (where `Static-W2-l13-17` already hits 100% on standard LIBERO Long, leaving no rescue gap for AttnEntropy) to **Qwen2.5-VL-7B-Instruct on LongVideoBench-val**, where the model is unsaturated (54.7%) and long-video produces thousands of visual tokens, so KV-cache precision matters. The novelty thesis shifts from "AttnEntropy rescues weight quant" to: **attention entropy can allocate per-(layer, head, token) KV-cache *precision* better than uniform / random / attention-mass / MEDA-style baselines.**
+
+New top-level folder `qwen/` with parallel infrastructure (separate from the openpi/LIBERO line):
+
+```
+qwen/
+├── README.md
+├── scripts/
+│   ├── setup_qwen_env.sh         # uv venv + transformers + qwen-vl-utils + auto-awq
+│   ├── data_longvideobench.py    # LongVideoBench-val loader, 100-cal/200-eval stratified split
+│   ├── fake_quant_kv_cache.py    # FakeQuantKVCache(DynamicCache) + BitController (V1/V2/V3)
+│   ├── attn_entropy_hook.py      # multi-layer entropy hook (port of L12H2EntropyHook)
+│   ├── run_inference.py          # 4-way MCQ logprob scorer
+│   ├── calibrate.py              # frozen layer/head/token thresholds from cal split
+│   ├── expA_baseline.py          # 8 conditions × {64,128} frame budgets
+│   ├── expB_attnentropy.py       # 9 conditions @ matched ~3 avg KV bits
+│   ├── expB_pareto_plot.py       # avg KV bits vs accuracy Pareto curve
+│   ├── run_smoke.sh              # 3B + 10 items + hard logits-differ assertion
+│   └── run_main.sh               # 7B + 200-eval + nvidia-smi gate
+├── calibration/                  # frozen thresholds JSON, per (model, target_avg_bits, frames)
+├── results/                      # per-sample JSONL + summary markdown
+└── plots/
+```
+
+### Correctness invariant (critical)
+
+For MCQ scoring with `max_new_tokens=1`, the scored logit is produced by the prefill forward pass. Quantizing K/V *only* in `cache.update()` is not always sufficient — it depends on whether the attention backend uses the value returned by `update()`. For Qwen2.5-VL's SDPA forward (transformers ≥ 4.49), the returned tensors *do* feed the SDPA matmul, so our `FakeQuantKVCache.update()` quantizing on write affects first-token logits. `run_smoke.sh` asserts this by computing `||logits_BF16 − logits_INT2||_∞` across items; the test fails loud if max-diff ≤ 1e-3. `install_explicit_kv_quant_patch()` provides a fallback for backends where the cache-return is not consumed.
+
+### Conditions
+
+**Experiment A** (8): BF16+BF16 (ceiling), W4-fakequant + BF16-KV, AWQ + BF16-KV, BF16 + FP8-KV, BF16 + INT4-KV, BF16 + INT4-K/INT8-V (asymmetric), BF16 + INT2-KV (sub-2-bit stress), AWQ + INT4-KV (combined realistic).
+
+**Experiment B** (9, matched ~3 avg KV bits): Uniform INT4 / INT2 (Pareto anchors), Random mixed (3 seeds), Attention-mass token protection, MEDA-style entropy bit-budget, **AttnEntropy V1 (layer-level)**, **AttnEntropy V2 ((layer, KV-head)-level under GQA, 4 KV-heads)**, **AttnEntropy V3 ((layer, token)-level via online attention-mass mask)**, optional Oracle (logit-KL).
+
+### Running
+
+```bash
+# On tambe-server-1 (after git pull):
+cd /data/subha2/quantization/qwen/scripts
+bash setup_qwen_env.sh
+source /data/subha2/experiments/qwen_venv/bin/activate
+
+nvidia-smi
+export CUDA_VISIBLE_DEVICES=<unused-gpu>
+bash run_smoke.sh   # MUST pass the BF16-vs-INT2 logits-differ assertion before scaling up
+bash run_main.sh
+```
+
+Plan in `/Users/subha/.claude/plans/you-can-make-a-parallel-crown.md`.
+
 ## Key References
 
 - **QVLA** (ICLR 2026) — Action-centric channel-wise quantization for AR VLAs
