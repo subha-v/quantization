@@ -63,10 +63,13 @@ python3 -u expA_baseline.py --model "$MODEL" --frames "$FRAMES" \
     2>&1 | tee -a "$PIPELINE_LOG"
 log "STEP 3 done"
 
-# Step 4: Experiment B
-log "STEP 4 starting Experiment B (9 conditions × $FRAMES frames × 200 eval items, avg=$AVG)"
+# Step 4: Experiment B (skip B3 AttnMass and B8 V3 — they need eager attention
+# at runtime for live entropy/attention-mass which is a bigger refactor; the 6
+# remaining conditions cover the headline V1/V2 vs uniform/random/MEDA Pareto)
+log "STEP 4 starting Experiment B (6 conditions × $FRAMES frames × 200 eval items, avg=$AVG)"
 python3 -u expB_attnentropy.py --model "$MODEL" --frames "$FRAMES" --target_avg_bits "$AVG" \
     --thresholds "$THRESH_FILE" \
+    --conditions B0 B1 B2 B4 B6 B7 \
     --progress_every 5 --summary_every 20 \
     2>&1 | tee -a "$PIPELINE_LOG"
 log "STEP 4 done"

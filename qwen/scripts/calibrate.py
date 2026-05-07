@@ -95,8 +95,11 @@ def run(args):
     cal_items = filter_items(items, split["cal"])
     print(f"[calibrate] cal_items={len(cal_items)} target_avg_bits={args.target_avg_bits}")
 
+    # Eager attention is required for the entropy hook to capture attn_weights.
+    # Qwen2.5-VL's SDPA path returns attn_weights=None regardless of
+    # output_attentions=True (the kwarg is vestigial in the unified attention forward).
     model, processor = load_model(args.model, awq=False, dtype="bfloat16",
-                                  attn_impl="sdpa", device_map="auto")
+                                  attn_impl="eager", device_map="auto")
     num_layers = len(getattr(getattr(model, "language_model", None), "layers",
                              getattr(model.model, "layers", [])))
     print(f"[calibrate] num_layers={num_layers}")
