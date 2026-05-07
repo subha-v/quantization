@@ -28,14 +28,23 @@ log() { echo "[$(ts)] $*" | tee -a "$LOG"; }
 log "RESUME START model=$MODEL exp_frames=$EXP_FRAMES cal_frames=$CAL_FRAMES cuda=$CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | tee -a "$LOG"
 
-# STEP A: A2..A8 with --append
-log "STEP A Experiment A resume (conditions A2..A8, --append)"
+# STEP A1: KV-only quant conditions first (no weight modifications, lowest
+#          memory footprint; safest under tlandeg's co-tenant pressure)
+log "STEP A1 KV-only conditions (A4..A7, --append)"
 python3 -u expA_baseline.py --model "$MODEL" --frames "$EXP_FRAMES" --append \
-    --conditions A2_W4fake_BF16KV A3_AWQ_BF16KV A4_BF16_FP8KV A5_BF16_INT4KV \
-                 A6_BF16_INT4K_INT8V A7_BF16_INT2KV A8_AWQ_INT4KV \
+    --conditions A4_BF16_FP8KV A5_BF16_INT4KV A6_BF16_INT4K_INT8V A7_BF16_INT2KV \
     --progress_every 5 --summary_every 20 \
     2>&1 | tee -a "$LOG"
-log "STEP A done"
+log "STEP A1 done"
+
+# STEP A2: weight-quant conditions (in-place fake-quant; no weight clone).
+#          Best-effort — may still OOM if tlandeg spikes.
+log "STEP A2 weight-quant conditions (A2 fake-W4, A3/A8 AWQ, --append)"
+python3 -u expA_baseline.py --model "$MODEL" --frames "$EXP_FRAMES" --append \
+    --conditions A2_W4fake_BF16KV A3_AWQ_BF16KV A8_AWQ_INT4KV \
+    --progress_every 5 --summary_every 20 \
+    2>&1 | tee -a "$LOG" || log "STEP A2 partial (some conditions may have OOM'd; check expA_summary)"
+log "STEP A2 done"
 
 # STEP B: calibration with eager attention + chunked entropy hook + 32 frames
 THRESH_FILE="$QWEN_DIR/calibration/thresholds_${MODEL##*/}_avg${AVG}_frames${CAL_FRAMES}.json"

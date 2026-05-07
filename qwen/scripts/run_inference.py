@@ -49,19 +49,41 @@ def load_model(model_id: str, awq: bool = False, dtype: str = "bfloat16",
     return model, processor
 
 
-def fake_quantize_weights_w4(model, group_size: int = 128):
-    """Apply fake-quant W4 to all Linear layers in the language_model decoder.
+def fake_quantize_weights_w4(model, group_size: int = 128, bits: int = 4):
+    """In-place fake-quant of all Linear layers in the text decoder.
 
-    Reuses the lifted symmetric per-group formula. Returns a dict of saved
-    originals so callers can restore() if desired.
+    Memory-efficient: does NOT clone originals (the LIBERO version does, doubling
+    weight memory). Caller is responsible for tearing down and reloading the
+    model if it needs the original weights back. Returns None.
+
+    Skips vision_tower / merger to avoid degrading image features. Limits to
+    `model.language_model` (or equivalents) which holds the 28 decoder layers
+    we want to quantize.
     """
-    import sys
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "scripts"))
-    from utils import fake_quantize_module  # type: ignore
-
-    decoder = getattr(getattr(model, "language_model", None), "model", None) or getattr(model, "language_model", None) or model
-    saved = fake_quantize_module(decoder, bits=4, group_size=group_size)
-    return saved
+    qmax = 2 ** (bits - 1) - 1
+    decoder = getattr(getattr(model, "language_model", None), "model", None) \
+              or getattr(model, "language_model", None) or model
+    n_quant = 0
+    for name, child in decoder.named_modules():
+        if not isinstance(child, torch.nn.Linear):
+            continue
+        w = child.weight.data
+        wf = w.float()
+        if group_size > 0 and wf.shape[1] >= group_size and wf.shape[1] % group_size == 0:
+            g = wf.reshape(wf.shape[0], -1, group_size)
+            s = g.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
+            q = ((g / s).round().clamp(-qmax, qmax) * s).reshape_as(wf).to(w.dtype)
+        else:
+            s = wf.abs().amax(dim=-1, keepdim=True).clamp_min(1e-8) / qmax
+            q = ((wf / s).round().clamp(-qmax, qmax) * s).to(w.dtype)
+        child.weight.data.copy_(q)
+        del wf, q, s
+        n_quant += 1
+    import gc as _gc
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return n_quant
 
 
 # ---------------- per-sample scoring ----------------
