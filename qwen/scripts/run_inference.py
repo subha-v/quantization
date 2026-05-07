@@ -196,11 +196,17 @@ def run_condition(
     out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     progress_log = out_jsonl.with_name(out_jsonl.stem + ".progress.log")
 
+    import gc as _gc
     n = len(items)
     _append_progress(progress_log, f"START {condition} frames={n_frames} n_items={n}")
     t_start = time.perf_counter()
     results: list[ScoreResult] = []
     n_correct = 0
+
+    # Free any stale cache memory before starting (esp. between conditions)
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     with open(out_jsonl, "a") as f:
         for i, it in enumerate(items):
@@ -215,6 +221,13 @@ def run_condition(
             f.flush()
             results.append(r)
             n_correct += int(r.is_correct)
+            # Memory hygiene: every 5 items return cached blocks to the allocator.
+            # Without this, fragmentation slowly grows and the next condition can
+            # OOM (observed on Qwen2.5-VL-7B + tlandeg co-tenant on GPU 0).
+            if (i + 1) % 5 == 0:
+                _gc.collect()
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             done = i + 1
             if done % progress_every == 0 or done == n:
@@ -240,6 +253,11 @@ def run_condition(
             summary_callback(out_jsonl)
         except Exception as e:
             _append_progress(progress_log, f"WARN final summary_callback failed: {e!r}")
+
+    # Final cleanup before next condition
+    _gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
     final_acc = n_correct / max(1, n)
     final_line = (f"DONE {condition} frames={n_frames} acc={n_correct}/{n}={final_acc:.3f} "
