@@ -256,63 +256,55 @@ def text_positions(seq_len: int, v_start: int, v_end: int) -> list[int]:
 # ---------------- per-text-token K residual capture (for E1.10) ----------------
 
 
-class TextKResidualCache:
-    """`DynamicCache` subclass that records per-text-position INT4 K residual.
+from transformers.cache_utils import DynamicCache as _DynamicCache
 
-    Storage stays BF16; on each `update()` we additionally compute
-        ||K[t, L, h, :] - Q_int4(K[t, L, h, :])||_2 / ||K[t, L, h, :]||_2
-    averaged across all KV-heads (h) and accumulated across all layers (L).
 
-    Final result: tensor of shape [seq_len] with mean residual norm per position.
-    Only the positions in `text_position_set` have non-zero accumulated values.
-    Positions outside text_position_set are returned as 0 (or NaN if you query
-    `relative=True` and the position has zero K-norm).
+class TextKResidualCache(_DynamicCache):
+    """`DynamicCache` subclass that records per-position INT4 K residual.
+
+    Storage stays BF16 (DynamicCache behavior). On each `update()` we
+    additionally compute (per query position t)
+        rel[t] = ||K[t, L, h, :] - Q_int4(K[t, L, h, :])||_2 / ||K[t, L, h, :]||_2
+    summed across heads h and accumulated across layers L. After one prefill
+    the running sum has been incremented num_layers * num_kv_heads times per
+    position; `finalize()` divides by that count.
+
+    NOTE: subclasses DynamicCache (proper `is-a` inheritance) so transformers
+    can do `cache[layer_idx]`, `len(cache)`, etc. via the parent class.
     """
 
     def __init__(self, num_layers: int, seq_len: int):
-        from transformers.cache_utils import DynamicCache
-        self._inner = DynamicCache()
+        super().__init__()
         self.num_layers = num_layers
         self.seq_len = seq_len
-        # accumulator shape [seq_len], summed across (L, h) then divided by L*h at the end
+        # accumulator shape [seq_len], summed across (L, h)
         self._sum = torch.zeros(seq_len, dtype=torch.float32)
-        self._count = 0  # number of (L, h) increments per position; equals num_layers * num_kv_heads after one prefill
+        # number of (L, h) increments accumulated; divisor for finalize().
+        self._count = 0
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        # key_states: [B, H_kv, T_new, D] -- in prefill T_new == seq_len; on later
-        # decode steps T_new == 1.
         from fake_quant_kv_cache import fake_quantize_kv
         with torch.no_grad():
             B, H, T, D = key_states.shape
-            # We expect prefill (T == seq_len). If not, just no-op (decode steps).
-            if T <= 0:
-                return self._inner.update(key_states, value_states, layer_idx, cache_kwargs)
-            Kq = fake_quantize_kv(key_states, 4)
-            # Per-position residual norm: ||K[b=0, h, t, :] - Kq[b=0, h, t, :]||_2 / ||K[b=0, h, t, :]||_2
-            num = (key_states - Kq).pow(2).sum(dim=-1).sqrt()  # [B, H, T]
-            den = key_states.pow(2).sum(dim=-1).sqrt().clamp_min(1e-8)  # [B, H, T]
-            rel = (num / den)[0]  # [H, T]
-            # Sum over heads and accumulate by position. Append to self._sum.
-            per_pos = rel.sum(dim=0).float().cpu()  # [T]
-            # In prefill T may equal seq_len (or smaller if cache_kwargs split). Append.
-            cache_offset = self._inner.get_seq_length(layer_idx)
-            end = cache_offset + T
-            if end <= self.seq_len:
-                self._sum[cache_offset:end] += per_pos
-                self._count += int(H)
-        return self._inner.update(key_states, value_states, layer_idx, cache_kwargs)
-
-    def __getattr__(self, name):
-        # Forward all attribute access to the inner cache (DynamicCache)
-        return getattr(self._inner, name)
-
-    def get_seq_length(self, *args, **kwargs):
-        return self._inner.get_seq_length(*args, **kwargs)
+            if T > 0:
+                Kq = fake_quantize_kv(key_states, 4)
+                num = (key_states - Kq).pow(2).sum(dim=-1).sqrt()  # [B, H, T]
+                den = key_states.pow(2).sum(dim=-1).sqrt().clamp_min(1e-8)  # [B, H, T]
+                rel = (num / den)[0]  # [H, T]
+                per_pos = rel.sum(dim=0).float().cpu()  # [T]
+                # Position offset in the running cache (0 during prefill).
+                cache_offset = super().get_seq_length(layer_idx)
+                end = cache_offset + T
+                if end <= self.seq_len:
+                    self._sum[cache_offset:end] += per_pos
+                    self._count += int(H)
+        return super().update(key_states, value_states, layer_idx, cache_kwargs)
 
     def finalize(self) -> torch.Tensor:
         """Return [seq_len] tensor of mean per-position residual norm.
 
-        Mean is taken over (L * h) increments (so num_layers * num_kv_heads).
+        Mean is over (L * num_kv_heads) increments — so for a 28L x 4-head
+        Qwen2.5-VL model with one prefill, this divides by 28 * 4 = 112.
         """
         if self._count == 0:
             return torch.zeros(self.seq_len, dtype=torch.float32)
