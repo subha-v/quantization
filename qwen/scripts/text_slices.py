@@ -148,47 +148,75 @@ def find_text_slice_spans(input_ids: torch.Tensor, processor, item: LVBItem
 
     warnings: list[str] = []
 
-    # 6. Locate question / options / instruction within body
+    # 6. Marker-based slice detection. We do NOT tokenize item.question standalone
+    # because BPE merges across boundaries cause that to mismatch in 100% of items.
+    # Instead, locate the structural markers ('Options:' and 'Answer with...') in
+    # the user-message body, then derive the question span as the range between
+    # them. This is robust across tokenizer behavior.
     n_options = len(item.candidates)
-    letters = OPTION_LETTERS[:n_options]
-    options_text = "\n".join(f"{letter}. {cand}" for letter, cand in zip(letters, item.candidates))
-    letter_list = ", ".join(letters)
-    options_block = f"\n\nOptions:\n{options_text}"
-    instruction_block = f"\n\nAnswer with a single letter from {letter_list}."
+    letter_list = ", ".join(OPTION_LETTERS[:n_options])
 
-    q_a, q_b, q_status = _find_substring_span(ids, processor, item.question,
-                                              start=body_lo, end=body_hi)
-    if q_status == "fail":
-        warnings.append("question:fail")
-        q_a, q_b = body_lo, body_lo  # empty span — treated as 0 tokens
-    elif q_status != "exact":
-        warnings.append(f"question:{q_status}")
+    # Try several spelling variants in order of specificity (most-specific first).
+    options_marker_candidates = [
+        "\n\nOptions:\n", "\n\nOptions:", "\nOptions:\n", "\nOptions:", "Options:",
+    ]
+    answer_marker_candidates = [
+        f"\n\nAnswer with a single letter from {letter_list}.",
+        f"\n\nAnswer with a single letter from {letter_list}",
+        f"\nAnswer with a single letter from {letter_list}",
+        f"Answer with a single letter from {letter_list}",
+        "Answer with a single letter",
+    ]
 
-    o_a, o_b, o_status = _find_substring_span(ids, processor, options_block,
-                                              start=q_b, end=body_hi)
-    if o_status == "fail":
-        warnings.append("options:fail")
-        o_a, o_b = q_b, q_b
-    elif o_status != "exact":
-        warnings.append(f"options:{o_status}")
+    o_a, o_b, o_status = -1, -1, "fail"
+    for s in options_marker_candidates:
+        a, b, st = _find_substring_span(ids, processor, s, start=body_lo, end=body_hi)
+        if a >= 0:
+            o_a, o_b, o_status = a, b, f"{s!r}/{st}"
+            break
 
-    i_a, i_b, i_status = _find_substring_span(ids, processor, instruction_block,
-                                              start=o_b, end=body_hi)
-    if i_status == "fail":
-        warnings.append("instruction:fail")
-        i_a, i_b = o_b, o_b
-    elif i_status != "exact":
-        warnings.append(f"instruction:{i_status}")
+    i_a, i_b, i_status = -1, -1, "fail"
+    instr_search_start = (o_b if o_b >= 0 else body_lo)
+    for s in answer_marker_candidates:
+        a, b, st = _find_substring_span(ids, processor, s, start=instr_search_start, end=body_hi)
+        if a >= 0:
+            i_a, i_b, i_status = a, b, f"{s!r}/{st}"
+            break
 
-    # 7. answer_prefix = [last_im_end, seq_len)  -- includes <|im_end|> + <|im_start|>assistant\n
+    if o_a < 0:
+        warnings.append("options_marker:fail")
+    elif "/exact" not in o_status:
+        warnings.append(f"options_marker:{o_status}")
+    if i_a < 0:
+        warnings.append("instruction_marker:fail")
+    elif "/exact" not in i_status:
+        warnings.append(f"instruction_marker:{i_status}")
+
+    # Derive spans from markers
+    if o_a >= 0:
+        question_span = (body_lo, o_a)
+        if i_a >= 0:
+            options_span = (o_a, i_a)
+            instruction_span = (i_a, body_hi)
+        else:
+            options_span = (o_a, body_hi)
+            instruction_span = (body_hi, body_hi)
+    else:
+        # Last-resort fallback: dump entire body into question slice
+        warnings.append("fallback:body_as_question")
+        question_span = (body_lo, body_hi)
+        options_span = (body_hi, body_hi)
+        instruction_span = (body_hi, body_hi)
+
+    # 7. answer_prefix = [last_im_end, seq_len)
     answer_prefix_span = (last_im_end, seq_len)
 
     return {
         "header": header_span,
         "visual_wrapper": visual_wrapper_span,
-        "question": (q_a, q_b),
-        "options": (o_a, o_b),
-        "instruction": (i_a, i_b),
+        "question": question_span,
+        "options": options_span,
+        "instruction": instruction_span,
         "answer_prefix": answer_prefix_span,
         "_seq_len": seq_len,
         "_v_start": v_start,
