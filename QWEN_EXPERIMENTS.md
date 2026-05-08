@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-07:** **Three experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), and Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits). Total: ~3600 rollouts of routed/baseline data, plus 33,600 (item × layer × KV-head) diagnostic signal rows.
+**Status as of 2026-05-08:** **Four experiments — D0 just completed, D1 in flight.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), and Exp D0 Evidence-window diagnostic (200 eval items × 8 BF16 conditions, 1h 26min wall on H100). Total: ~3600 rollouts of routed/baseline data + 33,600 (item × layer × KV-head) diagnostic signal rows + 200 D0 per-item rows with full per-(layer, head) answer-query attention windows.
 
 ## Headline
 
@@ -28,6 +28,19 @@
 > 10. **Margin tracks accuracy.** C2.1 mean answer margin = +0.674 vs the 100-item BF16 ceiling +0.712. Logits are genuinely moving toward the right answer, not just flipping argmax. C2.2 margin = −0.850, basically tied with A5's −0.871.
 >
 > **Implication.** The next experiment is *not* a richer KV tier set, and *not* {INT2, INT4, BF16} routing. It's **K-side outlier reduction at INT4** (KIVI-style per-channel K, AKVQ-VL static outlier extraction, or post-RoPE channel-wise K calibration). The naive symmetric per-channel quantizer is broken specifically on K; once K is properly quantized, V can stay at INT4 with effectively no accuracy loss — that gives ~10 KV bits avg without the 30 pp Exp A collapse.
+>
+> **Exp D0 Evidence-window diagnostic — NEGATIVE for the all-pooled selector; one viable signal in the maxhead variant.** 200 eval items × 8 BF16 conditions, 64 frames, 8 windows × 8 frames each:
+>
+> 11. **Top-1-window-removed (0.560) is HIGHER accuracy than Full-64 (0.500).** Removing the supposedly most-attended visual window IMPROVES accuracy by 6 pp on the same 200 items. This is the opposite of the "attention identifies evidence" prediction.
+> 12. **Top-1-window-removed (0.560) ≈ Random-window-removed (0.548 over 3 seeds).** No statistically meaningful difference. Among BF16-correct items (n=100), top-removal flips 6 to wrong; removing any one of 3 random windows flips 12. Random removal is *more* damaging.
+> 13. **EvidenceCausalGap = TopCausalEffect − RandomCausalEffect** has median 0.000, mean 0.011 across 200 items. Sign of the gap is uncorrelated with whether BF16 gets the right answer.
+> 14. **Mechanism: LM attention sink at the first visual token.** `top1_window_all` collapses to window 0 in 195/200 items (97.5%). Mean per-window mass = [0.245, 0.127, 0.111, 0.105, 0.100, 0.097, 0.098, 0.115]. Window 0 wins by a razor-thin margin because heads dump no-op attention on the first visual token after `<|vision_start|>`; raw-mass pooling cannot distinguish "this head spreads visual mass across windows" from "this head sinks all of its tiny visual mass on token 0". `evidence_width_90` = 7 of 8 windows in 195/200 items.
+> 15. **`visual_mass_total` median = 0.061** — the answer-query position averages only ~6% of its attention on visual tokens (~94% on text/system/options/instruction). Below-the-fold visual usage is the regime where the sink artifact dominates.
+> 16. **Maxhead diagnostic shows sharper localization.** Per-(L, h) normalize-pick gives `top1_window_maxhead` distribution {0: 135, 1: 9, 2: 1, 3: 4, 4: 4, 5: 6, 6: 4, 7: 37}: window-0 win rate drops to 67.5%, with a clear secondary mode at window 7 (recency, 18.5%). Median maxhead top-1-mass = 0.563 vs 0.245 for the all-pooled selector. Maxhead picks concentrate on layers 6, 9, 21, 24 (~56% of items).
+> 17. **Mid-layer pooling does NOT help** — agreement with all-pooled = 96.5% (both pick window 0). Selector agreement: all == maxhead = 69.5%, mid == maxhead = 67.0%, all == mid = 96.5%.
+> 18. **Per-bucket Full-64 BF16 accuracy is 6.5 pp below Exp A's 56.5%** — short 0.515 (vs 0.667), mid 0.818 (vs 0.848), long 0.493 (vs 0.537), very_long 0.343 (vs 0.403). Most likely cause: `Qwen2VLImageProcessor` defaulting to the "fast processor" path (transformers warning at load time). All D1 conditions inherit this shifted ceiling, so within-D1 comparisons remain valid.
+>
+> **Implications.** The all-pooled selector (the user's deliberate primary choice — raw-mass pooling, since per-head normalization would let text-focused heads dominate) is hijacked by the sink. The fix is *not* to switch the pooling rule (raw mass remains correct for distinguishing visual-vs-text heads); it's to **drop the first ~32 sink tokens before window-mass computation** OR to use the maxhead variant. D1 has been extended in flight to test top-1-maxhead and top-2-maxhead as additional conditions (D1.5a_mh, D1.5b_mh) alongside the original top-1/top-2-all conditions. The headline D1 prediction is now: **D1.5a-mh > D1.6a (random) > D1.5a-all on localized items**, while **D1.5a-all ≈ D1.7a (uniform window 4)** because both effectively protect window 0. The D1.4 (all visual K BF16) vs D1.3 (text K BF16, visual K INT4) comparison is independent of window selection and remains the foundational visual-K-matters test.
 
 The methodology gates: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (smoke threshold 1e-3) — `FakeQuantKVCache.update()` feeds the SDPA matmul as designed. Diagnostic pass produces 0 NaN entropy/residual rows on 33,600 (item × L × H) signals; `bf16_pred ≠ uniform_int2_pred` on 90%+ of items, confirming the routing decisions are operating on real signal.
 
@@ -281,6 +294,171 @@ A6 in Exp A (INT4-K + INT8-V at 25.0%) tested asymmetric K/V but still quantized
 - `qwen/results/expC_kv_isolation.progress.log` — full server progress log.
 - `qwen/results/expC0_diagnostics.md` — no-compute diagnostic output.
 
+## Experiment D0 — Evidence-window diagnostic (2026-05-08)
+
+After Exp C established that **K is the killer at INT4 and V is essentially free**, the natural next question shifts from "how do we route bits across layers" to a VLM-specific framing:
+
+> **Does answer-query attention identify the visual evidence windows that matter for retrieval, so that we can selectively protect those K positions at higher precision?**
+
+D0 is the BF16-only evidence-restriction half of the combined D0+D1 pipeline. It runs 8 BF16 forwards per item on the same 200 LongVideoBench eval items at 64 frames, captures per-(layer, KV-head) answer-query attention via an `EvidenceWindowAttentionHook`, and produces three pooled selectors over 8 temporal windows (8 frames each):
+
+- `evidence_attn_all` — raw visual-window mass pooled across all 28 layers × 4 KV heads, normalized over windows. **Primary selector.**
+- `evidence_attn_mid` — same but layers 8–20 only (sensitivity diagnostic for "do middle layers carry sharper cross-modal alignment").
+- `evidence_attn_maxhead` — per-(L, h) normalize-over-windows, pick the (L, h) with the sharpest top-1 mass. Per-head upper-bound diagnostic.
+
+Six conditions per item:
+
+| ID | Condition | Frames the model sees |
+|---|---|---|
+| D0.1 | Full-64 BF16 (eager attention; captures attention) | 64 |
+| D0.2 | Uniform-16 BF16 | 16 uniformly sampled |
+| D0.3 | Top-1-window-only BF16 | 8 frames (the top-attended window via `evidence_attn_all`) |
+| D0.4 | Top-2-windows-only BF16 | 16 frames (top-2 attended windows) |
+| D0.5 | Top-1-window-removed BF16 | 56 frames (drop top window) |
+| D0.6 | Random-window-removed BF16 (×3 seeds, exclude top) | 56 frames |
+
+Frame manipulation v1 = frame removal (sequence length and temporal positions change; `mode="frame_removal_v1"` in JSONL). Blank-in-place v2 deferred behind a flag.
+
+### Per-condition results (n=200 eval items)
+
+| Condition | acc | 95% CI | mean answer margin |
+|---|---:|---|---:|
+| D0.1 Full-64 BF16 | **0.500** | [0.430, 0.570] | +0.646 |
+| D0.2 Uniform-16 BF16 | 0.500 | [0.435, 0.570] | +0.326 |
+| D0.3 Top-1-window-only | 0.425 | [0.360, 0.490] | −0.097 |
+| D0.4 Top-2-windows-only | 0.520 | [0.450, 0.590] | +0.473 |
+| **D0.5 Top-1-window-removed** | **0.560** | [0.495, 0.630] | **+0.675** |
+| D0.6 Random-window-removed (3 seeds, n=600) | 0.548 | — | +0.686 |
+
+### Per-bucket Full-64 BF16 accuracy
+
+| Bucket | Exp A (slow processor) | Exp D0 (fast processor) | Δ |
+|---|---:|---:|---:|
+| short (n=33) | 0.667 | 0.515 | −15.2 pp |
+| mid (n=33) | 0.848 | 0.818 | −3.0 pp |
+| long (n=67) | 0.537 | 0.493 | −4.4 pp |
+| very_long (n=67) | 0.403 | 0.343 | −6.0 pp |
+| **all (n=200)** | **0.565** | **0.500** | **−6.5 pp** |
+
+The drop from 56.5% → 50.0% on the same 200 items is unexpected and is probably the `Qwen2VLImageProcessor` "fast processor" change (transformers default since the last update; warning printed at model load: *"loaded as a fast processor by default, even if the checkpoint was saved with a slow processor. This is a breaking change and may produce slightly different outputs"*). The mid-bucket-easier-than-short anomaly is reproduced (0.818 > 0.515). All D1 conditions will see this same shifted ceiling, so within-D1 comparisons are still well-defined; the absolute gap-vs-Exp-C ceiling has just narrowed.
+
+### Headline finding — answer-query attention does NOT identify causal evidence windows
+
+Three independent signals converge on the same conclusion: **the all-layer raw-mass-pooled answer-query attention does not pick the visual windows that actually carry evidence.**
+
+**1. Top-1-removed (0.560) is HIGHER accuracy than Full-64 (0.500).** Removing the supposedly most-attended visual window IMPROVES accuracy by 6 pp. If attention identified evidence, removal would *lower* accuracy.
+
+**2. Top-1-removed (0.560) ≈ Random-removed (0.548).** No statistically meaningful difference. Random-window removal hurts about as much (or as little) as top-window removal.
+
+**3. EvidenceCausalGap = TopWindowCausalEffect − RandomWindowCausalEffect** has median 0.000, mean 0.011 across 200 items, and the sign of the gap is uncorrelated with whether BF16 gets the right answer (positive-gap items: 50.0% bf16-correct; negative-gap items: 49.5% bf16-correct).
+
+Among **BF16-correct items (n=100)** specifically: top-1-removal flips **6 items** to wrong, while removing **any one of 3 random windows** flips **12 items** to wrong. Removing the top-attended window is *less* damaging than removing a random window — directly opposite to the "attention identifies evidence" prediction.
+
+### Mechanism — the LM attention-sink artifact at window 0
+
+`top1_window_all` lands on **window 0 in 195/200 items (97.5%)**, with windows 1–7 as runners-up only 5 times total:
+
+```
+top1_window_all distribution: {0: 195, 1: 2, 2: 1, 7: 2}
+```
+
+But the win is a *razor-thin margin*, not a confident pick. Mean per-window mass across all 200 items:
+
+```
+evidence_attn_all   = [0.245, 0.127, 0.111, 0.105, 0.100, 0.097, 0.098, 0.115]
+evidence_attn_mid   = [0.274, 0.123, 0.106, 0.100, 0.096, 0.093, 0.094, 0.113]
+evidence_attn_maxhead = [0.414, 0.117, 0.065, 0.063, 0.061, 0.062, 0.070, 0.148]
+```
+
+`evidence_width_90` = 7 of 8 windows in 195/200 items. The "winner" (window 0) has only 24.5% mass on average, max 35.4%; window 7 has a consistent 11–15% recency bump. The remaining six windows are essentially uniform at 9–13%.
+
+This is the well-documented **LM attention sink** ([Xiao et al., "Attention Sinks", 2023](https://arxiv.org/abs/2309.17453)): many transformer heads dump attention on the first token of any segment as a no-op when they have nothing semantic to attend to. With raw-mass pooling across all (L, h), the heads with sinks at the first visual token (immediately after `<|vision_start|>`) dominate the average and put a mild but consistent excess mass on window 0. Pooling raw mass (the user's deliberate choice — it correctly downweights heads that attend mostly to text) cannot distinguish *"this head spreads visual attention across windows"* from *"this head sinks all of its tiny visual attention on the first visual token."*
+
+The mid-layer pooling makes the sink WORSE, not better (0.274 vs 0.245 on window 0): mid layers (8–20) have more attention sinks, not more semantic localization. Selector agreement: `top1_all == top1_mid` in 96.5% of items — they almost always pick the same window (window 0), just for different head-distribution reasons.
+
+### Maxhead diagnostic — there ARE sharp heads, just not on average
+
+The per-(L, h) max-head selector is the cleaner test of "does any single head localize evidence?":
+
+```
+top1_window_maxhead distribution: {0: 135, 1: 9, 2: 1, 3: 4, 4: 4, 5: 6, 6: 4, 7: 37}
+maxhead_top_mass: median = 0.563, q75 = 0.629, max = 0.912
+```
+
+Window-0 win rate drops from 97.5% (all-pooled) to **67.5% (maxhead)** — still sink-dominated, but with a long tail and a clear secondary mode at window 7 (the last temporal window, 18.5% of items). The selected (L, h) is concentrated on a handful of layers:
+
+| Layer | n items | % |
+|---|---:|---:|
+| 6 | 38 | 19.0% |
+| 9 | 34 | 17.0% |
+| 21 | 24 | 12.0% |
+| 24 | 16 | 8.0% |
+| 22 | 15 | 7.5% |
+| 16 | 11 | 5.5% |
+| 15 | 10 | 5.0% |
+| 27 | 10 | 5.0% |
+
+Layers 6, 9, 15, 16, 21, 22, 24, 27 cover **~79% of all maxhead picks**, and median top-1-mass at the maxhead is **56.3%** vs 24.5% for the all-pooled selector. So the mechanism is: the model *does* contain heads that localize sharply on a single visual window for any given item, but they're a minority that gets washed out when you average raw mass across all 28 × 4 = 112 heads. Selector agreement: `top1_all == top1_maxhead` in only 69.5% of items, so maxhead picks a *different* window from the all-pooled selector for nearly a third of items.
+
+### Visual mass total — the answer query is mostly text-driven
+
+The auxiliary `visual_mass_total = mean over (L, h) of the head's total visual-window mass`:
+
+| Statistic | Value |
+|---|---:|
+| min | 0.0449 |
+| q25 | 0.0566 |
+| median | 0.0610 |
+| q75 | 0.0673 |
+| max | 0.0912 |
+
+The answer-query position averages **6.1% of its attention on visual tokens** and ~94% on text (system prompt, question, options, instruction). This is the regime where the attention-sink artifact is dominant: 6% mass × small variations across 8 windows means the sink at window 0 (a constant ~24% of that 6%) easily wins by default. Items with `visual_mass_total > 0.07` represent the top quartile where the answer-query is genuinely doing visual retrieval — those are the items most likely to have meaningful evidence-window structure.
+
+### Evidence-label distribution (post-hoc thresholds)
+
+`expD_analyze.py` applies the threshold rules:
+
+| Label | Rule | n | % |
+|---|---|---:|---:|
+| localized | full64 ✓ ∧ (top1_only or top2_only ✓) ∧ Δmargin > 0.5 ∧ EvidenceCausalGap > 0.2 | 11 | 5.5% |
+| global | full64 ✓ ∧ uniform16 ✓ ∧ \|Δmargin\| < 0.3 | 19 | 9.5% |
+| distributed | full64 ✓ ∧ top1_only ✗ ∧ top2_only ✗ | 2 | 1.0% |
+| attention_not_causal | TopCausalEffect ≤ RandomCausalEffect | 49 | 24.5% |
+| unlabeled | (full64 ✗, mostly) + boundary cases | 119 | 59.5% |
+
+Among the 100 BF16-correct items, the largest category is **attention_not_causal (49 items)** — top-window removal hurts no more than random. Only 11/200 items qualify as **localized** under the strict thresholds, which is a small population for the planned D1.5a stratified test. Loosening the thresholds in `expD_analyze.py` is supported (labels are computed post-hoc, not baked into D0's JSONL) but will not change the headline diagnosis.
+
+### Implications for D1
+
+The D1 pipeline (currently in flight) tests the cross-modal K/V quantization hypothesis: V always at INT4, K varied between BF16/INT4 across text vs visual vs evidence-window subregions. The D0 finding reshapes what each D1 condition will tell us:
+
+1. **D1.4 (all visual K = BF16, V INT4) vs D1.3 (text-K BF16 + visual K INT4, V INT4)** — independent of window selection. This pair tests "does visual K matter at all" and is unaffected by the attention-sink finding. **The most important D1 comparison.**
+
+2. **D1.5a (top-1 visual K BF16, all-pooled selector) vs D1.6a (random-1 visual K BF16)** — under the all-pooled selector, D1.5a will protect window 0 in 195/200 items. This collapses to "does protecting K at the first visual token (the sink) recover anything specifically?" and will likely come out flat because the sink isn't carrying evidence. **Expected to be a null/negative result.**
+
+3. **D1.5a-mh (top-1 visual K BF16, maxhead selector) vs D1.6a** — added to D1 mid-flight after D0's diagnosis. Uses `top1_window_maxhead` (window 0 in only 67.5% of items, with a meaningful tail). This is the cleaner test of "does attention pick causal evidence" and is predicted to outperform random *if* the maxhead variant is genuinely picking evidence. **The headline VLM-specific test.**
+
+4. **D1.5b vs D1.6b** at top-2 budget — same logic at a more permissive budget.
+
+### Remediation paths if D1.5a-mh also fails
+
+If even the maxhead-derived window selection doesn't beat random, the next experiments are:
+
+- **Sink correction.** Drop the first N visual tokens (the sink) before pooling and before window selection. Concretely: compute window mass over `[v_start + 32 : v_end]` instead of `[v_start : v_end]`. Quick post-hoc analysis on the saved `evidence_attn_*` data.
+- **Sub-window K-mask.** Even within "window 0", mask only the first ~32 sink tokens at INT4 while protecting the rest of the window at BF16. Tests whether the issue is the entire window or just the sink prefix.
+- **Sharp-head selection at calibration time.** Use the cal-100 split to identify (L, h) heads whose evidence-window distribution is sharpest and most predictive of BF16-correct outcomes, then use those heads' window picks for D1.
+
+### Files of record (Exp D0)
+
+- `qwen/scripts/expD0_evidence_diagnostic.py` — Phase 1 driver; 8 BF16 forwards/item, captures per-(L, h) answer-query attention.
+- `qwen/scripts/visual_tokens.py` — `find_visual_token_span` (locates `<|vision_start|>`/`<|vision_end|>`) + `build_window_token_ranges`.
+- `qwen/scripts/frame_manip.py` — `decode_uniform_frames` with decord/imageio/cv2 fallback; window-index helpers; blank-in-place v2 stub.
+- `qwen/scripts/expD_smoke.py` — 5-check smoke (visual span, window mapping, V3K logits-differ, mask-cache alignment, frame-removal end-to-end).
+- `qwen/scripts/run_expD.sh` — orchestrator (`smoke | d0 | d1 | analyze | full`).
+- `qwen/results/expD0_evidence_diagnostic.jsonl` — 200 per-item rows; full schema in `expD0_evidence_diagnostic.py` docstring.
+- `qwen/results/expD0_summary.md` — auto-generated by `expD_analyze.py`.
+- `qwen/results/expD_pipeline.progress.log` + `expD0_evidence_diagnostic.progress.log` — server progress logs.
+
 ## Methodological lessons learned (cumulative)
 
 1. **`torch>=2.10` ships CUDA-13 wheels that silently fall back to CPU on driver 12.6.** Pinned to `torch==2.5.1+cu124`. Calibration "completed" in 7 seconds the first time because the model was on CPU.
@@ -303,6 +481,20 @@ qwen-expC (tmux session, GPU 0) — PIPELINE COMPLETE (~22 min total)
 └── ✅ STEP 1  K/V isolation: 4 conditions × 100 stratified eval items × 64 frames
               C2.1 BF16K/INT4V → 0.530, C2.2 INT4K/BF16V → 0.290,
               C2.3 BF16K/INT2V → 0.210, C2.4 INT2K/BF16V → 0.330
+
+qwen-expD-d0 (tmux session, GPU 0) — PIPELINE COMPLETE (1h 26min total)
+└── ✅ STEP 1  Evidence-window diagnostic: 200 eval items × 8 BF16 conditions × 64 frames
+              Full-64=0.500, Uniform-16=0.500, Top-1-only=0.425, Top-2-only=0.520,
+              Top-1-removed=0.560, Random-removed (3 seeds, n=600)=0.548.
+              EvidenceCausalGap median=0.000 — attention does NOT identify evidence
+              under the all-pooled selector (sink artifact at window 0 dominates).
+              Maxhead diagnostic: window-0 win rate drops to 67.5% (median top-mass 0.563).
+
+qwen-expD-d1 (tmux session, GPU 0) — IN FLIGHT
+└── 🟡 STEP 2  Cross-modal K/V quantization: 200 eval items × 14 conditions × 64 frames
+              D1.3 (text-K BF16 / visual-K INT4 / V INT4) ... D1.7b
+              + D1.5a_mh / D1.5b_mh (maxhead-derived windows; added in-flight)
+              Pace ~30s per item; ETA ~1h40m total wall.
 ```
 
 ## Files of record
