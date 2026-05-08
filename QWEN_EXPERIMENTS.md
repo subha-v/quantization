@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-08:** **Four experiments — D0 just completed, D1 in flight.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), and Exp D0 Evidence-window diagnostic (200 eval items × 8 BF16 conditions, 1h 26min wall on H100). Total: ~3600 rollouts of routed/baseline data + 33,600 (item × layer × KV-head) diagnostic signal rows + 200 D0 per-item rows with full per-(layer, head) answer-query attention windows.
+**Status as of 2026-05-08:** **Five experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 eval items × 8 BF16 conditions, 1h 26min wall on H100), and Exp D1 Cross-modal K/V quantization (200 eval items × 14 V3K-K-mask conditions, 1h 42min wall on H100). Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + **2800 D1 per-item-per-condition rows** (200 items × 14 conditions).
 
 ## Headline
 
@@ -41,6 +41,27 @@
 > 18. **Per-bucket Full-64 BF16 accuracy is 6.5 pp below Exp A's 56.5%** — short 0.515 (vs 0.667), mid 0.818 (vs 0.848), long 0.493 (vs 0.537), very_long 0.343 (vs 0.403). Most likely cause: `Qwen2VLImageProcessor` defaulting to the "fast processor" path (transformers warning at load time). All D1 conditions inherit this shifted ceiling, so within-D1 comparisons remain valid.
 >
 > **Implications.** The all-pooled selector (the user's deliberate primary choice — raw-mass pooling, since per-head normalization would let text-focused heads dominate) is hijacked by the sink. The fix is *not* to switch the pooling rule (raw mass remains correct for distinguishing visual-vs-text heads); it's to **drop the first ~32 sink tokens before window-mass computation** OR to use the maxhead variant. D1 has been extended in flight to test top-1-maxhead and top-2-maxhead as additional conditions (D1.5a_mh, D1.5b_mh) alongside the original top-1/top-2-all conditions. The headline D1 prediction is now: **D1.5a-mh > D1.6a (random) > D1.5a-all on localized items**, while **D1.5a-all ≈ D1.7a (uniform window 4)** because both effectively protect window 0. The D1.4 (all visual K BF16) vs D1.3 (text K BF16, visual K INT4) comparison is independent of window selection and remains the foundational visual-K-matters test.
+>
+> **Exp D1 Cross-modal K/V — VLM-specific evidence-window hypothesis FALSIFIED. Text-K is the dominant fragility, not visual-K.** 200 eval items × 14 V3K K-mask conditions × 64 frames; V always at INT4:
+>
+> 19. **Spending more bits on visual-K *hurts* accuracy.** D1.4 (text-K INT4, all 5760 visual-K BF16, V INT4) at avg=9.85 KV bits lands at **0.210**. D1.3 (text-K BF16, all 5760 visual-K INT4, V INT4) at avg=4.15 KV bits lands at **0.385**. **2.4× more KV bits, 17.5 pp WORSE accuracy.** The bit budget is being spent on the wrong side.
+> 20. **D1.4 ≤ uniform-INT4 floor (A5 = 0.210 in Exp A).** Protecting all 5760 visual-K positions at BF16 while corrupting the ~140 text-K positions at INT4 destroys the prompt scaffolding (system prompt + question + options + "Answer with a single letter from..." instruction) that produces the answer-letter logits. On the 100 BF16-correct items, D1.4 only preserves 19/100 vs D1.3's 55/100. Paired: D1.3-only-correct = 46, D1.4-only-correct = 10. Text-K dominates by 4.6×.
+> 21. **All visual-K-protected conditions cluster in [0.395, 0.435], a ~3-5 pp boost over D1.3.** Adding *any* visual-K BF16 protection (top-1, top-2, random, uniform, maxhead) gives a small consistent rescue on top of text-K-BF16, but **no condition meaningfully separates from any other.**
+>     - D1.3 (text-K BF16 only): 0.385
+>     - D1.5a (top-1 all): 0.415 — D1.5a_mh (top-1 maxhead): 0.425 — D1.7a (uniform middle): 0.395
+>     - D1.5b (top-2 all): 0.430 — D1.5b_mh (top-2 maxhead): 0.415 — D1.7b (uniform 0+4): 0.395
+>     - D1.6a (random-1 mean over 3 seeds): 0.417 — D1.6b (random-2): 0.423
+> 22. **Maxhead window selection does NOT separate from random.** D1.5a_mh (top-1 maxhead) at 0.425 vs D1.6a-seed0 (random-1) at 0.420 = +0.5 pp, well within bootstrap noise. Even fixing the attention-sink pathology (maxhead picks non-window-0 in 32.5% of items: window 0 = 135/200, window 7 = 37/200, others = 28/200) the resulting accuracy is the same as random-window selection at the same budget.
+> 23. **No differentiation on D0-labeled "localized" items (n=11) either.** D1.5a vs D1.6a-seed0 = 0.909 vs 0.909 (Δ = 0); D1.5a_mh vs D1.5a = 0.909 vs 0.909 (Δ = 0); D1.7a uniform = 1.000 = D1.5b = D1.7b. The 11-item population is too small to power the test, but the direction is null/negative — not the predicted "top-evidence > random" pattern.
+> 24. **Per-bucket D1.3 vs D1.4 reproduces the asymmetry across all durations.** Text-K BF16 wins in every bucket: short 0.333 vs 0.242, mid 0.576 vs 0.273 (largest gap, 30 pp), long 0.373 vs 0.239, very_long 0.328 vs 0.134.
+>
+> **Mechanism — MCQ scoring is text-anchored.** D0's auxiliary `visual_mass_total` median = 0.061 already showed that the answer-query position attends ~94% to text (prompt header + question + options + instruction) and only ~6% to visual tokens. Within that 94%, the answer-letter logits are produced primarily from question + options keys, which are at a tiny fraction of total seq_len (~140 / ~5900 ≈ 2.4% of positions). Quantizing those ~140 high-impact text-K positions to INT4 destroys the prompt structure that maps "what is the question + options" → "which letter to emit." Quantizing all 5760 visual-K positions, by contrast, only modestly degrades visual retrieval — and even that 5-pp visual-K effect doesn't depend on *which* visual tokens you protect, because (a) the answer-query barely attends to visuals to begin with and (b) the model has already compressed visual content into text-side representations during the prefill.
+>
+> **Implications — the next experiment is text-K, not visual-K.** The original hypothesis ("preserve question-relevant evidence-window visual-K addresses for retrieval") is falsified for first-token MCQ scoring on Qwen2.5-VL-7B + LongVideoBench. The actionable next directions:
+> 1. **Text-K outlier handling at INT4.** Text-K is small (~140 tokens × 4 KV-heads × 28 layers × 128 head-dim = ~2 MB BF16) and high-impact. Per-channel K calibration restricted to text positions, or AKVQ-VL-style outlier extraction on text-K only, may recover the 17.5 pp gap at INT4-text + INT4-visual + INT4-V. Memory cost is negligible.
+> 2. **Finer text-K partition.** Split text-K into prompt header / question / options / instruction. Which slice carries the fragility? If it's *just* the question or *just* the options, that's an even cheaper rescue.
+> 3. **Test on long-form video QA generation.** First-token MCQ may be a degenerate setting that hides visual-K importance. Long-form generation queries visual content repeatedly across many decode steps; the visual-K effect may rise. Try Video-MME / MVBench long-form items with multi-token decoding.
+> 4. **Drop the visual-K window-routing approach.** The infrastructure (V3K mode, window-mass selectors, per-token K mask) is good, but the routing object — visual evidence windows under MCQ — has been shown not to be the right object. Re-target to text-K or text-substring routing.
 
 The methodology gates: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (smoke threshold 1e-3) — `FakeQuantKVCache.update()` feeds the SDPA matmul as designed. Diagnostic pass produces 0 NaN entropy/residual rows on 33,600 (item × L × H) signals; `bf16_pred ≠ uniform_int2_pred` on 90%+ of items, confirming the routing decisions are operating on real signal.
 
@@ -459,6 +480,126 @@ If even the maxhead-derived window selection doesn't beat random, the next exper
 - `qwen/results/expD0_summary.md` — auto-generated by `expD_analyze.py`.
 - `qwen/results/expD_pipeline.progress.log` + `expD0_evidence_diagnostic.progress.log` — server progress logs.
 
+## Experiment D1 — Cross-modal K/V quantization (2026-05-08)
+
+D1 takes the per-(item, top-window) data from D0 and asks the cross-modal K/V quantization question:
+
+> **Given V is essentially free at INT4 (Exp C), where do we spend BF16 K bits — on text K, on visual K, or on a question-conditioned subset of visual-K windows?**
+
+V is fixed at INT4 everywhere. K is varied per condition via the `BitController` V3K mode (per-token K mask, V follows the layer's `v_bits` scalar). 14 conditions per item, 200 items, 64 frames; sequence length is ~5899 tokens with `[v_start, v_end) = [15, 5775)` (5760 visual tokens) and ~140 text tokens.
+
+### Conditions and per-condition results (n=200 each)
+
+| ID | Text K | Visual K policy | V | n | acc | 95% CI | avg KV bits | margin |
+|---|---|---|---:|---:|---:|---|---:|---:|
+| D1.3 | BF16 | INT4 (all) | INT4 | 200 | **0.385** | [0.315, 0.455] | 4.15 | −0.418 |
+| D1.4 | INT4 | BF16 (all 5760) | INT4 | 200 | **0.210** | [0.155, 0.265] | 9.85 | −1.609 |
+| D1.5a | BF16 | top-1 BF16 (all-pooled selector) | INT4 | 200 | 0.415 | [0.345, 0.485] | 4.88 | −0.383 |
+| D1.5a_mh | BF16 | top-1 BF16 (maxhead selector) | INT4 | 200 | 0.425 | [0.360, 0.490] | 4.88 | −0.412 |
+| D1.5b | BF16 | top-2 BF16 (all-pooled) | INT4 | 200 | 0.430 | [0.365, 0.500] | 5.61 | −0.238 |
+| D1.5b_mh | BF16 | top-2 BF16 (maxhead) | INT4 | 200 | 0.415 | [0.350, 0.485] | 5.61 | −0.305 |
+| D1.6a (×3 seeds) | BF16 | random-1 BF16 | INT4 | 600 | 0.417 | — | 4.88 | −0.355 |
+| D1.6b (×3 seeds) | BF16 | random-2 BF16 | INT4 | 600 | 0.423 | — | 5.61 | −0.307 |
+| D1.7a | BF16 | uniform-1 BF16 (window 4) | INT4 | 200 | 0.395 | [0.330, 0.465] | 4.88 | −0.359 |
+| D1.7b | BF16 | uniform-2 BF16 (windows 0, 4) | INT4 | 200 | 0.395 | [0.325, 0.465] | 5.61 | −0.331 |
+
+Reused from earlier experiments on the same 200 items: A1 BF16 ceiling = 0.500 (in this run, with the fast-processor path; vs Exp A's 0.565), C2.1 BF16-K + INT4-V on n=100 stratified subset = 0.530, A5 INT4 K/V floor = 0.210.
+
+### Headline asymmetry: text-K dominates visual-K by 17.5 pp
+
+The **D1.3 vs D1.4 pair is the dominant signal of the experiment**, and its direction is the *opposite* of the original VLM-specific hypothesis:
+
+- **D1.3 (text-K BF16, visual-K INT4 for all 5760 positions, V INT4) at avg 4.15 KV bits → 0.385.**
+- **D1.4 (text-K INT4, visual-K BF16 for all 5760 positions, V INT4) at avg 9.85 KV bits → 0.210.**
+
+D1.4 spends **2.4× more KV bits** than D1.3 yet lands **17.5 pp lower** in accuracy — at the uniform-INT4 floor (A5 = 0.210). On the 100 BF16-correct items (paired):
+
+| Condition | bf16-correct preserved | unique-correct vs the other condition |
+|---|---:|---:|
+| D1.3 | 55 | 46 (only D1.3) |
+| D1.4 | 19 | 10 (only D1.4) |
+| both | 9 | — |
+| neither | 35 | — |
+
+**D1.3 dominates D1.4 by 4.6× on unique-correct items.** Text-K BF16 alone (with all 5760 visual-K at INT4) recovers 55% of BF16-correct items; visual-K BF16 alone (with text-K at INT4) recovers only 19%.
+
+### Per-bucket D1.3 vs D1.4
+
+| Bucket | D1.3 (text-K BF16 only) | D1.4 (visual-K BF16 only) | Δ |
+|---|---:|---:|---:|
+| short (n=33) | 0.333 | 0.242 | +9.1 pp |
+| mid (n=33) | 0.576 | 0.273 | **+30.3 pp** |
+| long (n=67) | 0.373 | 0.239 | +13.4 pp |
+| very_long (n=67) | 0.328 | 0.134 | +19.4 pp |
+
+Text-K dominance is robust across all duration buckets. The mid-bucket, where Full-64 BF16 is highest (0.818), shows the biggest gap (30 pp) — when the model is operating well on full visual context, the text-K side is what's load-bearing.
+
+### Visual-K protection methods are interchangeable
+
+All visual-K-BF16-protection conditions cluster in the [0.395, 0.435] band with no statistically distinguishable separation:
+
+| Selector | top-1 | top-2 |
+|---|---:|---:|
+| All-pooled (sink-dominated; window-0 in 195/200 items) | 0.415 | 0.430 |
+| Maxhead (window-0 in 135/200, window-7 in 37/200, etc.) | 0.425 | 0.415 |
+| Random (mean over 3 seeds) | 0.417 | 0.423 |
+| Uniform (middle / 0+middle) | 0.395 | 0.395 |
+
+`D1.5a_mh − D1.6a-seed0 = 0.425 − 0.420 = +0.5 pp` — well within bootstrap noise. Even after fixing the attention-sink artifact (maxhead picks non-window-0 in 32.5% of items vs all-pooled's 2.5%), the resulting accuracy is statistically identical to random window selection at the same budget. **Window selection method does not matter at this resolution; what matters is *whether* any visual K positions are at BF16, not *which* ones.**
+
+The +3–5 pp boost from any visual-K BF16 protection over D1.3 (no visual protection) is consistent with Exp C's V-side finding (V at INT4 is essentially free if K is correct) extended to the K-visual side: a small fraction of visual-K positions at BF16 helps marginally, but the marginal value of additional BF16 visual-K positions saturates fast.
+
+### D1 stratified by D0 evidence label (the headline test)
+
+The original prediction was: on D0-labeled "localized" items (n=11 under our thresholds), top-evidence visual-K BF16 should beat random visual-K BF16 at matched budget. Result on the 11 localized items:
+
+| Pair | acc(left) | acc(right) | Δ | Verdict |
+|---|---:|---:|---:|---|
+| D1.5a (top-1 all) vs D1.6a seed=0 (random-1) | 0.909 | 0.909 | 0.0 pp | tied |
+| D1.5b (top-2 all) vs D1.6b seed=0 (random-2) | 1.000 | 0.818 | +18.2 pp | top wins (n=11; 2 items) |
+| D1.5a (top-1 all) vs D1.7a (uniform middle) | 0.909 | 1.000 | −9.1 pp | uniform wins |
+| D1.5b (top-2 all) vs D1.7b (uniform 0+4) | 1.000 | 1.000 | 0.0 pp | tied |
+| D1.5a_mh (top-1 maxhead) vs D1.6a seed=0 | 0.909 | 0.909 | 0.0 pp | tied |
+| D1.5b_mh (top-2 maxhead) vs D1.6b seed=0 | 0.909 | 0.818 | +9.1 pp | top wins (n=11; 1 item) |
+| D1.5a_mh (top-1 maxhead) vs D1.5a (top-1 all) | 0.909 | 0.909 | 0.0 pp | tied |
+| **D1.4 vs D1.3 (visual-K BF16 vs text-K BF16)** | **0.091** | **0.818** | **−72.7 pp** | text-K dominates |
+
+The 11-item localized population is too small to power statistical tests, but the direction of every visual-K-routing pair is null or 1-item noise. **The only large effect on localized items is the same text-K-vs-visual-K asymmetry (0.818 D1.3 vs 0.091 D1.4 = +72.7 pp).** Not even D0-labeled "this question has a localized evidence window" items show the predicted top-attention > random pattern.
+
+### Confirmed mechanism — MCQ first-token scoring is text-anchored
+
+D0's auxiliary `visual_mass_total` median = 0.061 already foreshadowed this. The answer-query position attends ~94% to text and only ~6% to visual tokens. Within the 94% text attention:
+
+- **Prompt header + system message + `<|im_start|>` etc.**: position-encoded scaffolding the model uses for role-conditioning. Quantizing these positions corrupts the response format.
+- **Question text**: directly encodes "what's being asked." A few hundred K positions, but they carry the semantic content the answer logits need.
+- **Options A/B/C/D text**: the candidate space. The model must distinguish "Option C: ..." from "Option D: ..." via the option tokens; corrupting these K positions blurs the choice.
+- **"Answer with a single letter from A, B, C, D" instruction**: tells the model what shape of answer to produce. Without this, the model's distribution on A/B/C/D collapses to noise.
+
+Quantizing visual-K corrupts ~5760 positions but each contributes ~0.001% of attention mass; the answer-query has already extracted the visual signal it needs into text-side representations during the prefill, so visual-K quantization only modestly degrades that already-compressed signal.
+
+D1.4 (visual-K BF16, text-K INT4) preserves the part of the cache the model barely uses while corrupting the part it heavily uses → 0.210 (uniform-INT4 floor). D1.3 (text-K BF16, visual-K INT4) does the opposite, and recovers most of the rescue at 1/2.4 the bit budget.
+
+### Implications & next steps
+
+The visual-evidence-window precision-routing thesis is **falsified in the MCQ first-token-scoring setting**. Reroute:
+
+1. **Text-K outlier handling at INT4 (small, high-impact).** Text-K is ~140 tokens × 28 layers × 4 KV-heads × 128 head-dim ≈ 2 MB BF16. KIVI-style per-channel K calibration restricted to text positions, or AKVQ-VL outlier extraction on text-K only, should close most of the 17.5 pp gap at uniform-INT4 + outlier-aware-text-K.
+
+2. **Finer text-K partition study.** Split the text-K range into prompt-header / question / options / instruction subspans and run a C2.1-style isolation sweep on each. Identifies which text slice carries the fragility — the smallest possible BF16-protected subset.
+
+3. **Long-form generation re-test.** First-token MCQ is a *minimal* visual-K-stress setting because the model only needs to emit a single letter. Long-form video QA (Video-MME generation, MVBench) decodes many tokens, each re-querying visual K. The "visual-K windows matter" hypothesis may hold at multi-token decoding even though it fails at 1-token.
+
+4. **Drop visual-K window routing as a research direction.** The V3K infrastructure (per-token K mask, attention hooks, EvidenceWindowAttentionHook) is reusable, but the routing *target* — visual evidence windows under MCQ — has been ruled out. Repurpose for text-K subsegment routing.
+
+### Files of record (Exp D1)
+
+- `qwen/scripts/expD1_crossmodal_kv.py` — Phase 2 driver; per-condition V3K K-mask construction; reads D0 JSONL for top-window selectors (all-pooled + maxhead).
+- `qwen/scripts/expD_analyze.py` — applies post-hoc evidence labels; produces 3 markdown summaries.
+- `qwen/results/expD1_crossmodal_kv.jsonl` — 2800 rows (200 items × 14 conditions). Each row: `condition, k_text_bits, k_visual_policy, v_bits, avg_kv_bits, pred_choice, is_correct, option_logprobs, answer_margin, top1_window_all, top2_windows_all, top1_window_maxhead, top2_windows_maxhead, bf16_pred, bf16_correct, visual_protect_windows`.
+- `qwen/results/expD1_summary.md` — per-condition acc + 95% CI + BF16-correct preservation table.
+- `qwen/results/expD_combined_analysis.md` — D1 stratified by D0 evidence label + headline-pair table.
+- `qwen/results/expD1_crossmodal_kv.progress.log` — full server progress log.
+
 ## Methodological lessons learned (cumulative)
 
 1. **`torch>=2.10` ships CUDA-13 wheels that silently fall back to CPU on driver 12.6.** Pinned to `torch==2.5.1+cu124`. Calibration "completed" in 7 seconds the first time because the model was on CPU.
@@ -490,11 +631,16 @@ qwen-expD-d0 (tmux session, GPU 0) — PIPELINE COMPLETE (1h 26min total)
               under the all-pooled selector (sink artifact at window 0 dominates).
               Maxhead diagnostic: window-0 win rate drops to 67.5% (median top-mass 0.563).
 
-qwen-expD-d1 (tmux session, GPU 0) — IN FLIGHT
-└── 🟡 STEP 2  Cross-modal K/V quantization: 200 eval items × 14 conditions × 64 frames
-              D1.3 (text-K BF16 / visual-K INT4 / V INT4) ... D1.7b
-              + D1.5a_mh / D1.5b_mh (maxhead-derived windows; added in-flight)
-              Pace ~30s per item; ETA ~1h40m total wall.
+qwen-expD-d1 (tmux session, GPU 0) — PIPELINE COMPLETE (1h 42min total)
+└── ✅ STEP 2  Cross-modal K/V quantization: 200 eval items × 14 conditions × 64 frames
+              D1.3 (text-K BF16, visual-K INT4, V INT4) → 0.385
+              D1.4 (text-K INT4, visual-K BF16, V INT4) → 0.210 ← 17.5 pp WORSE at 2.4× bits
+              D1.5a / D1.5a_mh (top-1 visual-K BF16 + text-K BF16) → 0.415 / 0.425
+              D1.5b / D1.5b_mh (top-2 visual-K BF16 + text-K BF16) → 0.430 / 0.415
+              D1.6a/b (random ×3 seeds) → 0.417 / 0.423
+              D1.7a/b (uniform) → 0.395 / 0.395
+              All visual-K-protected conditions cluster in [0.395, 0.435] —
+              window selection is irrelevant. Text-K is the dominant fragility.
 ```
 
 ## Files of record

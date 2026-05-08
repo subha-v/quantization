@@ -387,9 +387,11 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
-## Qwen2.5-VL × LongVideoBench — Experiment D: Evidence-Window + Cross-Modal Visual-Key Diagnostic (2026-05-07, plumbing staged)
+## Qwen2.5-VL × LongVideoBench — Experiment D: Evidence-Window + Cross-Modal Visual-Key Diagnostic (2026-05-08, COMPLETE)
 
-After Exp C nailed K-fragility at INT4, **Exp D** asks the VLM-specific question: does low-bit visual-key quantization break long-video VLMs by corrupting *question-specific evidence retrieval*? Combined two-phase pipeline on the same 200 LongVideoBench eval items at 64 frames:
+**Headline: the visual-evidence-window precision-routing hypothesis is FALSIFIED for first-token MCQ scoring. Text-K is the dominant fragility.** D1.3 (text-K BF16, all 5760 visual-K INT4, V INT4) at avg 4.15 KV bits → 0.385. D1.4 (text-K INT4, all 5760 visual-K BF16, V INT4) at avg 9.85 KV bits → 0.210. D1.4 has 2.4× more KV bits and lands 17.5 pp WORSE — at the uniform-INT4 floor. All visual-K-routing conditions (top-1/2 attention, random, uniform, maxhead) cluster in [0.395, 0.435] with no separation by selection method. D0 also revealed the LM attention sink at the first visual token: `top1_window_all` collapses to window 0 in 195/200 items because heads dump no-op attention there; even fixing this via the maxhead diagnostic doesn't change the D1 outcome. Full writeup in `QWEN_EXPERIMENTS.md`.
+
+After Exp C nailed K-fragility at INT4, **Exp D** asked the VLM-specific question: does low-bit visual-key quantization break long-video VLMs by corrupting *question-specific evidence retrieval*? Combined two-phase pipeline on the same 200 LongVideoBench eval items at 64 frames:
 
 **Phase D0 — Evidence-window diagnostic (BF16 only).** For each item, run 8 BF16 forwards: Full-64 (eager + answer-query attention capture), Uniform-16, Top-1-window-only, Top-2-windows-only, Top-1-window-removed, Random-window-removed × 3 seeds. Classify by what visual evidence the question needs:
 - *localized* — full64 correct ∧ top-window-only correct ∧ top-window-removed flips ∧ removal hurts more than random removal
@@ -432,13 +434,22 @@ cd /data/subha2/quantization && git pull
 source /data/subha2/experiments/qwen_venv/bin/activate
 nvidia-smi
 tmux new -s qwen-expD
-CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh smoke      # ~30 min
-CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh d0         # ~4h
-CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh d1         # ~5h
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh smoke      # ~30s, halts on fail
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh d0         # ~1.5h (faster than 4h estimate)
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh d1         # ~1.7h (faster than 5h estimate)
 bash qwen/scripts/run_expD.sh analyze                                # no GPU
 ```
 
-Frame-manipulation v1 = frame removal (sequence length and temporal positions change for top-only / window-removed conditions). Marked in JSONL as `mode="frame_removal_v1"`. Stretch-goal v2 = blank-in-place via decord pre-decode + black-frame substitution; deferred until v1 produces a meaningful evidence signal worth refining.
+Actual wall on H100 with 25 GB co-tenant on GPU 0: smoke = 25s, D0 = 1h 26min, D1 = 1h 42min, analyze = <1s. Total pipeline = ~3h 10min.
+
+Frame-manipulation v1 = frame removal (sequence length and temporal positions change for top-only / window-removed conditions). Marked in JSONL as `mode="frame_removal_v1"`. Stretch-goal v2 = blank-in-place via decord pre-decode + black-frame substitution; not pursued because v1 results already falsify the visual-K-window-routing hypothesis at the bigger-effect text-vs-visual-K level.
+
+### Next steps (post-D)
+
+The original visual-K-window precision-routing thesis is ruled out. Pivots:
+1. **Text-K outlier handling at INT4.** Text K is small (~140 tokens × 28 layers × 4 KV-heads × 128 head-dim ≈ 2 MB) and high-impact; per-channel K calibration restricted to text positions or AKVQ-VL outlier extraction on text-K should close the 17.5 pp gap.
+2. **Finer text-K partition** (header / question / options / instruction) via a C2.1-style isolation sweep on the text subspans.
+3. **Long-form generation re-test.** Multi-token decoding (Video-MME generation, MVBench) may stress visual-K differently; first-token MCQ is the minimal-visual-K-stress setting.
 
 ## Qwen2.5-VL × LongVideoBench — Experiment C: K/V isolation mini-sweep (2026-05-07)
 
