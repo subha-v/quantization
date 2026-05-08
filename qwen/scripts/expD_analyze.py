@@ -311,6 +311,12 @@ def combined_analysis(labeled_d0: dict[str, dict],
         ("D1_5b_TextBF16_Top2VisBF16_VInt4", "D1_6b_TextBF16_Rand2VisBF16_VInt4_seed0"),
         ("D1_5a_TextBF16_Top1VisBF16_VInt4", "D1_7a_TextBF16_UniformMidVisBF16_VInt4"),
         ("D1_5b_TextBF16_Top2VisBF16_VInt4", "D1_7b_TextBF16_Uniform2VisBF16_VInt4"),
+        ("D1_5a_mh_TextBF16_Top1MaxheadVisBF16_VInt4",
+            "D1_6a_TextBF16_Rand1VisBF16_VInt4_seed0"),
+        ("D1_5b_mh_TextBF16_Top2MaxheadVisBF16_VInt4",
+            "D1_6b_TextBF16_Rand2VisBF16_VInt4_seed0"),
+        ("D1_5a_mh_TextBF16_Top1MaxheadVisBF16_VInt4",
+            "D1_5a_TextBF16_Top1VisBF16_VInt4"),
         ("D1_4_TextInt4_VisBF16_VInt4",     "D1_3_TextBF16_VisInt4_VInt4"),
     ]
     for a, b in pairs:

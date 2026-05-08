@@ -97,11 +97,21 @@ def avg_kv_bits_for_mask(
 # ===================================================================
 
 
-def conditions_for_item(top1: int, top2: list[int], n_windows: int, seeds: list[int]):
+def conditions_for_item(top1: int, top2: list[int],
+                        top1_mh: int, top2_mh: list[int],
+                        n_windows: int, seeds: list[int]):
     """Yield (name, build_kwargs) for each D1 condition this item runs.
 
     build_kwargs has keys: text_protect, visual_default_protect,
     visual_protect_windows, k_visual_policy (string label), seed (or None).
+
+    `top1` / `top2` are from D0's `evidence_attn_all` (raw-mass-pooled across all
+    L, h) — the primary selector. `top1_mh` / `top2_mh` are from D0's
+    `evidence_attn_maxhead` — the per-(L, h)-normalized variant that picks the
+    sharpest single head. Both are tested in parallel because in D0 the all-
+    pooled selector exhibited an attention-sink pathology (top1=window-0 in
+    97.5% of items), so D1.5a-mh is the cleaner test of "does attention pick
+    causal evidence windows."
     """
     middle = n_windows // 2  # uniform-1 fallback
     uniform2 = sorted({0, middle})
@@ -117,12 +127,22 @@ def conditions_for_item(top1: int, top2: list[int], n_windows: int, seeds: list[
     yield ("D1_5a_TextBF16_Top1VisBF16_VInt4", dict(
         text_protect=True, visual_default_protect=False,
         visual_protect_windows=[int(top1)],
-        k_visual_policy="top1_BF16", seed=None,
+        k_visual_policy=f"top1_all_BF16_w{int(top1)}", seed=None,
     ))
     yield ("D1_5b_TextBF16_Top2VisBF16_VInt4", dict(
         text_protect=True, visual_default_protect=False,
         visual_protect_windows=[int(w) for w in top2],
-        k_visual_policy="top2_BF16", seed=None,
+        k_visual_policy=f"top2_all_BF16_{sorted(int(w) for w in top2)}", seed=None,
+    ))
+    yield ("D1_5a_mh_TextBF16_Top1MaxheadVisBF16_VInt4", dict(
+        text_protect=True, visual_default_protect=False,
+        visual_protect_windows=[int(top1_mh)],
+        k_visual_policy=f"top1_maxhead_BF16_w{int(top1_mh)}", seed=None,
+    ))
+    yield ("D1_5b_mh_TextBF16_Top2MaxheadVisBF16_VInt4", dict(
+        text_protect=True, visual_default_protect=False,
+        visual_protect_windows=[int(w) for w in top2_mh],
+        k_visual_policy=f"top2_maxhead_BF16_{sorted(int(w) for w in top2_mh)}", seed=None,
     ))
     for s in seeds:
         yield (f"D1_6a_TextBF16_Rand1VisBF16_VInt4_seed{s}", dict(
@@ -206,13 +226,23 @@ def run_item_d1(
 
     top1 = int(d0_row["top1_window_all"])
     top2 = list(d0_row["top2_windows_all"])
+    # Maxhead-derived windows: top1_window_maxhead is in D0; top2 isn't saved
+    # explicitly but we can derive it from evidence_attn_maxhead (saved [8]).
+    top1_mh = int(d0_row["top1_window_maxhead"])
+    ev_mh = d0_row.get("evidence_attn_maxhead", [])
+    if isinstance(ev_mh, list) and len(ev_mh) == n_windows:
+        sorted_idx = sorted(range(n_windows), key=lambda i: -ev_mh[i])
+        top2_mh = sorted(sorted_idx[:2])
+    else:
+        # Fallback: top1_mh + middle as a stand-in
+        top2_mh = sorted({top1_mh, n_windows // 2})
     bf16_pred = int(d0_row["pred_full64"])
     bf16_correct = bool(bf16_pred == correct)
 
     rows: list[dict] = []
     K_HI, K_LO, V_BITS = 16, 4, 4
 
-    for name, kw in conditions_for_item(top1, top2, n_windows, seeds):
+    for name, kw in conditions_for_item(top1, top2, top1_mh, top2_mh, n_windows, seeds):
         mask = build_mask(
             seq_len=seq_len, v_start=v_start, v_end=v_end,
             text_protect=kw["text_protect"],
@@ -271,6 +301,8 @@ def run_item_d1(
             # D0 join fields (read at runtime so analyze can post-hoc re-stratify)
             "top1_window_all": top1,
             "top2_windows_all": top2,
+            "top1_window_maxhead": top1_mh,
+            "top2_windows_maxhead": top2_mh,
             "bf16_pred": bf16_pred,
             "bf16_correct": bf16_correct,
         })
