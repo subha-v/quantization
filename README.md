@@ -387,6 +387,59 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
+## Qwen2.5-VL × LongVideoBench — Experiment D: Evidence-Window + Cross-Modal Visual-Key Diagnostic (2026-05-07, plumbing staged)
+
+After Exp C nailed K-fragility at INT4, **Exp D** asks the VLM-specific question: does low-bit visual-key quantization break long-video VLMs by corrupting *question-specific evidence retrieval*? Combined two-phase pipeline on the same 200 LongVideoBench eval items at 64 frames:
+
+**Phase D0 — Evidence-window diagnostic (BF16 only).** For each item, run 8 BF16 forwards: Full-64 (eager + answer-query attention capture), Uniform-16, Top-1-window-only, Top-2-windows-only, Top-1-window-removed, Random-window-removed × 3 seeds. Classify by what visual evidence the question needs:
+- *localized* — full64 correct ∧ top-window-only correct ∧ top-window-removed flips ∧ removal hurts more than random removal
+- *global* — full64 correct ∧ uniform-16 correct ∧ top-window-removal does not hurt
+- *distributed* — full64 correct ∧ top-1-only fails
+- *attention_not_causal* — top-attention removal hurts no more than random
+
+The top-window selector pools **raw visual-window attention mass** across all 28 layers × 4 KV-heads, then normalizes over 8 windows (8 frames each). Raw-mass pooling first naturally downweights text-focused heads. Mid-layer (8–20) and per-head-max variants saved as sensitivity diagnostics.
+
+**Phase D1 — Cross-modal K/V quantization.** V is fixed at INT4 everywhere (Exp C: V at INT4 is essentially free if K is BF16). K is varied per condition via the new `BitController` V3K mode (per-token K mask, V uses layer's v_bits):
+
+| Condition | Text-K | Visual-K policy | V |
+|---|---|---|---:|
+| D1.3 | BF16 | INT4 (all) | INT4 |
+| D1.4 | INT4 | BF16 (all) | INT4 |
+| **D1.5a** | BF16 | top-1 BF16 / rest INT4 | INT4 |
+| D1.5b | BF16 | top-2 BF16 / rest INT4 | INT4 |
+| D1.6a/b | BF16 | random-1/2 BF16 (×3 seeds) | INT4 |
+| D1.7a/b | BF16 | uniform-spaced 1/2 BF16 | INT4 |
+
+Headline test: on **localized** items, does `D1.5a` (top-1 visual-K BF16) beat `D1.6a` (random-1 visual-K BF16) at matched bit budget? If yes → answer-query attention picks visual evidence windows that matter for retrieval under K quantization.
+
+### Implementation
+
+- `qwen/scripts/fake_quant_kv_cache.py` — added `BitController` mode `V3K` (K masked per-token, V uses layer's v_bits). Backward-compatible with existing V1/V2/V3.
+- `qwen/scripts/data_longvideobench.py` — added `format_mcq_messages_with_frames(item, frames)` for precomputed-frame inputs.
+- `qwen/scripts/visual_tokens.py` — `find_visual_token_span` (locates `<|vision_start|>`/`<|vision_end|>`) + `build_window_token_ranges`.
+- `qwen/scripts/frame_manip.py` — `decode_uniform_frames` (decord→imageio→cv2 fallback), window-index helpers, optional blank-in-place v2.
+- `qwen/scripts/expD0_evidence_diagnostic.py` — Phase D0 driver (8 BF16 forwards/item with `EvidenceWindowAttentionHook`).
+- `qwen/scripts/expD1_crossmodal_kv.py` — Phase D1 driver (per-condition V3K K-mask construction, V always INT4).
+- `qwen/scripts/expD_smoke.py` — 5 correctness checks (visual span, window mapping, V3K logits-differ, mask-cache alignment, frame-removal end-to-end).
+- `qwen/scripts/expD_analyze.py` — applies evidence labels post-hoc; produces `expD0_summary.md`, `expD1_summary.md`, `expD_combined_analysis.md` (D1 stratified by D0 label).
+- `qwen/scripts/run_expD.sh smoke|d0|d1|analyze|full` — orchestrator.
+
+### Running on tambe-server-1
+
+```bash
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+source /data/subha2/experiments/qwen_venv/bin/activate
+nvidia-smi
+tmux new -s qwen-expD
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh smoke      # ~30 min
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh d0         # ~4h
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expD.sh d1         # ~5h
+bash qwen/scripts/run_expD.sh analyze                                # no GPU
+```
+
+Frame-manipulation v1 = frame removal (sequence length and temporal positions change for top-only / window-removed conditions). Marked in JSONL as `mode="frame_removal_v1"`. Stretch-goal v2 = blank-in-place via decord pre-decode + black-frame substitution; deferred until v1 produces a meaningful evidence signal worth refining.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment C: K/V isolation mini-sweep (2026-05-07)
 
 **Headline: K-quantization is the killer at INT4; V is essentially free.** Four conditions on 100 stratified eval items each, leaving one of K or V at BF16 and quantizing the other:

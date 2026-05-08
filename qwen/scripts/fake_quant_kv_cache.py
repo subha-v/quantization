@@ -118,11 +118,14 @@ class BitController:
         V1: scalar bits per layer.
         V2: tensor[num_kv_heads] bits per layer.
         V3: per-token mask + hi/lo bits per layer (set via set_protected_mask).
+            Same mask drives both K and V (symmetric).
+        V3K: same per-token mask but K-only — V uses the layer's v_bits scalar.
+            Used by Exp D1 (cross-modal visual-K protection at INT4 V).
     """
 
     def __init__(self, num_layers: int, num_kv_heads: int, mode: str = "V1",
                  default_k_bits: int = 16, default_v_bits: int = 16):
-        assert mode in ("V1", "V2", "V3")
+        assert mode in ("V1", "V2", "V3", "V3K")
         self.num_layers = num_layers
         self.num_kv_heads = num_kv_heads
         self.mode = mode
@@ -168,7 +171,7 @@ class BitController:
         cache_offset = number of tokens already in cache (for V3 mask alignment).
         Returns (k_bits, v_bits). Each is either an int or a tensor broadcastable to [H, T_new].
         """
-        if self.mode == "V3" and layer_idx in self.protected:
+        if self.mode in ("V3", "V3K") and layer_idx in self.protected:
             mask, hi, lo = self.protected[layer_idx]
             end = cache_offset + new_chunk_len
             if end <= mask.shape[0]:
@@ -178,6 +181,8 @@ class BitController:
                 slice_mask = torch.cat([mask[cache_offset:], pad], dim=0)
             bits = torch.where(slice_mask, hi, lo).long()
             bits_hk = bits.unsqueeze(0).expand(num_kv_heads, -1)
+            if self.mode == "V3K":
+                return bits_hk, self.v_bits[layer_idx]
             return bits_hk, bits_hk
         return self.k_bits[layer_idx], self.v_bits[layer_idx]
 

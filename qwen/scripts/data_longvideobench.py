@@ -219,6 +219,40 @@ def format_mcq_messages(item: LVBItem, n_frames: int, max_pixels: int = 360 * 42
     ]
 
 
+def format_mcq_messages_with_frames(item: LVBItem, frames, max_pixels: int = 360 * 420) -> list[dict]:
+    """Like format_mcq_messages but with a precomputed frame iterable.
+
+    `frames` may be:
+      - list[PIL.Image] — passed directly to qwen_vl_utils
+      - list[str] — file:// or absolute paths to JPEGs
+      - list[np.ndarray] — HxWxC uint8 RGB arrays (qwen_vl_utils handles these)
+
+    Used by Exp D0/D1 for top-window-only / window-removed conditions where we
+    need to control which frames the processor sees without re-decoding.
+    """
+    n = len(item.candidates)
+    letters = OPTION_LETTERS[:n]
+    options_text = "\n".join(f"{letter}. {cand}" for letter, cand in zip(letters, item.candidates))
+    letter_list = ", ".join(letters)
+    user_text = (
+        f"{item.question}\n\nOptions:\n{options_text}\n\n"
+        f"Answer with a single letter from {letter_list}."
+    )
+    return [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "video",
+                    "video": list(frames),
+                    "max_pixels": max_pixels,
+                },
+                {"type": "text", "text": user_text},
+            ],
+        }
+    ]
+
+
 def answer_token_ids(processor, n: int = 5) -> list[int]:
     """Resolve single-token IDs for the first n option letters (default 5: A..E).
 
