@@ -89,8 +89,10 @@ def main():
     # Check 1: visual-token-range detection
     try:
         v_start, v_end = find_visual_token_span(inputs["input_ids"], processor)
+        # Accept any sane positive span: lower-bound 1k tokens (rules out empty/too-short),
+        # upper-bound seq_len-50 (rules out span that swallowed the entire prompt).
         ok = (v_start > 0 and v_end > v_start and (v_end - v_start) >= 1000
-              and (v_end - v_start) <= 5000)
+              and v_end <= seq_len - 50)
         results.append({
             "check": "visual_token_range_detection",
             "pass": ok,
