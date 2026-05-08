@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-08:** **Five experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 eval items × 8 BF16 conditions, 1h 26min wall on H100), and Exp D1 Cross-modal K/V quantization (200 eval items × 14 V3K-K-mask conditions, 1h 42min wall on H100). Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + **2800 D1 per-item-per-condition rows** (200 items × 14 conditions).
+**Status as of 2026-05-08:** **Six experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), and Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall). Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + **2200 E1 per-item-per-condition rows**.
 
 ## Headline
 
@@ -62,6 +62,16 @@
 > 2. **Finer text-K partition.** Split text-K into prompt header / question / options / instruction. Which slice carries the fragility? If it's *just* the question or *just* the options, that's an even cheaper rescue.
 > 3. **Test on long-form video QA generation.** First-token MCQ may be a degenerate setting that hides visual-K importance. Long-form generation queries visual content repeatedly across many decode steps; the visual-K effect may rise. Try Video-MME / MVBench long-form items with multi-token decoding.
 > 4. **Drop the visual-K window-routing approach.** The infrastructure (V3K mode, window-mass selectors, per-token K mask) is good, but the routing object — visual evidence windows under MCQ — has been shown not to be the right object. Re-target to text-K or text-substring routing.
+>
+> **Exp E1 Text-K slice ablation — text-K-routing hypothesis ALSO falsified. Both prompt-role and quantization-difficulty signals fail.** 200 items × 11 V3K text-K-mask conditions (V always INT4, visual-K always INT4, only text-K varied):
+>
+> 25. **No single text slice or pair recovers most of D1.3's 17.5 pp text-K rescue.** Best single condition is `E1.4 OptionsOnly` (40 tokens, **0.290** acc), recovering only 45.7% of the floor → ceiling gap. Other slices: header 0.215, question 0.175 (BELOW floor), instruction+answer-prefix 0.225, Q+O 0.270, O+AP 0.185, Q+O+AP 0.205.
+> 26. **Adding more text slices to the union HURTS.** `E1.7 (Options + AnsPrefix, 45 tok) − E1.4 (Options alone, 40 tok) = −10.5 pp` despite 5 *more* BF16 tokens. `E1.8 (Q+O+AP, 96 tok) − E1.4 = −8.5 pp` despite 56 more BF16 tokens. The K-side is sensitive to *which positions are at which precision relative to each other*, not just to the BF16 fraction.
+> 27. **K-residual selection is *worse* than random.** E1.10 (top-20 text positions by per-position INT4 K-row residual norm, mean over 28 layers × 4 KV-heads, captured online per-item) lands at 0.200 — *below* E1.0 floor (0.210) and *below* E1.9 random-20 (mean 0.215 over 3 seeds). Protecting the highest-residual K positions actively damages accuracy.
+> 28. **Random-20 is at floor.** E1.9 across 3 seeds: 0.220 / 0.215 / 0.210. No statistical separation from E1.0 uniform INT4 K/V at 0.210. 20 of ~140 text-K positions at BF16 doesn't recover anything regardless of selection.
+> 29. **Verdict matrix: NO condition is sufficient** (≥80% of E1.1's 0.385 acc at <50% of E1.1's 140 tokens). Every fixed slice, union, random, and K-residual condition fails one or both criteria. Full text-K must be protected to capture the rescue.
+>
+> **Combined D1 + E1 implication.** Routing within K alone is *ruled out* as a research direction for first-token MCQ scoring on Qwen2.5-VL. The signal that actually matters is *whether* K is at BF16 or INT4 in aggregate (text-K bulk vs visual-K bulk = +17.5 pp; D1.3 vs uniform-INT4 = +17.5 pp; sub-divisions don't compose monotonically). The actionable next direction is **K-side outlier-aware INT4 quantization itself**: KIVI per-channel K calibration, AKVQ-VL static K outlier extraction, or post-RoPE per-channel K scale. Once uniform-INT4-K at all 5900 positions is recoverable to within 5 pp of BF16, the visual-K + text-K + V-INT4 setup gives ~10 KV avg bits without the 30 pp Exp A collapse — without any routing.
 
 The methodology gates: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (smoke threshold 1e-3) — `FakeQuantKVCache.update()` feeds the SDPA matmul as designed. Diagnostic pass produces 0 NaN entropy/residual rows on 33,600 (item × L × H) signals; `bf16_pred ≠ uniform_int2_pred` on 90%+ of items, confirming the routing decisions are operating on real signal.
 
@@ -600,9 +610,9 @@ The visual-evidence-window precision-routing thesis is **falsified in the MCQ fi
 - `qwen/results/expD_combined_analysis.md` — D1 stratified by D0 evidence label + headline-pair table.
 - `qwen/results/expD1_crossmodal_kv.progress.log` — full server progress log.
 
-## Experiment E1 — Text-K slice ablation, Pass A interim (2026-05-08)
+## Experiment E1 — Text-K slice ablation, COMPLETE (2026-05-08)
 
-**Status:** Pass A complete (7 conditions × 200 eval items × 64 frames, 1h 42min wall on H100). Pass B (E1.9 random + E1.10 K-residual top-N at global median budget N = 20) is in flight; this section reports Pass A results only. Two implementation bugs were caught and fixed in the smoke + early Pass B (BPE-merge-driven slice mismatch in `find_text_slice_spans`; `TextKResidualCache` composition not subscriptable for transformers); see git log for fixes.
+**Status:** Pass A complete (7 conditions × 200 items, 54 min wall, 0 failures). Pass B complete (4 conditions × 200 items, 35 min wall, 0 failures). Total 11 routed conditions × 200 items + 2 reused references = **2200 E1 rows**. Both passes ran cleanly after two implementation bug fixes (BPE-driven slice mismatch in `find_text_slice_spans` → switched to marker-based detection; `TextKResidualCache` composition not subscriptable → switched to direct `DynamicCache` subclass). Two implementation bugs were caught and fixed in the smoke + early Pass B (BPE-merge-driven slice mismatch in `find_text_slice_spans`; `TextKResidualCache` composition not subscriptable for transformers); see git log for fixes.
 
 E1 follows up D1's headline finding (text-K is the dominant fragility, not visual-K). The natural question: *which* of the ~140 text-K positions carry the fragility? V at INT4 everywhere; visual-K at INT4 everywhere; only text-K is masked between BF16 and INT4 via the `BitController` V3K mode.
 
@@ -693,20 +703,80 @@ This points to **text K being broadly fragile** rather than localized to a speci
 - If `E1.10 K-residual top-20` ≫ `E1.9 random-20`: the right object is *quantization difficulty* (which positions have the largest K-row outliers), not prompt role. Action: AKVQ-VL-style per-channel K outlier extraction restricted to text positions.
 - If `E1.9 random-20` ≈ `E1.10 K-residual top-20` ≈ `E1.5 InstrAnsPrefix` (~22 tok): any 20-token text-K BF16 protection helps about the same; full text-K must be protected for the headline rescue. Action: text-K outlier handling at INT4 is needed; partial protection is insufficient.
 
-### Implementation notes & two bugs caught in this run
+### Pass B results — both routing hypotheses falsified
 
-1. **Slice detection bug (smoke).** First-pass `text_slices.py` standalone-tokenized `item.question` and searched its tokenization in `input_ids`. BPE merges across the question/options boundary (specifically `\n\n` between question and `Options:`) caused 100% of items to fail the question search. Fix: marker-based slice derivation. Locate the `Options:` and `Answer with a single letter from A, B, C, D, E.` markers in `input_ids` (with multiple spelling variants tried in most-specific-first order, plus up to 3-character left trims for BPE tolerance), and derive `question = [v_end + 1, options_marker_start)` by subtraction. Robust across all 200 eval items; only diagnostic warnings logged (which most-specific marker variant matched for 4-way vs 5-way MCQ items).
+Pass B tested whether random-20 or K-residual-top-20 text-K BF16 protection at the same budget as the median best-fixed-slice (N = 20 tokens) could match or beat the fixed-slice conditions.
 
-2. **Cache-class subscript bug (Pass B).** First-pass `TextKResidualCache` used composition (`self._inner = DynamicCache()`) with `__getattr__` forwarding. Transformers calls `cache[layer_idx]` (subscript) on `past_key_value`, which is a dunder method `__getitem__` not caught by `__getattr__` — failed on all 200 items in Pass B with `TypeError: 'TextKResidualCache' object is not subscriptable`. Fix: subclass `DynamicCache` directly (proper is-a inheritance). Pass A data was unaffected; Pass B re-launched cleanly with the fix.
+| ID | Method | tokens | acc | 95% CI | Δ vs floor (0.210) |
+|---|---|---:|---:|---|---:|
+| **E1.10** | **K-residual top-20** (per-item INT4 K-row residual norm, mean over (L, h)) | 20 | **0.200** | [0.145, 0.255] | **−1.0 pp** (BELOW floor) |
+| E1.9-s0 | Random-20 (seed 0) | 20 | 0.220 | [0.165, 0.280] | +1.0 pp |
+| E1.9-s1 | Random-20 (seed 1) | 20 | 0.215 | [0.160, 0.275] | +0.5 pp |
+| E1.9-s2 | Random-20 (seed 2) | 20 | 0.210 | [0.155, 0.270] | +0.0 pp |
+| E1.9 mean | Random-20 (3-seed mean) | 20 | 0.215 | — | +0.5 pp |
+| (ref) E1.5 | InstrAnsPrefix (instr + answer-prefix) | 22 | 0.225 | [0.170, 0.285] | +1.5 pp |
+| (ref) E1.4 | OptionsOnly (best fixed slice) | 40 | 0.290 | [0.225, 0.355] | +8.0 pp |
 
-### Files of record (Exp E1, Pass A)
+**Two negative results:**
 
-- `qwen/scripts/text_slices.py` — `find_text_slice_spans` (marker-based), `union_mask`, `positions_to_mask`, `text_positions`, `TextKResidualCache` (subclass of `DynamicCache`).
-- `qwen/scripts/expE1_text_slice_ablation.py` — Pass A + Pass B driver (`--phase passA|passB`).
-- `qwen/scripts/expE1_smoke.py` — 5-check smoke test.
+1. **K-residual is *worse* than random.** E1.10 (top-20 by per-position INT4 K-row residual norm) at 0.200 is below E1.9 random-20 (mean 0.215). Quantization difficulty is not just an irrelevant signal — protecting hard-to-quantize text-K positions is *actively harmful*. Mechanistically consistent with the Pass A non-monotonicity (E1.7 O+AnsPrefix < E1.4 O alone): the highest-residual K positions are likely the ones most depended-on by attention, and shifting the symmetric per-channel quantizer's scale to spare them may distort the lower-residual positions' representations more than uniform INT4 would.
+
+2. **Random-20 is at floor.** No statistically meaningful separation between E1.9 (any seed, 0.210-0.220) and E1.0 (uniform INT4 K/V floor, 0.210). Random text-K BF16 at 20 tokens out of ~140 doesn't recover anything.
+
+3. **InstrAnsPrefix (22 tokens, 0.225) is essentially tied with random-20 (mean 0.215).** Even the structurally important "answer scaffold" (instruction + `<|im_start|>assistant\n`) is no better than random text-K BF16 at the same token budget.
+
+### Verdict matrix (sufficient = ≥80% of E1.1's 0.385 acc at <50% of E1.1's 140 tokens)
+
+The threshold is **0.308 acc at <70 tokens**.
+
+| Condition | acc | tokens | meets 80% acc | <50% tokens | sufficient? |
+|---|---:|---:|:-:|:-:|:-:|
+| E1.10 K-residual top-20 | 0.200 | 20 | ❌ | ✅ | ❌ |
+| E1.2 HeaderOnly | 0.215 | 14 | ❌ | ✅ | ❌ |
+| E1.3 QuestionOnly | 0.175 | 50 | ❌ | ✅ | ❌ |
+| E1.4 OptionsOnly | 0.290 | 40 | ❌ (close) | ✅ | ❌ |
+| E1.5 InstrAnsPrefix | 0.225 | 22 | ❌ | ✅ | ❌ |
+| E1.6 Q + O | 0.270 | 91 | ❌ | ❌ | ❌ |
+| E1.7 O + AnsPrefix | 0.185 | 45 | ❌ | ✅ | ❌ |
+| E1.8 Q + O + AnsPrefix | 0.205 | 96 | ❌ | ❌ | ❌ |
+| E1.9 random-20 (mean) | 0.215 | 20 | ❌ | ✅ | ❌ |
+
+**No condition is sufficient.** Every routing strategy — prompt-role-based slices, semantic unions, random selection, K-residual selection — either fails the accuracy threshold or the budget threshold. The full text-K (140 tokens, E1.1 = D1.3) must be protected to capture the rescue.
+
+### Combined headline — D1 + E1 falsifies in-K-routing entirely
+
+D1 (visual-K windows) and E1 (text-K subspans + random + K-residual) together rule out **routing within K alone** as a research direction for first-token MCQ scoring on Qwen2.5-VL-7B + LongVideoBench:
+
+- **Within visual-K:** all 11 D1 visual-K-routing conditions cluster in [0.395, 0.435]; no separation by selection method (top-attention, maxhead, random, uniform). The signal that mattered was text-K vs visual-K (D1.4 0.210 vs D1.3 0.385), not which visual-K windows.
+- **Within text-K:** all 11 E1 text-K-routing conditions cluster in [0.175, 0.290], well below E1.1 0.385 (= full text-K BF16). No subset, union, random, or K-residual ranking reaches the rescue.
+
+The actionable next direction is **K-side outlier-aware INT4 quantization itself**, not routing. Concretely: per-channel K calibration (KIVI-style), AKVQ-VL-style static K outlier extraction, or post-RoPE per-channel K scale calibration. These all attack the K fragility *within* the quantizer rather than trying to spare a subset to BF16. Once uniform-INT4-K at full 5900 positions is recoverable, the visual-K + text-K + V-INT4 setup gives ~10 KV bits avg without the 30 pp Exp A collapse.
+
+### Mechanistic interpretation
+
+Two consistent observations across D1, E1 Pass A, and E1 Pass B:
+
+1. **Adding more BF16 K positions doesn't monotonically help.** E1 Pass A: E1.7 (O + AnsPrefix, 45 tok) < E1.4 (O alone, 40 tok). E1 Pass B: K-residual-top-20 (worst residual positions protected) < random-20. D1: top-1-visual-K BF16 ≈ random-1-visual-K BF16. The K-side of attention is sensitive to *which positions are at which precision relative to each other*, not just to which fraction is at BF16.
+
+2. **The per-channel symmetric INT4 quantizer is brittle to non-uniform precision profiles.** Sparing a small subset of K positions to BF16 doesn't strictly improve over uniform INT4 — sometimes it makes things worse by changing the effective per-(L, h, position) scale interactions during attention. This is consistent with KIVI's argument that *per-channel* calibration (rather than per-token / per-position) is the right primitive for K.
+
+### Files of record (Exp E1, complete)
+
+- `qwen/scripts/text_slices.py` — `find_text_slice_spans` (marker-based), `union_mask`, `positions_to_mask`, `text_positions`, `TextKResidualCache` (subclass of `DynamicCache`), `capture_text_k_residuals`.
+- `qwen/scripts/expE1_text_slice_ablation.py` — Pass A + Pass B driver (`--phase passA|passB`); Pass B reads Pass A JSONL to compute global median budget N.
+- `qwen/scripts/expE1_smoke.py` — 5-check smoke test (visual span, slice non-overlap, decode round-trip, V3K logits-differ on question-only mask, V3K question-only distinct from all-text-BF16).
 - `qwen/scripts/run_expE1.sh` — orchestrator (`smoke|passA|passB|analyze|full`).
-- `qwen/scripts/expD_analyze.py` — extended with `summarize_e1` for E1 summary + pair analysis.
-- `qwen/results/expE1_text_slice_ablation.jsonl` — 1400 Pass A rows (200 items × 7 conditions); Pass B appends 800 more rows (200 × 4 conditions = 3 random seeds + 1 K-residual).
+- `qwen/scripts/expD_analyze.py` — extended with `summarize_e1` (per-condition + BF16-correct preservation + verdict matrix + per-bucket).
+- `qwen/results/expE1_text_slice_ablation.jsonl` — 2200 rows (200 items × 11 conditions: 7 fixed slices + 3 random seeds + 1 K-residual).
+- `qwen/results/expE1_summary.md` — auto-generated.
+- `qwen/results/expE1_pair_analysis.md` — auto-generated (pair table + per-bucket + verdict matrix).
+- `qwen/results/expE1_text_slice_ablation.progress.log` — server progress log.
+
+### Bug postmortems
+
+1. **Slice detection bug (smoke).** First-pass `text_slices.py` standalone-tokenized `item.question` and searched its tokenization in `input_ids`. BPE merges across the question/options boundary (specifically the `\n\n` between question and `Options:`) caused 100% of items to fail the question search. Fix: marker-based slice derivation. Locate the `Options:` and `Answer with a single letter from A, B, C, D, E.` markers in `input_ids` (with multiple spelling variants tried in most-specific-first order, plus up to 3-character left trims for BPE tolerance), and derive `question = [v_end + 1, options_marker_start)` by subtraction.
+
+2. **Cache-class subscript bug (Pass B).** First-pass `TextKResidualCache` used composition (`self._inner = DynamicCache()`) with `__getattr__` forwarding. Transformers calls `cache[layer_idx]` (subscript) on `past_key_value` — `__getitem__` is a dunder method not caught by `__getattr__`. Failed on all 200 items in Pass B with `TypeError: 'TextKResidualCache' object is not subscriptable`. Fix: subclass `DynamicCache` directly (proper is-a inheritance). Pass A data was unaffected; Pass B re-launched cleanly with the fix.
 
 ## Methodological lessons learned (cumulative)
 
@@ -749,6 +819,19 @@ qwen-expD-d1 (tmux session, GPU 0) — PIPELINE COMPLETE (1h 42min total)
               D1.7a/b (uniform) → 0.395 / 0.395
               All visual-K-protected conditions cluster in [0.395, 0.435] —
               window selection is irrelevant. Text-K is the dominant fragility.
+
+qwen-expE1 (tmux sessions: passA + passB) — PIPELINE COMPLETE (89 min total)
+├── ✅ STEP 1  passA: 7 fixed-slice conditions × 200 items (54 min)
+│             E1.4 OptionsOnly (40 tok) → 0.290  ← best single, recovers 46% rescue
+│             E1.6 Q+Options (91 tok) → 0.270, E1.5 InstrAnsPrefix (22 tok) → 0.225,
+│             E1.2 HeaderOnly (14 tok) → 0.215, E1.8 Q+O+AP (96 tok) → 0.205
+│             E1.7 O+AP (45 tok) → 0.185 ← BELOW floor; E1.3 Question (50 tok) → 0.175
+└── ✅ STEP 2  passB: random-20 (3 seeds) + K-residual-top-20 × 200 items (35 min)
+              Global median budget N=20 from passA's per-item best slice.
+              E1.10 K-residual-top-20 → 0.200 ← BELOW floor and BELOW random
+              E1.9 random-20 (3 seeds) → 0.220 / 0.215 / 0.210 (= floor)
+              No condition is sufficient (≥80% of D1.3 acc at <50% of D1.3 tokens).
+              Text-K routing falsified at every selection signal tested.
 ```
 
 ## Files of record

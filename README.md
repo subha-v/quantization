@@ -387,6 +387,26 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
+## Qwen2.5-VL × LongVideoBench — Experiment E1: Text-K Slice Ablation (2026-05-08, COMPLETE)
+
+**Headline: text-K-routing hypothesis ALSO falsified.** After D1 showed text-K is the dominant fragility (vs visual-K), E1 asked *which* of the ~140 text-K positions carry the fragility. 200 items × 11 V3K text-K-mask conditions (V always INT4, visual-K always INT4, only text-K varied):
+
+- **Best single slice** is `E1.4 OptionsOnly` (40 tokens, **0.290** acc), recovering only **46% of D1.3's 17.5 pp text-K rescue**. All other slices land at or below the floor (0.210).
+- **Adding more slices to the union HURTS.** `E1.7 (Options + AnsPrefix, 45 tok) − E1.4 (Options alone, 40 tok) = −10.5 pp` despite 5 *more* BF16 tokens. The K-side is sensitive to *which positions are at which precision relative to each other*, not just the BF16 fraction.
+- **K-residual selection is *worse* than random.** E1.10 (top-20 text positions by per-position INT4 K-row residual norm) at 0.200 < E1.9 random-20 (mean 0.215 over 3 seeds) < E1.0 floor 0.210. Quantization difficulty is the *opposite* of the right signal.
+- **Verdict matrix: NO condition is sufficient** (≥80% of E1.1 = D1.3's 0.385 acc at <50% of E1.1's 140 tokens). Every fixed slice, union, random, and K-residual condition fails.
+
+**Combined D1 + E1 implication.** Routing within K alone — visual-K windows OR text-K subsets — is *ruled out* as a research direction for first-token MCQ scoring on Qwen2.5-VL. The signal that matters is whether K is at BF16 or INT4 *in aggregate*; sub-divisions don't compose monotonically. The actionable next direction is **K-side outlier-aware INT4 quantization itself** (KIVI per-channel K calibration, AKVQ-VL static K outlier extraction, post-RoPE per-channel K scale) — fix the quantizer, don't route around it. Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment E1".
+
+### E1 implementation notes
+
+- `qwen/scripts/text_slices.py` — `find_text_slice_spans` (marker-based: locates `Options:` and `Answer with...` markers in input_ids and derives the question span by subtraction; robust against BPE merges that broke standalone tokenize-and-search). `TextKResidualCache` (subclass of `DynamicCache`) captures per-position INT4 K-row residual during a BF16 forward.
+- `qwen/scripts/expE1_text_slice_ablation.py` — Pass A (7 fixed-slice conditions) + Pass B (random ×3 seeds + K-residual at global median budget computed from Pass A).
+- `qwen/scripts/expE1_smoke.py` — 5-check correctness gate (visual span, slice non-overlap, decode round-trip, V3K logits-differ on question-only mask, V3K question-only distinct from all-text-BF16).
+- `qwen/scripts/run_expE1.sh smoke|passA|passB|analyze|full`.
+
+Wall on H100: smoke ~30s, passA 54 min, passB 35 min, analyze <1s. Two implementation bugs caught and fixed: BPE-driven slice mismatch (smoke), and `TextKResidualCache` composition not subscriptable for transformers (Pass B). Both fixed; pipeline ran cleanly thereafter.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment D: Evidence-Window + Cross-Modal Visual-Key Diagnostic (2026-05-08, COMPLETE)
 
 **Headline: the visual-evidence-window precision-routing hypothesis is FALSIFIED for first-token MCQ scoring. Text-K is the dominant fragility.** D1.3 (text-K BF16, all 5760 visual-K INT4, V INT4) at avg 4.15 KV bits → 0.385. D1.4 (text-K INT4, all 5760 visual-K BF16, V INT4) at avg 9.85 KV bits → 0.210. D1.4 has 2.4× more KV bits and lands 17.5 pp WORSE — at the uniform-INT4 floor. All visual-K-routing conditions (top-1/2 attention, random, uniform, maxhead) cluster in [0.395, 0.435] with no separation by selection method. D0 also revealed the LM attention sink at the first visual token: `top1_window_all` collapses to window 0 in 195/200 items because heads dump no-op attention there; even fixing this via the maxhead diagnostic doesn't change the D1 outcome. Full writeup in `QWEN_EXPERIMENTS.md`.
