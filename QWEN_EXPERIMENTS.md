@@ -600,6 +600,114 @@ The visual-evidence-window precision-routing thesis is **falsified in the MCQ fi
 - `qwen/results/expD_combined_analysis.md` — D1 stratified by D0 evidence label + headline-pair table.
 - `qwen/results/expD1_crossmodal_kv.progress.log` — full server progress log.
 
+## Experiment E1 — Text-K slice ablation, Pass A interim (2026-05-08)
+
+**Status:** Pass A complete (7 conditions × 200 eval items × 64 frames, 1h 42min wall on H100). Pass B (E1.9 random + E1.10 K-residual top-N at global median budget N = 20) is in flight; this section reports Pass A results only. Two implementation bugs were caught and fixed in the smoke + early Pass B (BPE-merge-driven slice mismatch in `find_text_slice_spans`; `TextKResidualCache` composition not subscriptable for transformers); see git log for fixes.
+
+E1 follows up D1's headline finding (text-K is the dominant fragility, not visual-K). The natural question: *which* of the ~140 text-K positions carry the fragility? V at INT4 everywhere; visual-K at INT4 everywhere; only text-K is masked between BF16 and INT4 via the `BitController` V3K mode.
+
+### Pass A conditions and per-condition results (n=200)
+
+| ID | Slice protected at BF16 | n | acc | med_tokens | mean_margin | avg KV bits |
+|---|---|---:|---:|---:|---:|---:|
+| **E1.0** | (none — uniform INT4 K/V floor; reused from A5) | 200 | **0.210** | 0 | −0.871 | 4.00 |
+| **E1.1** | all text K (= D1.3, reused) | 200 | **0.385** | ~140 | −0.418 | 4.15 |
+| E1.2 | header only | 200 | 0.215 | 14 | −0.663 | 4.01 |
+| E1.3 | question only | 200 | 0.175 | 50 | −1.131 | 4.05 |
+| **E1.4** | **options only** | 200 | **0.290** | 40 | −0.874 | 4.06 |
+| E1.5 | instruction + answer-prefix | 200 | 0.225 | 22 | −1.294 | 4.02 |
+| E1.6 | question + options | 200 | 0.270 | 91 | −0.970 | 4.11 |
+| E1.7 | options + answer-prefix | 200 | 0.185 | 45 | −0.972 | 4.06 |
+| E1.8 | question + options + answer-prefix | 200 | 0.205 | 96 | −0.843 | 4.12 |
+
+### Headline findings
+
+1. **No single slice or pair recovers most of D1.3's rescue.** Best single condition is `E1.4 OptionsOnly` (40 tokens) at 0.290 — recovers **45.7%** of the 17.5 pp E1.0→E1.1 rescue gap. Every other slice recovers less, and several are at or below the floor.
+
+2. **Adding more slices to the union *hurts*.** This is the most surprising result.
+   - `E1.4 OptionsOnly` (40 tok): **0.290**
+   - `E1.6 Q + O` (91 tok): 0.270 — **2 pp worse despite 2.3× more BF16 tokens**
+   - `E1.7 O + AnsPrefix` (45 tok): **0.185** — 10.5 pp worse than O alone at nearly the same budget; below the floor
+   - `E1.8 Q + O + AnsPrefix` (96 tok): 0.205 — at floor
+
+   `E1.7 (O + AnsPrefix) − E1.4 (O alone) = −10.5 pp` at +5 tokens. Protecting the answer-prefix tokens *on top of* options actively damages accuracy. Mechanistically suspicious: the answer-prefix tokens (`<|im_end|>\n<|im_start|>assistant\n`) may be in a regime where their K-row magnitudes are extreme outliers; protecting them at BF16 while leaving everything else at INT4 may shift the attention distribution badly. Or it's a non-monotonicity in the per-channel symmetric INT4 quantizer when small numbers of tokens are spared. The interaction is robust across buckets, not a small-n artifact.
+
+3. **Question alone (50 tok, 0.175) is *below* the floor.** Protecting just the question text but corrupting everything else (header, options, instruction, answer-prefix) is the worst single-slice condition. `E1.3 QuestionOnly − floor = −3.5 pp; QuestionOnly − E1.4 OptionsOnly = −11.5 pp` at greater token cost.
+
+4. **Header alone (14 tokens, 0.215) is essentially at the floor (0.210).** The Qwen system header / role tags carry almost no useful K-side signal at INT4 ↔ BF16 isolation.
+
+5. **InstrAnsPrefix (22 tok, 0.225) is barely above the floor.** Protecting the answer-letter scaffold is *not* the dominant fragility — surprising given the 1-token MCQ task structure where this scaffold sets up the letter generation.
+
+6. **Per-bucket: OptionsOnly's mid-bucket result (0.455) is the standout cell.** It's the highest accuracy in the entire Pass A table, exceeding even E1.1 (D1.3) on the mid bucket where Full-64 BF16 is highest. Other buckets show the same OptionsOnly > {Q, header, AP} ordering but smaller gaps.
+
+| Condition | short | mid | long | very_long |
+|---|---:|---:|---:|---:|
+| E1.2 HeaderOnly | 0.273 | 0.212 | 0.209 | 0.194 |
+| E1.3 QuestionOnly | 0.182 | 0.182 | 0.224 | 0.119 |
+| **E1.4 OptionsOnly** | 0.212 | **0.455** | 0.254 | 0.284 |
+| E1.5 InstrAnsPrefix | 0.273 | 0.212 | 0.224 | 0.209 |
+| E1.6 Q + O | 0.273 | 0.364 | 0.239 | 0.254 |
+| E1.7 O + AnsPrefix | 0.212 | 0.273 | 0.164 | 0.149 |
+| E1.8 Q + O + AnsPrefix | 0.152 | 0.273 | 0.254 | 0.149 |
+
+### BF16-correct preservation
+
+| Condition | n_bf16_correct | preserved | rate |
+|---|---:|---:|---:|
+| E1.2 HeaderOnly | 100 | 22 | 0.220 |
+| E1.3 QuestionOnly | 100 | 18 | 0.180 |
+| **E1.4 OptionsOnly** | 100 | **36** | **0.360** |
+| E1.5 InstrAnsPrefix | 100 | 19 | 0.190 |
+| E1.6 Q + O | 100 | 33 | 0.330 |
+| E1.7 O + AnsPrefix | 100 | 22 | 0.220 |
+| E1.8 Q + O + AnsPrefix | 100 | 24 | 0.240 |
+
+`E1.4 OptionsOnly` preserves 36/100 BF16-correct items at 40 tokens BF16. That's just over half of E1.1 (D1.3)'s 55/100 at ~140 tokens. So options carries 2/3 the rescue at less than 1/3 the bit budget — but the marginal Q, header, and instruction tokens still account for the missing ~36% rescue and that signal does not concentrate on any particular slice.
+
+### Per-item best-slice distribution (tiebreaker: smaller token count)
+
+| Condition | n_items_won | % | typical n_tokens |
+|---|---:|---:|---:|
+| E1.2 HeaderOnly | 84 | 42.0% | 14 |
+| E1.5 InstrAnsPrefix | 37 | 18.5% | 22 |
+| E1.4 OptionsOnly | 34 | 17.0% | 40 |
+| E1.3 QuestionOnly | 16 | 8.0% | 50 |
+| E1.6 Q + O | 12 | 6.0% | 91 |
+| E1.7 O + AnsPrefix | 12 | 6.0% | 45 |
+| E1.8 Q + O + AnsPrefix | 5 | 2.5% | 96 |
+
+**Caveat on the per-item win rate.** HeaderOnly "wins" on 42% of items, but by tiebreaker on smallest token count when multiple slices give the same per-item answer (most often when *every* slice gets the answer wrong, the smallest-token-count slice wins by default). This is **not** evidence that header is meaningful — it's evidence that on most items, no slice is sufficient to recover the BF16 prediction, so the tiebreaker dominates. The aggregate accuracy table (E1.4 best at 0.290) is the more honest read.
+
+The **median per-item best-slice token count = 20**, which becomes the global budget `N` for Pass B's E1.9 (random) and E1.10 (K-residual) conditions.
+
+### Mechanism — text-K fragility is broadly distributed, not localized
+
+The Pass A result falsifies the prompt-role hypothesis ("the bottleneck is one or two specific text slices like options or answer-prefix"). Three distinct signals converge:
+
+1. The best single slice (`OptionsOnly`) recovers only 46% of the rescue gap.
+2. Adding more slices doesn't monotonically help — `O + AnsPrefix < O alone`, `Q + O + AnsPrefix < Q + O`, and the strict subset relations are *not* respected by accuracy. The interaction between text-slice K precisions appears non-monotonic.
+3. No two-slice union exceeds the best single slice meaningfully (E1.6 Q+O at 0.270 < E1.4 O at 0.290).
+
+This points to **text K being broadly fragile** rather than localized to a specific prompt role. Quantizing text K disrupts attention distributions across many positions simultaneously; protecting a subset isn't the same as protecting the whole. The expected next outcome (which Pass B will test):
+
+- If `E1.10 K-residual top-20` ≫ `E1.9 random-20`: the right object is *quantization difficulty* (which positions have the largest K-row outliers), not prompt role. Action: AKVQ-VL-style per-channel K outlier extraction restricted to text positions.
+- If `E1.9 random-20` ≈ `E1.10 K-residual top-20` ≈ `E1.5 InstrAnsPrefix` (~22 tok): any 20-token text-K BF16 protection helps about the same; full text-K must be protected for the headline rescue. Action: text-K outlier handling at INT4 is needed; partial protection is insufficient.
+
+### Implementation notes & two bugs caught in this run
+
+1. **Slice detection bug (smoke).** First-pass `text_slices.py` standalone-tokenized `item.question` and searched its tokenization in `input_ids`. BPE merges across the question/options boundary (specifically `\n\n` between question and `Options:`) caused 100% of items to fail the question search. Fix: marker-based slice derivation. Locate the `Options:` and `Answer with a single letter from A, B, C, D, E.` markers in `input_ids` (with multiple spelling variants tried in most-specific-first order, plus up to 3-character left trims for BPE tolerance), and derive `question = [v_end + 1, options_marker_start)` by subtraction. Robust across all 200 eval items; only diagnostic warnings logged (which most-specific marker variant matched for 4-way vs 5-way MCQ items).
+
+2. **Cache-class subscript bug (Pass B).** First-pass `TextKResidualCache` used composition (`self._inner = DynamicCache()`) with `__getattr__` forwarding. Transformers calls `cache[layer_idx]` (subscript) on `past_key_value`, which is a dunder method `__getitem__` not caught by `__getattr__` — failed on all 200 items in Pass B with `TypeError: 'TextKResidualCache' object is not subscriptable`. Fix: subclass `DynamicCache` directly (proper is-a inheritance). Pass A data was unaffected; Pass B re-launched cleanly with the fix.
+
+### Files of record (Exp E1, Pass A)
+
+- `qwen/scripts/text_slices.py` — `find_text_slice_spans` (marker-based), `union_mask`, `positions_to_mask`, `text_positions`, `TextKResidualCache` (subclass of `DynamicCache`).
+- `qwen/scripts/expE1_text_slice_ablation.py` — Pass A + Pass B driver (`--phase passA|passB`).
+- `qwen/scripts/expE1_smoke.py` — 5-check smoke test.
+- `qwen/scripts/run_expE1.sh` — orchestrator (`smoke|passA|passB|analyze|full`).
+- `qwen/scripts/expD_analyze.py` — extended with `summarize_e1` for E1 summary + pair analysis.
+- `qwen/results/expE1_text_slice_ablation.jsonl` — 1400 Pass A rows (200 items × 7 conditions); Pass B appends 800 more rows (200 × 4 conditions = 3 random seeds + 1 K-residual).
+
 ## Methodological lessons learned (cumulative)
 
 1. **`torch>=2.10` ships CUDA-13 wheels that silently fall back to CPU on driver 12.6.** Pinned to `torch==2.5.1+cu124`. Calibration "completed" in 7 seconds the first time because the model was on CPU.
