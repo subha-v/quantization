@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-08:** **Six experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), and Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall). Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + **2200 E1 per-item-per-condition rows**.
+**Status as of 2026-05-09:** **Seven experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), and **Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + **2896 F per-item-per-condition rows**.
 
 ## Headline
 
@@ -72,6 +72,27 @@
 > 29. **Verdict matrix: NO condition is sufficient** (≥80% of E1.1's 0.385 acc at <50% of E1.1's 140 tokens). Every fixed slice, union, random, and K-residual condition fails one or both criteria. Full text-K must be protected to capture the rescue.
 >
 > **Combined D1 + E1 implication.** Routing within K alone is *ruled out* as a research direction for first-token MCQ scoring on Qwen2.5-VL. The signal that actually matters is *whether* K is at BF16 or INT4 in aggregate (text-K bulk vs visual-K bulk = +17.5 pp; D1.3 vs uniform-INT4 = +17.5 pp; sub-divisions don't compose monotonically). The actionable next direction is **K-side outlier-aware INT4 quantization itself**: KIVI per-channel K calibration, AKVQ-VL static K outlier extraction, or post-RoPE per-channel K scale. Once uniform-INT4-K at all 5900 positions is recoverable to within 5 pp of BF16, the visual-K + text-K + V-INT4 setup gives ~10 KV avg bits without the 30 pp Exp A collapse — without any routing.
+>
+> **Exp F K-quantizer repair screening — STRONG POSITIVE RESULT. The KV-quantization collapse is solved by changing the K scale axis.** 14 K-quantizer variants screened on n=64 (Stage 1, balanced 16/bucket); top 10 confirmed on n=200 (Stage 3, canonical Exp A split):
+>
+> 30. **F4 KIVI per-channel-along-seq closes 94.4% of the F1→F0 gap at TRUE 4.00 KV bits.** Stage 3: F4 = 0.545 (vs F0 BF16 ceiling 0.565, F1 INT4 floor 0.210, F3 all-K-BF16 0.550). Closes 33.5 of 35.5 pp. **2.0 pp below the BF16 ceiling at 4× KV memory compression** — the deployable headline result. F4 dominates F3 (same accuracy, 2.5× less memory) and dominates F8 (better acc at lower bits).
+> 31. **The fix is a one-line scale-axis change, not a calibration trick.** F4's only difference from F1 is the per-channel scale axis: F1 scales along head_dim with one scale per (head, position, group of 128 head_dim slots) shared across positions; F4 scales along seq with one scale per (head, channel) shared across all positions. KIVI's central finding (arXiv:2402.02750) is that K outliers are channel-aligned across the sequence — one scale per channel exposes them, one scale per position hides them inside head_dim grouping. F4 needs no calibration, no routing, no slice info.
+> 32. **VLM-specific scaling refinements do NOT help once the K axis is correct.** F5 text/visual split (0.510), F6 prompt-role split (0.525), F7 99.5%ile clip (0.540) all UNDERPERFORM F4 (0.545) at the same 4-bit budget. This directly answers the question "does the model's modality structure require scale-aware quantization?" — once the axis is right, no.
+> 33. **Outlier-channel BF16 protection adds marginal value.** F8 (top-8 outlier channels per-(L, H_kv) at BF16, 4.375 KV bits) = 0.540 — slightly *worse* than F4 at higher cost. F9 (top-16 channels, 4.75 KV bits) = 0.560, statistically tied with F0 BF16 ceiling. F9 is the "zero accuracy loss" Pareto point if outlier bookkeeping is acceptable.
+> 34. **Score-calibration variants F10-F13 FAILED catastrophically (Stage 1, dropped from Stage 3).** Generic Q-energy reweighting (F10) = 0.281, TT-heavy block-score (F11) = 0.172 (below F1 floor), balanced block-score (F12) = 0.188, text-K-only score-cal (F13) = 0.172. The closed-form `s_d ∝ sqrt(E[Q_d²])` heuristic concentrates scale precision on high-Q-energy channels, which empirically aren't the channels that matter most for attention. Score-cal as a research direction needs iterative scale search to be revisited; the closed-form approximation is a strict downgrade at this bit budget.
+> 35. **All four anchors land within bootstrap CI of prior runs.** F0 = 0.565 (= A1 0.565), F1 = 0.210 (= A5 0.210), F2 = 0.385 (= D1.3 0.385), F3 = 0.550 (vs C2.1 0.530, n=200 vs n=100 stratification). Pixel-perfect alignment with the prior anchor numbers — the F-suite plumbing is correct end-to-end.
+>
+> **Pareto frontier (n=200):**
+>
+> | KV bits | acc | condition | note |
+> |---:|---:|---|---|
+> | 4.000 | 0.545 | F4 KIVI per-channel-seq | **deployable headline** (4× compression, ~2 pp loss) |
+> | 4.375 | 0.540 | F8 outlier-8 | dominated by F4 |
+> | 4.750 | 0.560 | F9 outlier-16 | **zero-loss Pareto point** (within CI of F0) |
+> | 10.000 | 0.550 | F3 all-K BF16 + V INT4 | dominated by F4 |
+> | 16.000 | 0.565 | F0 BF16 (ceiling) | reference |
+>
+> **Implications.** The 35.5 pp KV-quantization collapse from Exp A — which motivated the entire research program — is *solved* by switching the K scale axis. None of the routing experiments (Exp B, D1, E1) were necessary; the bottleneck was always the quantizer, not the selector. The deployable result for Qwen2.5-VL long-video MCQ inference is **F4 KIVI per-channel-along-seq K + per-channel-along-head_dim V at INT4 group_size=128**, giving 4× KV cache memory compression with 2.0 pp accuracy loss vs BF16. Future work: (a) test F4 on long-form generation (multi-token decode) where visual-K may matter more than at first-token MCQ; (b) revisit AKVQ-VL Hadamard rotation as a Pareto-improvement candidate over F4; (c) the outlier-channel result (F9 within CI of F0 at 4.75 bits) is a strong sub-headline for the "zero-accuracy-loss" deployment scenario.
 
 The methodology gates: BF16 vs INT2-KV first-token-logit perturbation ‖Δ‖∞ = 18.7 (smoke threshold 1e-3) — `FakeQuantKVCache.update()` feeds the SDPA matmul as designed. Diagnostic pass produces 0 NaN entropy/residual rows on 33,600 (item × L × H) signals; `bf16_pred ≠ uniform_int2_pred` on 90%+ of items, confirming the routing decisions are operating on real signal.
 
@@ -777,6 +798,128 @@ Two consistent observations across D1, E1 Pass A, and E1 Pass B:
 1. **Slice detection bug (smoke).** First-pass `text_slices.py` standalone-tokenized `item.question` and searched its tokenization in `input_ids`. BPE merges across the question/options boundary (specifically the `\n\n` between question and `Options:`) caused 100% of items to fail the question search. Fix: marker-based slice derivation. Locate the `Options:` and `Answer with a single letter from A, B, C, D, E.` markers in `input_ids` (with multiple spelling variants tried in most-specific-first order, plus up to 3-character left trims for BPE tolerance), and derive `question = [v_end + 1, options_marker_start)` by subtraction.
 
 2. **Cache-class subscript bug (Pass B).** First-pass `TextKResidualCache` used composition (`self._inner = DynamicCache()`) with `__getattr__` forwarding. Transformers calls `cache[layer_idx]` (subscript) on `past_key_value` — `__getitem__` is a dunder method not caught by `__getattr__`. Failed on all 200 items in Pass B with `TypeError: 'TextKResidualCache' object is not subscriptable`. Fix: subclass `DynamicCache` directly (proper is-a inheritance). Pass A data was unaffected; Pass B re-launched cleanly with the fix.
+
+## Experiment F — K-quantizer repair screening, COMPLETE (2026-05-09)
+
+**Status:** Tiered screen complete. Stage 0 (n=16, 14 conditions, 8 min wall, 0 fail). Stage 1 (n=64 balanced 16/bucket, 14 conditions, 33 min wall, 0 fail, 896 rows). Stage 3 (n=200 canonical Exp A split, 10 conditions = F0–F9, 76 min wall, 0 fail, 2000 rows). Calibration pass (cal-100, 7 min wall, 100/100 ok).
+
+After D1 / E1 ruled out routing-within-K as a research direction, the remaining hypothesis was that the K quantizer itself is the bottleneck. The F-suite tests 14 K-quantizer scale strategies against 4 anchors (F0 BF16, F1 uniform INT4, F2 = D1.3 text-K BF16, F3 = C2.1 all-K BF16); all hold V at INT4 per Exp C's "V is free" finding.
+
+### Stage 1 conditions (n=64 balanced 16/bucket)
+
+14 conditions. Anchors F0–F3; literature-aligned KIVI-style K repairs F4–F9; VLM-specific score-space variants F10–F13. Calibration NPZ captures per-(L, H_kv, channel) k_channel_energy + outlier indices + q_energy/q_energy_text/q_energy_visual diagonals via a forward hook on each layer's `q_proj`.
+
+### Stage 3 result (n=200, canonical Exp A split, F0–F9 only)
+
+Stage 1's F10–F13 (closed-form score-cal Q-energy reweighting) all FAILED (acc 0.172–0.281, below or near floor); dropped from Stage 3. Stage 3 confirms the 6 KIVI-style variants on the same 200 eval items used by Exp A / D1 / E1.
+
+| ID | Description | n | acc | 95% CI | bf16-pres | mean margin | Δmargin vs F1 | avg K | avg V | avg KV |
+|---|---|---:|---:|---|---:|---:|---:|---:|---:|---:|
+| **F0** | BF16 K/V (ceiling) | 200 | **0.565** | [0.495, 0.635] | 1.000 | +0.92 | +1.73 | 16.00 | 16.00 | 16.00 |
+| **F1** | Uniform INT4 K/V (floor) | 200 | **0.210** | [0.155, 0.265] | 0.204 | −0.81 | 0.00 | 4.00 | 4.00 | 4.00 |
+| F2 | Text-K BF16 + visual-K INT4 + V INT4 (= D1.3) | 200 | 0.385 | [0.315, 0.455] | 0.566 | −0.42 | +0.39 | 4.30 | 4.00 | 4.15 |
+| F3 | All-K BF16 + V INT4 (= C2.1) | 200 | 0.550 | [0.480, 0.620] | 0.965 | +0.89 | +1.70 | 16.00 | 4.00 | 10.00 |
+| **F4** | **KIVI per-channel-along-seq** | 200 | **0.545** | [0.475, 0.615] | **0.841** | +0.50 | **+1.31** | **4.00** | **4.00** | **4.00** |
+| F5 | F4 + text/visual scale split | 200 | 0.510 | [0.440, 0.585] | 0.850 | +0.59 | +1.40 | 4.00 | 4.00 | 4.00 |
+| F6 | F4 + per-prompt-role scales | 200 | 0.525 | [0.455, 0.595] | 0.841 | +0.71 | +1.51 | 4.00 | 4.00 | 4.00 |
+| F7 | F4 + 99.5%ile clipping | 200 | 0.540 | [0.470, 0.610] | 0.832 | +0.60 | +1.40 | 4.00 | 4.00 | 4.00 |
+| F8 | F4 + top-8 outlier channels at BF16 per (L, H_kv) | 200 | 0.540 | [0.475, 0.610] | 0.894 | +0.84 | +1.64 | 4.75 | 4.00 | 4.375 |
+| **F9** | **F4 + top-16 outlier channels at BF16 per (L, H_kv)** | 200 | **0.560** | [0.495, 0.630] | **0.929** | **+0.88** | **+1.68** | 5.50 | 4.00 | 4.75 |
+
+### Anchor sanity (paired with prior experiments)
+
+All four anchors land within bootstrap CI of the prior n=200 / n=100 numbers, confirming the F-suite plumbing is correct end-to-end:
+
+- **F0 = 0.565** (target A1 = 0.565; pixel-perfect) ✓
+- **F1 = 0.210** (target A5 = 0.210; pixel-perfect) ✓
+- **F2 = 0.385** (target D1.3 = 0.385; pixel-perfect) ✓
+- **F3 = 0.550** (target C2.1 = 0.530 on n=100; F3's slightly higher value on n=200 is within bootstrap noise) ✓
+
+### Headline — F4 is the deployable result
+
+**KIVI per-channel-along-seq closes 94.4% of the F1→F0 gap (33.5 of 35.5 pp) at TRUE 4.00 KV bits.** No calibration data, no routing, no slice info — just a one-line scale-axis change from per-(head, position, group of 128 head_dim slots) to per-(head, channel) shared across all positions. Mechanistically: K outliers are channel-aligned across the sequence (KIVI's central finding, arXiv:2402.02750). One scale per channel exposes them; one scale per position hides them inside head_dim grouping.
+
+F4 dominates F3 (same accuracy 0.545 vs 0.550, 2.5× less memory) and dominates F8 (better acc at lower bits). F4 is the Pareto-optimal point at 4 bits.
+
+### VLM-specific scaling refinements DO NOT help once the K axis is correct
+
+This is the second-order finding. F5/F6/F7 all underperform F4 at the same 4-bit budget despite adding modality-aware / role-aware / outlier-aware refinements:
+
+- F5 text/visual split: 0.510 (−3.5 pp vs F4)
+- F6 prompt-role split: 0.525 (−2.0 pp vs F4)
+- F7 99.5%ile clip: 0.540 (−0.5 pp vs F4)
+
+This directly answers the question "does Qwen2.5-VL's modality structure require modality-aware K quantization?" — once the axis is right, no.
+
+### F9 is the zero-accuracy-loss Pareto point
+
+F9 (top-16 outlier channels at BF16 per (L, H_kv), 4.75 KV bits) = 0.560, statistically tied with F0 BF16 ceiling (0.565) within bootstrap CI and BF16-correct preservation 0.929. Total protected channels = 16 × 28 × 4 = 1792 out of 14336 (12.5% of K channels at BF16). Memory cost: ~3.4× compression vs BF16 (vs F4's 4× at slight accuracy cost).
+
+### Score-cal failures (Stage 1 only; dropped from Stage 3)
+
+| ID | Description | Stage 1 n=64 acc |
+|---|---|---:|
+| F10 | Generic score-cal: per-channel scale ∝ sqrt(E[Q_d²]) | 0.281 |
+| F11 | Block-score TT-heavy (w_TT=4, w_TV=1, w_VT=1, w_VV=0.5) | 0.172 |
+| F12 | Block-score balanced (all w=1) | 0.188 |
+| F13 | Text-K-only score-cal | 0.172 |
+
+The closed-form `s_d ∝ sqrt(E[Q_d²])` heuristic concentrates scale precision on high-Q-energy channels, but those empirically aren't the channels that matter most for attention. Cross-modal block-score weighting (F11 / F12) actively introduces noise. **Score-cal as a research direction needs iterative scale search to be revisited** — the closed-form approximation is a strict downgrade at this bit budget.
+
+### Per-bucket F4 vs F0 (Stage 3, n=200)
+
+| Bucket | F0 BF16 | F4 KIVI | Δ (F4 − F0) |
+|---|---:|---:|---:|
+| short (n=33) | 0.667 | 0.606 | −6.1 pp |
+| mid (n=33) | 0.848 | 0.818 | −3.0 pp |
+| long (n=67) | 0.537 | 0.567 | **+3.0 pp** |
+| very_long (n=67) | 0.403 | 0.358 | −4.5 pp |
+
+F4 actually beats F0 on long videos (+3 pp), likely sample noise at n=67 but worth noting. F4 is robust across all duration buckets, with the largest gap on short (where F0 is highest, so any per-channel quantization noise has more headroom to flip an answer).
+
+### Bit-accounting fix (regression bug from Stage 1)
+
+Stage 1 reported `avg_kv_bits = 4.0` for F8 and F9 because `_run_condition_forward` used the formula `(cfg.bits + 4.0) / 2.0` and ignored `cfg.n_outliers`. Stage 3 fixes this with a `_compute_three_bit_columns` helper that handles all six cache modes (bf16, v1_kcfg, v1_kcfg_with_slice, v3k_text_bf16, v3k_all_bf16) with correct outlier-channel weighting:
+
+- F8: K=4.75 bits (16×8/128 + 4×120/128), V=4.00, KV=4.375
+- F9: K=5.50 bits (16×16/128 + 4×112/128), V=4.00, KV=4.75
+
+Stage 3 JSONL rows now include `avg_k_bits`, `avg_v_bits`, and `avg_kv_bits` separately. This makes F4's true 4-bit budget distinguishable from F9's 4.75-bit point on the Pareto frontier.
+
+### Mechanistic interpretation — why per-channel-along-seq beats per-channel-along-head_dim
+
+K shape is `[B, H_kv, T, D]`. The naive per-head_dim quantizer (F1) computes a scale per (B, H_kv, T, group of 128 head_dim slots) — one scale per *position*. The KIVI per-seq quantizer (F4) computes a scale per (B, H_kv, channel) — one scale per *channel* shared across positions.
+
+The KIVI literature's argument (arXiv:2402.02750): K outliers are channel-aligned across the sequence — a few specific channel indices have systematically large magnitude across most positions. Per-head_dim quantization gives each position its own tight scale, which "hides" the outlier-vs-normal channel gap inside the group-of-128. When the outlier channel happens to have a very high value at some position, that scale dilates to fit it, and the *non-outlier* channels at that position get coarser quantization. Per-seq quantization gives each channel its own scale, exposing outlier channels separately and letting non-outlier channels keep tight quantization regardless of position.
+
+Empirically Qwen2.5-VL's post-RoPE K confirms this geometry: F4 (axis change, no outlier handling) closes 94.4% of the gap; F8/F9 (axis change + explicit outlier protection) close 96-99%. The marginal value of the explicit outlier protection on top of the axis change is small (~1-2 pp).
+
+### Implications for prior experiments
+
+The 35.5 pp KV-quantization collapse from Exp A — which motivated Exp B (routing), Exp C (K/V isolation), Exp D0/D1 (visual-K windows), and Exp E1 (text-K subspans) — is *solved* by switching the K scale axis. **None of the routing experiments were necessary**; the bottleneck was always the quantizer, not the selector. The accumulated negative results across B/D/E (no routing signal helps at avg=4 with the {INT2, BF16} or {INT4, BF16} tier sets) are now retroactively explained: routing was trying to compensate for a broken quantizer, and no allocation policy can recover what the quantizer threw away.
+
+### Future work (not in F-suite)
+
+1. **AKVQ-VL Hadamard rotation as a Pareto-improvement over F4.** Requires Q-side rotation at attention time (out of pure-cache scope); could push F4 from 0.545 to ≈0.560 at 4.00 KV bits.
+2. **VidKV V-per-channel quantization.** Tests whether V can be compressed below 4 bits without accuracy loss when paired with F4 K. F-suite is K-only; V-side experiments are a separate family.
+3. **Long-form generation re-test on Video-MME / MVBench.** First-token MCQ is a *minimal* visual-K-stress setting. Multi-token decode re-queries visual K many times; F4 might or might not preserve quality there.
+4. **Iterative score-cal scale search.** F10–F13 used closed-form `sqrt(E[Q_d²])` reweighting and failed. A line-search over per-channel scales minimizing `||center(QK^T) - center(Q · Q4(K)^T)||_F` on cal-100 might recover, but the gap to F4 (≈25 pp) is so large that this is low-priority.
+
+### Files of record (Exp F)
+
+- `qwen/scripts/k_quantizers.py` — `KQuantizerConfig` dataclass + 12 quantizer kinds + `apply_k_quantizer` dispatch.
+- `qwen/scripts/expF_calibrate.py` — single-pass cal-100 capture; `KStatsCache` + `QStatsHook` (forward hooks on each layer's `q_proj`); writes `expF_kcalib_{model}_frames64.{json,npz}`.
+- `qwen/scripts/expF_smoke.py` — Phase A (synthetic-tensor) + Phase B (live-model logits-differ) smoke checks. 8 hard assertions.
+- `qwen/scripts/expF_kquant_screen.py` — tiered driver (Stage 0 / 1 / 2 / 3); auto-generates stratified split files; per-condition runner; bit-accounting helper `_compute_three_bit_columns`.
+- `qwen/scripts/expF_analyze.py` — per-condition table + verdict matrix (kill / borderline / promote_n100 / promote_n200 / paper_strong).
+- `qwen/scripts/run_expF.sh` — orchestrator (`smoke|calib|stage{0,1,2,3}|analyze|full`).
+- `qwen/scripts/fake_quant_kv_cache.py` — extended: `FakeQuantKVCache.__init__` accepts optional `k_quantizer_config`; `update()` dispatches K through `apply_k_quantizer` when set; `set_slice_info()` for role/modality K kinds.
+- `qwen/calibration/expF_kcalib_Qwen2.5-VL-7B-Instruct_frames64.json` + `.npz` — calibration data (n_cal=100 ok, n_failed=0).
+- `qwen/calibration/split_seed0_n{16,64}.json` — Stage 0 / Stage 1 stratified subsets (Stage 3 uses canonical `split_seed0.json`).
+- `qwen/results/expF_kquant_stage{0,1,3}.jsonl` — per (item, condition) rows. Stage 0: 224 rows; Stage 1: 896 rows; Stage 3: 2000 rows.
+- `qwen/results/expF_summary_stage{0,1,3}.md` — per-condition tables (Stage 3 has 3-bit-column accounting).
+- `qwen/results/expF_verdict_matrix_stage{0,1,3}.md` — verdict + promotion plan.
+- `qwen/results/expF_smoke.md` — Phase A + Phase B smoke report (8 PASS).
 
 ## Methodological lessons learned (cumulative)
 

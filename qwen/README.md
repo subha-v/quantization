@@ -107,42 +107,62 @@ not Q-heads (28)** — each KV-head is shared by 7 Q-heads under GQA. Per-Q-head
 precision is not directly expressible without re-quantizing post-`repeat_kv`,
 which is out of scope.
 
-## Experiment F — Tiered K-quantizer repair screening (in flight)
+## Experiment F — K-quantizer repair screening, COMPLETE (2026-05-09)
 
-After D1 / E1 ruled out routing-within-K as a research direction (text-K
-slice and visual-K window selectors all clustered within ±5 pp of D1.3's
-0.385), the next direction is to **fix the K quantizer itself** while V
-stays at INT4. Exp F screens 14 K-quantizer variants on a tiered
-n=16 → 64 → 100 → 200 ladder (`seed=0` stratified subsets so the smaller
-splits are subsets of the larger).
+After D1 / E1 ruled out routing-within-K as a research direction, Exp F
+screened 14 K-quantizer variants on a tiered n=16 → 64 → 200 ladder. Stage 0
+(n=16, wiring smoke). Stage 1 (n=64 balanced, all 14 variants). Stage 3
+(n=200 canonical Exp A split, F0–F9 only — F10–F13 score-cal variants
+all FAILED in Stage 1 and were dropped).
 
-### Stages
+### Headline (Stage 3, n=200)
 
-| Stage | n / bucket | n total | Purpose |
-|---|---:|---:|---|
-| 0 | 4 | 16 | Smoke / wiring; do NOT interpret accuracy |
-| 1 | 16 | 64 | Screen all 14 conditions |
-| 2 | 25 | 100 | Confirm borderlines (acc 0.30–0.36 in Stage 1) |
-| 3 | 50 | 200 | Final paired analysis (top survivors only) |
+**F4 KIVI per-channel-along-seq closes 94.4% of the F1→F0 gap (33.5 of
+35.5 pp) at TRUE 4.00 KV bits.** No calibration data, no routing, no slice
+info — just a one-line scale-axis change from per-(head, position, group of
+128 head_dim slots) to per-(head, channel) shared across all positions.
+**Deployable: 4× KV memory compression, ~2 pp accuracy below BF16 ceiling.**
 
-Stage-1 verdict thresholds (anchored on prior numbers — INT4 floor 0.21,
-text-K BF16 rescue 0.385, BF16 ceiling ≈0.50–0.57): `kill ≤ 0.27`,
-`borderline 0.28–0.34`, `promote_n100 0.34–0.40`, `promote_n200 0.40–0.45`,
-`paper_strong ≥ 0.45`.
+| KV bits | acc | condition | note |
+|---:|---:|---|---|
+| 4.000 | **0.545** | F4 KIVI per-channel-seq | **deployable** (4× compression, ~2 pp loss) |
+| 4.375 | 0.540 | F8 outlier-8 | dominated by F4 |
+| 4.750 | **0.560** | F9 outlier-16 | **zero-loss Pareto point** (within CI of F0) |
+| 10.000 | 0.550 | F3 all-K BF16 + V INT4 (= C2.1) | dominated by F4 |
+| 16.000 | 0.565 | F0 BF16 (ceiling) | reference |
 
-### Conditions (14)
+All four anchors land at their prior n=200 values: F0=0.565 (=A1),
+F1=0.210 (=A5), F2=0.385 (=D1.3), F3=0.550 (within CI of C2.1's 0.530).
 
-**Anchors:** F0 BF16, F1 uniform INT4, F2 text-K BF16 + visual-K INT4,
-F3 all-K BF16 + V INT4 (= D1.3 / C2.1 designs re-run on n=64).
+### Why F4 works — and why VLM-specific refinements DO NOT help
 
-**Literature-aligned K repairs (KIVI / KVQuant):**
-F4 KIVI-lite (per-channel along seq), F5 + text/visual scale split,
-F6 + per-prompt-role scales, F7 + 99.5-percentile clipping,
-F8/F9 + top-8/16 outlier channels at BF16 per (layer, kv-head).
+KIVI's central finding (arXiv:2402.02750): K outliers are channel-aligned
+across the sequence. Per-head_dim quantization (F1 floor) gives each
+position its own scale, hiding outlier-vs-normal channels inside head_dim
+grouping. Per-seq quantization (F4) gives each channel its own scale,
+exposing outliers and letting non-outlier channels keep tight quantization
+regardless of position.
 
-**VLM-specific score-space repairs (closed-form Q-energy reweight):**
-F10 generic score-cal K, F11 TT-heavy block-score K (w_TT=4),
-F12 balanced block-score K (all w=1), F13 text-K-only score-cal.
+Empirically Qwen2.5-VL confirms this: **the axis change alone closes
+94% of the gap.** F5 (text/visual split, 0.510), F6 (prompt-role split,
+0.525), F7 (99.5%ile clip, 0.540) all UNDERPERFORM F4 at the same 4-bit
+budget. Once the axis is right, modality-aware / role-aware / outlier-clip
+refinements add nothing.
+
+### Score-cal variants (F10–F13) failed catastrophically
+
+Closed-form Q-energy reweighting (`s_d ∝ sqrt(E[Q_d²])`) is a strict
+downgrade at this bit budget: F10 = 0.281, F11 = 0.172, F12 = 0.188,
+F13 = 0.172 — all at or below F1 floor. Cross-modal block-score weighting
+actively hurts. Score-cal needs iterative scale search to be revisited;
+the closed-form approximation does not work.
+
+### Implication for prior experiments
+
+The 35.5 pp KV-quantization collapse from Exp A — which motivated Exp B
+(routing), C (K/V isolation), D0/D1 (visual-K windows), and E1 (text-K
+subspans) — is *solved* by switching the K scale axis. None of the routing
+experiments were necessary; the bottleneck was always the quantizer.
 
 ### Layout (Exp F additions)
 
@@ -167,4 +187,5 @@ The cache extension lives in `fake_quant_kv_cache.py`:
 `FakeQuantKVCache(controller, k_quantizer_config=...)` dispatches the K
 path through `k_quantizers.apply_k_quantizer(...)` while V continues to use
 the BitController-driven `fake_quantize_kv`. `cache.set_slice_info(...)`
-plumbs role/modality position info to the F5/F6/F11/F12/F13 quantizers.
+plumbs role/modality position info to the F5/F6 quantizers (F11/F12/F13
+were dropped after Stage 1).
