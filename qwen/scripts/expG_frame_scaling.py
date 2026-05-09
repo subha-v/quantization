@@ -409,6 +409,10 @@ def backfill_bf16_join_g(out_jsonl: Path) -> None:
         if r.get("condition") == "G0_BF16" and "pred_choice" in r:
             bf16_pred[r["item_id"]] = int(r["pred_choice"])
     for r in rows:
+        # Skip rows emitted by the tier-skip path -- they have no pred / no
+        # correct_choice and are placeholders only.
+        if r.get("skipped") or "correct_choice" not in r or r.get("error"):
+            continue
         if r.get("condition") == "G0_BF16":
             r["bf16_pred"] = int(r.get("pred_choice", -1))
             r["bf16_correct"] = bool(r["bf16_pred"] == int(r["correct_choice"]))
