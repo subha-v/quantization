@@ -1004,3 +1004,198 @@ qwen-expE1 (tmux sessions: passA + passB) — PIPELINE COMPLETE (89 min total)
 **Cross-experiment references:**
 - `EXPERIMENT_FINDINGS.md` — pi0.5/LIBERO findings + Path 1 interim n=64 results.
 - Plan: `/Users/subha/.claude/plans/you-can-make-a-parallel-crown.md`.
+
+---
+
+# Experiment G — Frame-scaling under fixed KV memory budget (2026-05-09)
+
+**Status as of 2026-05-09 09:31 UTC:** Stage 1 (n=64 balanced 16/bucket, 9 fixed-frame conditions + 4 adaptive post-process conditions) **COMPLETE**. Stage 3 (n=200 canonical, 4 promoted conditions) **IN FLIGHT** — 64f and 128f tiers complete; 256f tier (G6) at 17/200, ETA ~36 min.
+
+## Hypothesis
+
+Exp F's F4 (KIVI per-channel-along-seq, 4 KV bits) closed 94.4% of the F1→F0 collapse — the rescue gap was a quantizer-axis problem, not a routing problem. The open question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget.* At fixed `max_pixels=360×420`,
+
+```
+relative KV memory = (frames × avg_kv_bits) / (64 × 16)
+```
+
+so 256-frame F4 (≈4 KV bits) ≈ 64-frame BF16 KV memory at 4× the temporal coverage. **Headline test: does the matched-memory more-frame condition (G4 = 256f F4) beat the BF16 baseline (G0 = 64f BF16)?**
+
+## Setup
+
+- **Model:** Qwen2.5-VL-7B-Instruct (28 layers, 4 KV-heads, head_dim=128).
+- **Bench:** LongVideoBench-val MCQ scoring, max_new_tokens=1, 4/5-way logprob argmax.
+- **Stage 1 split:** balanced 16/bucket × 4 buckets = 64 items (same 64-item subset as F-suite Stage 1 so F4 anchors line up).
+- **Stage 3 split:** auto-generated `split_seed0_n200.json` with 50/50/50/50 per bucket = 200 items. Note: this is **not** the canonical Exp A 200-eval set (which is 33/33/67/67 weighted toward longer items); the more-balanced Stage 3 set has higher BF16 ceiling (~0.665 vs Exp A's 0.565).
+- **Calibration:** F-suite NPZ at frames=64 reused as-is. K-channel outlier indices are post-RoPE and frame-count-independent in theory; smoke check 8 (opt-in) verifies via 8-item recalibration at frames=256 with Jaccard ≥ 0.75.
+- **Compute structure:** outer loop over frame counts {64, 128, 256}; inner loop over K-quantizer configs (F0/F4/F9). Visual prefill (image-token construction, position-id generation, find_text_slice_spans, inputs dict) is computed once per (item, frames) and reused across configs at the same frame count.
+
+## Conditions
+
+Stage 1 ran 7 fixed-frame conditions plus 2 adaptive post-processes (F4 backbone). After Stage 1 surfaced F9 winning, 2 additional F9-backbone adaptive post-processes were added.
+
+| ID | Frames | KV format | rel KV mem | Class |
+|---|---:|---|---:|---|
+| G0 | 64 | BF16 | 1.00× | anchor |
+| G1 | 64 | F4 INT4 (KIVI per-channel-seq) | 0.25× | anchor |
+| G2 | 128 | BF16 | 2.00× | anchor |
+| G3 | 128 | F4 INT4 | 0.50× | fixed |
+| G4 | 256 | F4 INT4 | 1.00× | **HEADLINE matched-memory** |
+| G5 | 128 | F9 (KIVI + top-16 outlier BF16, 4.75 KV bits) | 0.59× | fixed |
+| G6 | 256 | F9 | 1.19× | fixed |
+| G7_F4_CascadeAvg128 | 64↗256 cascade, target avg=128 | F4 | 0.50× | adaptive (post-process) |
+| G7_F9_CascadeAvg192 | 128↗256 cascade, target avg=192 | F9 | 0.99× | adaptive (post-process) |
+| G8_F4_TypeAdaptive | type-routed 64/128/256 | F4 | 0.55× | adaptive (post-process) |
+| G8_F9_TypeAdaptiveMin128 | type-routed 128/256 | F9 | 0.71× | adaptive (post-process) |
+
+The cascade routes the bottom-third of items by margin (`max(option_logprobs) − second_max(...)` from the cheap first pass) to the expensive second pass; the type-adaptive routes by question-keyword classifier (count/ocr/detail → 256f, temporal/action → 128f, other → 64f for F4 / 128f for F9 since no F9 64f exists).
+
+## Stage 1 results — n=64 (COMPLETE)
+
+| Condition | n | acc | 95% CI | rel_kv_mem | g0-pres |
+|---|---:|---:|---|---:|---:|
+| G0_BF16 | 64 | **0.672** | [0.547, 0.781] | 1.00× | 1.000 |
+| G1_F4_64f | 64 | 0.656 | [0.547, 0.766] | 0.25× | 0.884 |
+| G2_BF16_128f | 64 | 0.656 | [0.531, 0.766] | 2.00× | 0.907 |
+| G3_F4_128f | 64 | 0.562 | [0.438, 0.688] | 0.50× | 0.721 |
+| G4_F4_256f | 63 | 0.619 | [0.508, 0.746] | 1.00× | 0.786 |
+| **G5_F9_128f** | 64 | **0.688** | [0.578, 0.797] | **0.59×** | 0.930 |
+| **G6_F9_256f** | 63 | **0.730** | [0.619, 0.825] | 1.19× | 0.976 |
+| G7_F4_CascadeAvg128 | 60 | 0.633 | [0.500, 0.750] | 0.50× | 0.854 |
+| **G7_F9_CascadeAvg192** | 60 | **0.733** | [0.617, 0.834] | **0.99×** | 0.976 |
+| G8_F4_TypeAdaptive | 60 | 0.633 | [0.517, 0.750] | 0.55× | 0.805 |
+| G8_F9_TypeAdaptiveMin128 | 60 | 0.700 | [0.583, 0.817] | 0.71× | 0.927 |
+
+4 items at 256f failed because the source video had fewer than 256 native frames (qwen_vl_utils raises `ValueError: nframes should in interval [2, N], but got 256` for N<256). Runner caught and continued; affects G4/G6/G7-F9/G8-F9 sample sizes.
+
+### Stage 1 paired McNemar (headline pairs)
+
+| Pair | label | n | both | a_only | b_only | neither | Δ acc(a−b) | χ² |
+|---|---|---:|---:|---:|---:|---:|---:|---:|
+| G4 vs G0 | matched-memory headline | 60 | 32 | 5 | 9 | 14 | **−6.6 pp** | 1.14 |
+| G3 vs G0 | memory-saving | 64 | 31 | 5 | 12 | 16 | −11.0 pp | 2.88 |
+| **G6 vs G2** | **zero-loss at 4× frames** | 60 | 40 | 4 | 0 | 16 | **+6.7 pp** | **4.00** |
+| G6 vs G0 | f9_256f vs baseline | 60 | 39 | 5 | 0 | 16 | +8.3 pp | 5.00 |
+| G5 vs G0 | f9_128f vs baseline | 64 | 41 | 4 | 2 | 17 | +3.1 pp | 0.67 |
+| G7_F4_CascadeAvg128 vs G1 | cascade vs F4 anchor | 60 | 37 | 1 | 3 | 19 | −3.3 pp | 1.00 |
+| G8_F4_TypeAdaptive vs G1 | type-adaptive vs F4 anchor | 60 | 35 | 3 | 5 | 17 | −3.3 pp | 0.50 |
+| G7_F9_CascadeAvg192 vs G5 | F9 cascade vs F9 anchor | 60 | 41 | 4 | 1 | 14 | +5.0 pp | 1.80 |
+| G7_F9_CascadeAvg192 vs G6 | F9 cascade vs F9 top | 60 | 43 | 1 | 0 | 16 | +1.7 pp | 1.00 |
+| G8_F9_TypeAdaptiveMin128 vs G5 | F9 type-adaptive vs F9 anchor | 60 | 39 | 4 | 3 | 14 | +1.7 pp | 0.14 |
+
+### Stage 1 frontier (sorted ascending by relative_kv_memory)
+
+| Cond | frames | avg_kv_bits | rel_kv_mem | acc |
+|---|---|---:|---:|---:|
+| G1_F4_64f | 64 | 4.00 | 0.25× | 0.656 |
+| G3_F4_128f | 128 | 4.00 | 0.50× | 0.562 |
+| G7_F4_CascadeAvg128 | ~128 mixed | 4.00 | 0.50× | 0.633 |
+| G8_F4_TypeAdaptive | ~140 mixed | 4.00 | 0.55× | 0.633 |
+| **G5_F9_128f** | 128 | 4.75 | **0.59×** | **0.688** |
+| G8_F9_TypeAdaptiveMin128 | ~154 mixed | 4.75 | 0.71× | 0.700 |
+| **G7_F9_CascadeAvg192** | ~192 mixed | 4.75 | **0.99×** | **0.733** |
+| G0_BF16 | 64 | 16.00 | 1.00× | 0.672 |
+| G4_F4_256f | 256 | 4.00 | 1.00× | 0.619 |
+| **G6_F9_256f** | 256 | 4.75 | 1.19× | **0.730** |
+| G2_BF16_128f | 128 | 16.00 | 2.00× | 0.656 |
+
+Pareto-optimal points at n=64 are **G5** (cheapest above-baseline accuracy, 0.59× memory) and **G7_F9_CascadeAvg192** (best accuracy below 1.00× memory; ties G6 at 75% the compute).
+
+### Stage 1 verdict
+
+```
+G3_F4_128f  (0.562)  → kill           (-11 pp vs G0)
+G4_F4_256f  (0.619)  → kill           (matched-memory headline failed; -5.3 pp vs G0)
+G5_F9_128f  (0.688)  → promote_n200   (+1.6 pp vs G0 at 0.59× mem)
+G6_F9_256f  (0.730)  → promote_n200   (+5.8 pp vs G0; +6.7 pp paired vs G2 with χ²=4.0)
+G7_F4 / G8_F4         → borderline    (dragged down by F4 backbone's weak G3/G4)
+G7_F9 / G8_F9         → borderline    (G7_F9=0.733 ties G6 at 75% compute; G8_F9=0.700)
+```
+
+**Per-bucket pattern:** F4 helps on *short* clips (G4 short=0.833 vs G0 short=0.688, +14.6 pp) but loses on long/very_long. F9 256f wins in every bucket except very_long (G6 short=0.917, mid=0.750, long=0.737, very_long=0.562). Frame coverage genuinely buys something at short — but F4's per-channel-along-seq scale is brittle at 23k tokens; F9's outlier protection compensates.
+
+## Stage 3 results — n=200 (IN FLIGHT)
+
+Promoted 4 conditions to n=200 canonical: G0, G2, G5, G6. Auto-generated `split_seed0_n200.json` (50/50/50/50 per bucket).
+
+| Tier | Conditions | Status | Wall |
+|---|---|---|---|
+| 64f | G0_BF16 | DONE 200/200 | 12:09 |
+| 128f | G2_BF16_128f, G5_F9_128f | DONE 200/200 | ~36 min |
+| 256f | G6_F9_256f | running 17/200 | ETA 36 min |
+
+After 256f completes, the chain auto-fires: F9 cascade post-process (G7_F9_CascadeAvg192 stitch) → F9 type-adaptive post-process (G8_F9_TypeAdaptiveMin128 stitch) → analyze.
+
+### Stage 3 live preview (n=200 final for G0/G2/G5; n=17 partial for G6)
+
+| Cond | n | acc | rel_kv_mem | Note |
+|---|---:|---:|---:|---|
+| G0_BF16 | 200 | 0.665 | 1.00× | FINAL |
+| G2_BF16_128f | 200 | 0.680 | 2.00× | FINAL |
+| **G5_F9_128f** | 200 | **0.685** | **0.59×** | FINAL |
+| G6_F9_256f | 17 | 0.706 | 1.19× | partial; not stable |
+
+**Paired G5 vs G0 (n=200): Δ = +2.0 pp** (G5 wins on 17 items, G0 wins on 12, 116 both, 55 neither). Stage 1 showed G5 vs G0 = +1.6 pp at n=64; Stage 3 reproduces and slightly strengthens at n=200.
+
+**Paired G2 vs G0 (n=200): Δ = +1.5 pp** — extra BF16 frames at 2× memory help only marginally.
+
+**Crucially, G5 ≥ G2 at n=200** (0.685 vs 0.680): F9 INT4 at 128f matches BF16 at 128f at less than 30% the KV memory. F9 is the deployable 128f operating point.
+
+The headline G6 vs G2 ("zero-loss at 4× frames" with F9) will resolve once the 256f tier completes. Stage 1 result was Δ = +6.7 pp paired with χ²=4.0.
+
+## Files of record (Exp G)
+
+```
+qwen/scripts/expG_frame_scaling.py        # main driver; outer loop frames, inner loop K-cfg
+qwen/scripts/expG_smoke.py                # 8 hard assertions (Phase A + Phase B)
+qwen/scripts/expG_cascade.py              # G7 cascade post-process (any first/second pass cond pair)
+qwen/scripts/expG_type_adaptive.py        # G8 type-adaptive post-process (custom budget map / mapping)
+qwen/scripts/question_type_classifier.py  # 6-label keyword heuristic + BUDGET_MAP
+qwen/scripts/expG_analyze.py              # per-cond + paired McNemar + frontier + verdict
+qwen/scripts/run_expG.sh                  # smoke|stage1|stage3|cascade|analyze|full
+
+qwen/results/expG_frame_stage1.jsonl                     # 446 rows (64 items × 7 conds + errors)
+qwen/results/expG_frame_stage1_G7.jsonl                  # 60 F4-cascade stitched rows
+qwen/results/expG_frame_stage1_G7f9.jsonl                # 60 F9-cascade stitched rows
+qwen/results/expG_frame_stage1_G8.jsonl                  # 60 F4-type-adaptive stitched rows
+qwen/results/expG_frame_stage1_G8f9.jsonl                # 60 F9-type-adaptive stitched rows
+qwen/results/expG_summary_stage1.md                      # per-condition table + per-bucket
+qwen/results/expG_paired_stage1.md                       # 11 paired McNemar comparisons
+qwen/results/expG_frontier_stage1.md                     # frame-budget × accuracy frontier
+qwen/results/expG_verdict_matrix_stage1.md               # promotion plan
+qwen/results/expG_cascade_meta.json / _f9_meta.json      # τ, realized avg frames, bucket dist
+qwen/results/expG_qtype_meta.json / _f9_meta.json        # budget map, label distribution
+qwen/results/expG_frame_stage3.jsonl                     # in-flight stage 3 rows
+qwen/results/expG_smoke.md                               # 8-check report
+qwen/results/expG_pipeline.progress.log
+qwen/results/expG_frame_stage{1,3}.progress.log
+```
+
+## Methodological notes
+
+1. **Compute amortization.** Outer-loop frame count, inner-loop K-quantizer config: visual prefill (decord decode + image-token build + position-ids + find_text_slice_spans + inputs dict) is computed once per (item, frames) and reused across F0/F4/F9 conditions sharing that frame count. Stage 1 wall: 5:58 (64f, 2 conds) + 15:50 (128f, 3 conds) + 21:19 (256f, 2 conds) = 43 min total — vs naive estimate ~3.5 h. ~5× speedup over the worst-case nested loop.
+
+2. **Memory precheck calibration.** First Stage 1 launch had `EXPG_MIN_FREE_GB=70`; precheck at the 256f tier saw `torch.cuda.mem_get_info()` returning 42 GiB free (model resident from 128f tier consumed ~17 GiB beyond the co-tenant's 21 GiB, even though OS-level free was 60 GiB). Tier was correctly skipped per safety logic. Lowered to `EXPG_MIN_FREE_GB=30` and re-launched 256f-only with `--append`; ran cleanly. Peak 256f memory is ~14 GiB beyond model weights, so 30 GiB is the right safety threshold.
+
+3. **Backfill skip-row handling.** Initial `backfill_bf16_join_g` crashed on placeholder rows (the tier-skip path emits stub rows with no `correct_choice`). Fixed: skip rows with `skipped=True`, missing `correct_choice`, or `error` set.
+
+4. **Question-type classifier tuning.** First smoke run hit weighted_avg_frames=194.6 outside [110, 145]. LongVideoBench questions have long scene-description prefixes ("In a dim room, there is..."), creating false-positive temporal matches against words like "during"/"after" in description prose. Fixed by trimming to the trailing interrogative (substring after the last `.`) and using question-form keywords ("how many" not bare "many"); BUDGET_MAP recalibrated so temporal→128 (subtitle-anchored, range-narrowed) and detail→256 (visual-content-heavy). Final cal-100 distribution: 51 temporal, 17 detail, 9 action, 23 other → 135.0 weighted avg.
+
+5. **Short-video failures.** 4 of 64 items at 256f fail because video duration × fps < 256. Treated as data-driven sample drop; affects G4/G6/G7-F9/G8-F9 from n=64 to n=63 (Stage 1) and similarly at scale on Stage 3.
+
+## Pipeline status
+
+```
+qwen-expG (tmux session, GPU 0) — STAGE 1 COMPLETE (43 min) + ANALYZE COMPLETE; STAGE 3 IN FLIGHT
+├── ✅ smoke (8 checks PASS, 16 sec)
+├── ✅ stage 1 64f tier (G0 + G1, 5:58 wall, 64/64 ok)
+├── ✅ stage 1 128f tier (G2 + G3 + G5, 15:50 wall, 64/64 ok)
+├── ✅ stage 1 256f tier (G4 + G6, 21:19 wall, 60/64 ok, 4 short-video failures)
+├── ✅ stage 1 cascade + analyze (F4 backbone)
+├── ✅ stage 1 F9-backbone post-process + analyze (G7_F9 = 0.733, G8_F9 = 0.700)
+├── ✅ stage 3 64f tier (G0, 12:09 wall, 200/200 ok)
+├── ✅ stage 3 128f tier (G2 + G5, ~36 min wall, 200/200 ok)
+└── 🔄 stage 3 256f tier (G6) — 17/200 (8.5%), ETA 36 min
+    └── then auto-fire: F9 cascade + F9 type-adaptive + analyze
+```
+

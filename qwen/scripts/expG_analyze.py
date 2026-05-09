@@ -64,7 +64,10 @@ ANCHORS = {"G0_BF16", "G1_F4_64f", "G2_BF16_128f"}
 
 
 HEADLINE_PAIRS = [
-    # (a, b) -- a is the "alternative", b is the "baseline".
+    # (a, b) -- a is the "alternative" (typically more frames or new method),
+    # b is the "baseline". For low-vs-high-frame pairs the column display
+    # surfaces "new_evidence_wins" (high helps where low fails) and "damage"
+    # (low was right but high broke it). See write_paired().
     ("G4_F4_256f",   "G0_BF16",         "matched_memory_headline"),
     ("G3_F4_128f",   "G0_BF16",         "memory_saving"),
     ("G6_F9_256f",   "G2_BF16_128f",    "zero_loss_at_4x_frames"),
@@ -78,7 +81,52 @@ HEADLINE_PAIRS = [
     ("G7_F9_CascadeAvg192",       "G6_F9_256f",  "f9_cascade_vs_f9_top"),
     ("G8_F9_TypeAdaptiveMin128",  "G5_F9_128f",  "f9_type_adaptive_vs_f9_anchor"),
     ("G8_F9_TypeAdaptiveMin128",  "G6_F9_256f",  "f9_type_adaptive_vs_f9_top"),
+    # New-evidence wins / damage decomposition for the low-vs-high frame ladders.
+    ("G6_F9_256f",   "G5_F9_128f",      "f9_256f_vs_128f"),
+    ("G4_F4_256f",   "G3_F4_128f",      "f4_256f_vs_128f"),
+    # G control: direct 192f F9 vs the F9 anchors and the matched-budget cascade.
+    ("G9_F9_192f",   "G5_F9_128f",      "f9_192f_vs_128f"),
+    ("G9_F9_192f",   "G6_F9_256f",      "f9_192f_vs_256f"),
+    ("G9_F9_192f",   "G0_BF16",         "f9_192f_vs_baseline"),
+    ("G7_F9_CascadeAvg192",  "G9_F9_192f", "f9_cascade_vs_fixed_192f"),
+    # F9-cascade selection-mode controls (random ×3 + oracle).
+    ("G7_F9_CascadeOracle",     "G5_F9_128f", "f9_oracle_vs_anchor"),
+    ("G7_F9_CascadeOracle",     "G7_F9_CascadeAvg192", "f9_oracle_vs_margin"),
+    ("G7_F9_CascadeRandomS0",   "G7_F9_CascadeAvg192", "f9_random_s0_vs_margin"),
+    ("G7_F9_CascadeRandomS1",   "G7_F9_CascadeAvg192", "f9_random_s1_vs_margin"),
+    ("G7_F9_CascadeRandomS2",   "G7_F9_CascadeAvg192", "f9_random_s2_vs_margin"),
+    # H-suite: temporal-windowed KIVI vs F4 and F9 at matched frame counts.
+    ("H3_KIVI_TempWin4_256f",    "G4_F4_256f",     "h_temp_win4_vs_f4_256f"),
+    ("H3_KIVI_TempWin4_256f",    "G6_F9_256f",     "h_temp_win4_vs_f9_256f"),
+    ("H3_KIVI_TempWin4_256f",    "G0_BF16",        "h_temp_win4_vs_baseline"),
+    ("H4_KIVI_TempWin8_256f",    "H3_KIVI_TempWin4_256f", "h_window_count_8_vs_4"),
+    ("H4_KIVI_TempWin8_256f",    "G4_F4_256f",     "h_temp_win8_vs_f4_256f"),
+    ("H4_KIVI_TempWin8_256f",    "G6_F9_256f",     "h_temp_win8_vs_f9_256f"),
+    ("H5_KIVI_TokenBlock4_256f", "H3_KIVI_TempWin4_256f", "h_modality_aware_vs_blind"),
+    ("H6_KIVI_TempWin2_128f",    "G3_F4_128f",     "h_temp_win2_vs_f4_128f"),
+    ("H6_KIVI_TempWin2_128f",    "G5_F9_128f",     "h_temp_win2_vs_f9_128f"),
 ]
+
+
+# Pairs where the framing is "low frames vs high frames" -- the analyzer
+# surfaces these with explicit "new_evidence_wins" / "damage" columns. The
+# convention for these pairs is: a = high-frame condition, b = low-frame.
+LOW_VS_HIGH_FRAME_LABELS = {
+    "matched_memory_headline",     # G4 (256f) vs G0 (64f)
+    "memory_saving",                # G3 (128f) vs G0 (64f)
+    "zero_loss_at_4x_frames",       # G6 (256f) vs G2 (128f)
+    "f9_256f_vs_baseline",
+    "f9_128f_vs_baseline",
+    "f9_192f_vs_128f",
+    "f9_192f_vs_256f",
+    "f9_192f_vs_baseline",
+    "f9_256f_vs_128f",
+    "f4_256f_vs_128f",
+    "256f_quant_vs_128f_bf16",
+    "h_temp_win4_vs_baseline",
+    "h_temp_win2_vs_f4_128f",
+    "h_temp_win2_vs_f9_128f",
+}
 
 
 # Sort order for tables (stable across stages).
@@ -208,6 +256,44 @@ def verdict_g(cond: str, by_cond_acc: dict[str, float]) -> str:
         if acc >= best_fixed_f9 - 0.01:
             return "borderline"
         return "borderline"
+    # G control: direct 192f F9 -- compare against G5 (128f F9) and G6 (256f F9).
+    if cond == "G9_F9_192f":
+        g5 = by_cond_acc.get("G5_F9_128f", float("nan"))
+        if acc >= g5 + 0.01:
+            return "promote_n200"
+        return "borderline"
+    # F9 cascade selection-mode controls: oracle should be highest by construction;
+    # random seeds should be near or below margin-cascade.
+    if cond.startswith("G7_F9_Cascade") and cond not in ("G7_F9_CascadeAvg192",):
+        return "control"
+    # H-suite temporal-windowed KIVI conditions: compare against F4 at the same
+    # frame count (same KV bits) and F9 (higher KV bits, the rescue target).
+    if cond.startswith("H3_") or cond.startswith("H4_"):
+        # 256f H conditions: target acc(H) >= acc(G4) + 5 pp at TRUE 4 KV bits.
+        g4 = by_cond_acc.get("G4_F4_256f", float("nan"))
+        g6 = by_cond_acc.get("G6_F9_256f", float("nan"))
+        if acc >= g4 + 0.05 and acc >= g6 - 0.02:
+            return "promote_paper_strong"
+        if acc >= g4 + 0.05:
+            return "promote_n200"
+        if acc >= g4:
+            return "borderline"
+        return "kill"
+    if cond.startswith("H5_"):
+        # Token-block control: should NOT beat H3 if visual-time structure is
+        # load-bearing. Returns 'control' to flag for analysis, not promotion.
+        return "control"
+    if cond.startswith("H6_"):
+        # 128f H condition: compare against G3 (128f F4) and G5 (128f F9).
+        g3 = by_cond_acc.get("G3_F4_128f", float("nan"))
+        g5 = by_cond_acc.get("G5_F9_128f", float("nan"))
+        if acc >= g3 + 0.05 and acc >= g5 - 0.02:
+            return "promote_paper_strong"
+        if acc >= g3 + 0.05:
+            return "promote_n200"
+        if acc >= g3:
+            return "borderline"
+        return "kill"
     return "unranked"
 
 
@@ -298,13 +384,16 @@ def write_paired(rows: list[dict], stage: int, out_paired: Path) -> None:
     for r in rows:
         by_cond[r["condition"]].append(r)
 
+    # Two tables: one general McNemar table, plus a "new evidence wins / damage"
+    # decomposition table for the low-vs-high-frame pairs only. Same numbers,
+    # cleaner framing.
     lines = [
         f"# Exp G paired comparisons (stage {stage})\n",
-        "Each pair is restricted to item_ids present in both conditions. The "
-        "'new-evidence wins' metric is `b_only - a_only` (signed): a positive "
-        "value means the alternative recovered items the baseline got wrong.\n",
-        "| Pair | label | n_paired | both_correct | a_only_correct | b_only_correct | "
-        "neither | new_evidence_wins | acc(a) | acc(b) | mcnemar_chi2 | p |",
+        "## General McNemar table\n",
+        "Each pair is restricted to item_ids present in both conditions. "
+        "`net_a` = `a_only - b_only` (positive => a recovered items b missed).\n",
+        "| Pair | label | n | both | a_only | b_only | neither | net_a | "
+        "acc(a) | acc(b) | mcnemar_chi2 | p |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]
     for a, b, label in HEADLINE_PAIRS:
@@ -316,11 +405,47 @@ def write_paired(rows: list[dict], stage: int, out_paired: Path) -> None:
         n, both, a_only, b_only, neither, chi2, p = mcnemar_pair(ra, rb)
         acc_a = (both + a_only) / max(1, n)
         acc_b = (both + b_only) / max(1, n)
-        new_ev = a_only - b_only  # rows_a substitutes for rows_b -- a "wins" means a_only > b_only
-        # Phrase consistently: "new_evidence_wins" is signed against the *alternative* (a).
+        net_a = a_only - b_only
         lines.append(
             f"| `{a}` vs `{b}` | {label} | {n} | {both} | {a_only} | {b_only} | "
-            f"{neither} | {new_ev:+d} | {acc_a:.3f} | {acc_b:.3f} | "
+            f"{neither} | {net_a:+d} | {acc_a:.3f} | {acc_b:.3f} | "
+            f"{chi2:.3f} | {p:.3f} |"
+        )
+
+    # New-evidence/damage decomposition for low-vs-high frame pairs.
+    lines += [
+        "\n## New-evidence wins / damage decomposition\n",
+        "For pairs where the alternative `a` is the *higher-frame* condition "
+        "and the baseline `b` is the *lower-frame* condition, this table "
+        "decomposes whether the extra frames added missing evidence "
+        "(`new_evidence_wins`: `b` wrong, `a` correct) or damaged outputs "
+        "(`damage`: `b` correct, `a` wrong). The signed `net = new_evidence_wins - damage` "
+        "is the clean 'did extra frames net-help?' metric.\n",
+        "| Pair (high vs low) | label | n | both | new_evidence_wins (a_only) | "
+        "damage (b_only) | neither | net | acc(high) | acc(low) | "
+        "chi2 | p |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for a, b, label in HEADLINE_PAIRS:
+        if label not in LOW_VS_HIGH_FRAME_LABELS:
+            continue
+        ra = by_cond.get(a, [])
+        rb = by_cond.get(b, [])
+        if not ra or not rb:
+            lines.append(f"| `{a}` vs `{b}` | {label} | — | — | — | — | — | — | — | — | — | — |")
+            continue
+        n, both, a_only, b_only, neither, chi2, p = mcnemar_pair(ra, rb)
+        acc_a = (both + a_only) / max(1, n)
+        acc_b = (both + b_only) / max(1, n)
+        # a is high-frame, b is low-frame. new_evidence_wins is items where
+        # high helps that low couldn't solve (= a_only). damage is items
+        # where low solved but high broke (= b_only).
+        new_ev = a_only
+        damage = b_only
+        net = new_ev - damage
+        lines.append(
+            f"| `{a}` vs `{b}` | {label} | {n} | {both} | {new_ev} | {damage} | "
+            f"{neither} | {net:+d} | {acc_a:.3f} | {acc_b:.3f} | "
             f"{chi2:.3f} | {p:.3f} |"
         )
 

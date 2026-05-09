@@ -58,8 +58,22 @@ def stitch_cascade(in_jsonl: Path,
                    first_pass_frames: int = 64,
                    second_pass_frames: int = 256,
                    stitched_cond_name: str = "G7_F4_CascadeAvg128",
-                   tie_seed: int = 0) -> tuple[list[dict], dict]:
-    """Return (stitched_rows, meta_dict)."""
+                   tie_seed: int = 0,
+                   selection_mode: str = "margin",
+                   random_seed: int = 0) -> tuple[list[dict], dict]:
+    """Return (stitched_rows, meta_dict).
+
+    selection_mode:
+      "margin" -- bottom-third by confidence margin (max - second_max) of the
+                  first-pass option_logprobs. The original cascade.
+      "random" -- bottom-third by deterministic hash with random_seed. Tests
+                  whether margin-based selection beats arbitrary selection at
+                  the same rerun rate.
+      "oracle" -- items where first_pass.is_correct=False AND
+                  second_pass.is_correct=True. Uses ground-truth labels;
+                  upper-bound on cascade gain. Realized rerun rate may differ
+                  from the target.
+    """
     if not in_jsonl.exists():
         raise FileNotFoundError(f"input JSONL does not exist: {in_jsonl}")
     rows = [json.loads(l) for l in in_jsonl.read_text().splitlines() if l.strip()]
@@ -79,42 +93,77 @@ def stitch_cascade(in_jsonl: Path,
             f"{in_jsonl}. Run expG_frame_scaling.py for both conditions first."
         )
 
-    # Compute margins for G1 (the first-pass forward).
-    by_item_margin: list[tuple[str, float, int]] = []  # (id, margin, hashbreak)
-    for iid in common_items:
-        m = _confidence_margin(g1_rows[iid]["option_logprobs"])
-        by_item_margin.append((iid, m, _hash_break(iid, seed=tie_seed)))
-
-    # Sort ascending by (margin, hashbreak): low-margin items rerun first.
-    by_item_margin.sort(key=lambda x: (x[1], x[2]))
-
-    # Pick the bottom-third (rounded). target_avg = 128 -> rerun_fraction = 1/3.
+    # Target rerun fraction (used by margin/random modes; informational for oracle).
     span = max(1, second_pass_frames - first_pass_frames)
     rerun_fraction = (target_avg_frames - first_pass_frames) / span
     rerun_fraction = max(0.0, min(1.0, rerun_fraction))
-    n_rerun = int(round(len(common_items) * rerun_fraction))
-    low_margin_ids = {iid for iid, _, _ in by_item_margin[:n_rerun]}
-    tau = (by_item_margin[n_rerun - 1][1] if n_rerun > 0
-           else float("-inf"))
+    n_rerun_target = int(round(len(common_items) * rerun_fraction))
+
+    # Compute margins for the first pass (used by margin mode + always recorded
+    # in the per-row first_pass_margin field).
+    margins: dict[str, float] = {
+        iid: _confidence_margin(g1_rows[iid]["option_logprobs"])
+        for iid in common_items
+    }
+
+    if selection_mode == "margin":
+        # Sort ascending by (margin, hashbreak); pick bottom-third.
+        ranked = sorted(
+            ((iid, margins[iid], _hash_break(iid, seed=tie_seed)) for iid in common_items),
+            key=lambda x: (x[1], x[2]),
+        )
+        low_margin_ids = {iid for iid, _, _ in ranked[:n_rerun_target]}
+        n_rerun = n_rerun_target
+        tau = ranked[n_rerun - 1][1] if n_rerun > 0 else float("-inf")
+    elif selection_mode == "random":
+        # Deterministic random selection by hash seeded with random_seed.
+        ranked = sorted(common_items, key=lambda iid: _hash_break(iid, seed=random_seed))
+        low_margin_ids = set(ranked[:n_rerun_target])
+        n_rerun = n_rerun_target
+        tau = float("nan")  # not meaningful for random selection
+    elif selection_mode == "oracle":
+        # Pick items where first-pass is wrong but second-pass is right; rank
+        # by margin (lowest first) and cap at n_rerun_target if there are
+        # more eligible items than the budget.
+        eligible = [
+            iid for iid in common_items
+            if not g1_rows[iid].get("is_correct", False)
+            and g4_rows[iid].get("is_correct", False)
+        ]
+        if len(eligible) > n_rerun_target:
+            eligible.sort(key=lambda iid: (margins[iid], _hash_break(iid, seed=tie_seed)))
+            eligible = eligible[:n_rerun_target]
+        low_margin_ids = set(eligible)
+        n_rerun = len(low_margin_ids)
+        tau = float("nan")  # selection was label-based, not margin-thresholded
+    else:
+        raise ValueError(f"unknown selection_mode={selection_mode!r}")
 
     realized_avg = (
         (n_rerun * second_pass_frames + (len(common_items) - n_rerun) * first_pass_frames)
         / max(1, len(common_items))
     )
 
-    # Build stitched rows: substitute G4 for low-margin, keep G1 for the rest.
+    realized_avg = (
+        (n_rerun * second_pass_frames + (len(common_items) - n_rerun) * first_pass_frames)
+        / max(1, len(common_items))
+    )
+
+    # Build stitched rows: substitute second-pass for selected items, keep
+    # first-pass for the rest.
     stitched: list[dict] = []
     bucket_low_margin = Counter()
     for iid in common_items:
         g1_row = g1_rows[iid]
         g4_row = g4_rows[iid]
-        margin = _confidence_margin(g1_row["option_logprobs"])
+        margin = margins[iid]
         is_low = iid in low_margin_ids
         src = g4_row if is_low else g1_row
         new = dict(src)  # shallow copy
         new["experiment"] = "G"
         new["condition"] = stitched_cond_name
         new["condition_class"] = "cascade"
+        new["cascade_selection_mode"] = selection_mode
         new["cascade_target_avg"] = target_avg_frames
         new["cascade_threshold_tau"] = float(tau)
         new["first_pass_margin"] = float(margin)
@@ -125,6 +174,8 @@ def stitch_cascade(in_jsonl: Path,
         # Carry source provenance for analyzer auditing.
         new["cascade_first_pass_cond"] = first_pass_cond
         new["cascade_second_pass_cond"] = second_pass_cond
+        if selection_mode == "random":
+            new["cascade_random_seed"] = random_seed
         if is_low:
             bucket_low_margin[src.get("duration_bucket", "unknown")] += 1
         stitched.append(new)
@@ -136,14 +187,26 @@ def stitch_cascade(in_jsonl: Path,
         "target_avg_frames": target_avg_frames,
         "first_pass_frames": first_pass_frames,
         "second_pass_frames": second_pass_frames,
-        "rerun_fraction": rerun_fraction,
+        "selection_mode": selection_mode,
+        "rerun_fraction_target": rerun_fraction,
         "n_items": len(common_items),
-        "n_rerun": n_rerun,
+        "n_rerun_target": n_rerun_target,
+        "n_rerun_realized": n_rerun,
         "cascade_threshold_tau": float(tau),
         "realized_avg_frames": float(realized_avg),
         "low_margin_bucket_distribution": dict(bucket_low_margin),
         "tie_seed": tie_seed,
     }
+    if selection_mode == "random":
+        meta["random_seed"] = random_seed
+    if selection_mode == "oracle":
+        # Diagnostic: how many items in total satisfy the oracle condition?
+        n_oracle_eligible = sum(
+            1 for iid in common_items
+            if not g1_rows[iid].get("is_correct", False)
+            and g4_rows[iid].get("is_correct", False)
+        )
+        meta["n_oracle_eligible"] = n_oracle_eligible
     return stitched, meta
 
 
@@ -159,8 +222,18 @@ def main():
     ap.add_argument("--first_pass", default="G1_F4_64f")
     ap.add_argument("--second_pass", default="G4_F4_256f")
     ap.add_argument("--target_avg_frames", type=int, default=128)
+    ap.add_argument("--first_pass_frames", type=int, default=64)
+    ap.add_argument("--second_pass_frames", type=int, default=256)
     ap.add_argument("--stitched_name", default="G7_F4_CascadeAvg128")
     ap.add_argument("--tie_seed", type=int, default=0)
+    ap.add_argument("--selection_mode", choices=["margin", "random", "oracle"],
+                    default="margin",
+                    help="margin = bottom-third by confidence margin (default); "
+                         "random = bottom-third by deterministic hash with --random_seed; "
+                         "oracle = items where first-pass wrong AND second-pass right "
+                         "(uses ground-truth labels; upper-bound).")
+    ap.add_argument("--random_seed", type=int, default=0,
+                    help="Seed for random selection mode.")
     args = ap.parse_args()
 
     stitched, meta = stitch_cascade(
@@ -168,8 +241,12 @@ def main():
         first_pass_cond=args.first_pass,
         second_pass_cond=args.second_pass,
         target_avg_frames=args.target_avg_frames,
+        first_pass_frames=args.first_pass_frames,
+        second_pass_frames=args.second_pass_frames,
         stitched_cond_name=args.stitched_name,
         tie_seed=args.tie_seed,
+        selection_mode=args.selection_mode,
+        random_seed=args.random_seed,
     )
     args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     with open(args.out_jsonl, "w") as f:

@@ -120,10 +120,20 @@ FIXED_FRAME_CONDITIONS = [
     ("G4_F4_256f",   256, "F4_KIVI_PerChannelSeq", "v1_kcfg"),
     ("G5_F9_128f",   128, "F9_KIVI_Outlier16",    "v1_kcfg"),
     ("G6_F9_256f",   256, "F9_KIVI_Outlier16",    "v1_kcfg"),
+    # G control: direct 192f F9 to compare against the cascade-avg-192 two-pass
+    # policy. Tests whether the cascade's gain is the average frame budget or
+    # the adaptive routing.
+    ("G9_F9_192f",   192, "F9_KIVI_Outlier16",    "v1_kcfg"),
+    # H-suite: temporal-windowed KIVI. v1_kcfg_with_slice supplies slice_info
+    # (v_start/v_end) to the kernel so it can split the visual span.
+    ("H3_KIVI_TempWin4_256f",    256, "H3_KIVI_TempWin4",    "v1_kcfg_with_slice"),
+    ("H4_KIVI_TempWin8_256f",    256, "H4_KIVI_TempWin8",    "v1_kcfg_with_slice"),
+    ("H5_KIVI_TokenBlock4_256f", 256, "H5_KIVI_TokenBlock4", "v1_kcfg_with_slice"),
+    ("H6_KIVI_TempWin2_128f",    128, "H6_KIVI_TempWin2",    "v1_kcfg_with_slice"),
 ]
 
 
-CONDITIONS_NEEDING_CALIB = {"G5_F9_128f", "G6_F9_256f"}  # F9 needs outlier indices
+CONDITIONS_NEEDING_CALIB = {"G5_F9_128f", "G6_F9_256f", "G9_F9_192f"}  # F9 needs outlier indices
 
 
 def build_g_conditions(calib: Optional[dict]) -> list[dict]:

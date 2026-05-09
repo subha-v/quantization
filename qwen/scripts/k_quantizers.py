@@ -74,6 +74,10 @@ KQUANTIZER_KINDS = (
     "score_cal_block_tt_heavy",
     "score_cal_block_balanced",
     "score_cal_text_only",
+    # H-suite: temporal-windowed KIVI. One per-channel scale per temporal
+    # segment instead of one scale shared across the whole sequence. Stays at
+    # TRUE 4.00 KV bits (no outlier spend; scale metadata is negligible).
+    "kivi_temporal_window",
 )
 
 
@@ -88,6 +92,14 @@ class KQuantizerConfig:
     calib: Optional[dict] = field(default=None, repr=False)
     group_size: int = 0  # 0 means "no head_dim grouping" — pure per-channel-seq
     text_only: bool = False
+    # H-suite (kivi_temporal_window): number of K-scale segments inside the
+    # visual span (or across the whole sequence in token_block mode).
+    n_temporal_windows: int = 0
+    # "visual_only" -> text-prefix + N visual windows + text-suffix, each with
+    # its own per-channel scale.
+    # "token_block" -> N equal-token segments across the whole sequence,
+    # ignoring modality boundaries (control for the visual-time hypothesis).
+    temporal_mode: str = "visual_only"
 
     def __post_init__(self):
         if self.kind not in KQUANTIZER_KINDS:
@@ -247,6 +259,17 @@ def apply_k_quantizer(K: torch.Tensor, cfg: KQuantizerConfig,
         # F13: text-K with score-cal scales, visual-K with current INT4.
         return _score_cal_text_only(K, cfg, layer_idx, slice_info, cache_offset, qmax)
 
+    if kind == "kivi_temporal_window":
+        # H3/H4/H6: per-channel scales applied separately to (text-prefix,
+        # visual-window-1, ..., visual-window-N, text-suffix).
+        # H5: per-channel scales applied to N equal-token blocks across the
+        # whole sequence, ignoring modality.
+        return _kivi_temporal_window(
+            K, cfg, slice_info, cache_offset, qmax,
+            n_windows=int(cfg.n_temporal_windows or 0),
+            mode=str(cfg.temporal_mode or "visual_only"),
+        )
+
     raise ValueError(f"apply_k_quantizer: unhandled kind={kind!r}")
 
 
@@ -354,6 +377,77 @@ def _kivi_role_split(K: torch.Tensor, cfg: KQuantizerConfig,
         s_r = _per_channel_seq_scale(K_r, qmax, percentile=None)
         K_r_q = _quantize_with_scale(K_r, s_r, qmax)
         K_q.index_copy_(dim=-2, index=idx, source=K_r_q)
+    return K_q
+
+
+# ===================================================================
+# Temporal-windowed KIVI (H suite)
+# ===================================================================
+
+
+def _kivi_temporal_window(K: torch.Tensor, cfg: KQuantizerConfig,
+                          slice_info: Optional[dict], cache_offset: int,
+                          qmax: float, n_windows: int,
+                          mode: str = "visual_only") -> torch.Tensor:
+    """One per-channel KIVI scale per temporal segment.
+
+    visual_only mode:
+      - text-prefix span [0, v_start): one scale (per-channel)
+      - visual span [v_start, v_end): split into n_windows equal-token segments;
+        one scale per segment.
+      - text-suffix span [v_end, T): one scale (per-channel)
+      Each segment is quantized with its own [B, H_kv, 1, D] scale.
+
+    token_block mode:
+      [0, T) split into n_windows equal-token segments. Modality is ignored.
+      Used as a control to test whether the visual-time structure is the
+      load-bearing thing or just generic local scaling.
+
+    cache_offset > 0 (decode-time, not used in MCQ scoring) falls back to plain
+    F4 per-channel-seq scale on the small new chunk. Matches F5/F6 pattern.
+    """
+    B, H, T, D = K.shape
+    if T == 0:
+        return K
+
+    # Decode-time fallback: small new chunk, no temporal structure to exploit.
+    if cache_offset > 0:
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+
+    # Degenerate window count: behave like F4.
+    if n_windows is None or n_windows <= 1:
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+
+    if mode == "token_block":
+        boundaries = [int(round(T * i / n_windows)) for i in range(n_windows + 1)]
+    else:
+        # visual_only: text-prefix + N visual windows + text-suffix.
+        v_start = 0
+        v_end = T
+        if slice_info is not None and "v_start" in slice_info and "v_end" in slice_info:
+            v_start = max(0, min(T, int(slice_info["v_start"])))
+            v_end = max(v_start, min(T, int(slice_info["v_end"])))
+        if v_end <= v_start:
+            # Degenerate: no visual span detected. Fall back to F4.
+            scale = _per_channel_seq_scale(K, qmax, percentile=None)
+            return _quantize_with_scale(K, scale, qmax)
+        v_boundaries = [v_start + int(round((v_end - v_start) * i / n_windows))
+                        for i in range(n_windows + 1)]
+        boundaries = [0] + v_boundaries + [T]
+        # Dedup adjacents (handles cases where v_start==0 or v_end==T or
+        # window boundary equals v_start/v_end).
+        boundaries = sorted(set(boundaries))
+
+    K_q = K.clone()
+    for i in range(len(boundaries) - 1):
+        a, b = boundaries[i], boundaries[i + 1]
+        if b <= a:
+            continue
+        seg = K[:, :, a:b, :]
+        s = _per_channel_seq_scale(seg, qmax, percentile=None)
+        K_q[:, :, a:b, :] = _quantize_with_scale(seg, s, qmax)
     return K_q
 
 
@@ -575,4 +669,14 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
                          score_cal_weights={"w_TT": 1.0, "w_TV": 1.0, "w_VT": 1.0, "w_VV": 1.0}),
         KQuantizerConfig(name="F13_ScoreCal_TextOnly", kind="score_cal_text_only", bits=4,
                          calib=calib, text_only=True),
+        # --- H-suite: temporal-windowed KIVI (genuine VLM novelty) ---
+        # Stays at TRUE 4.00 KV bits; scale metadata is negligible vs cache.
+        KQuantizerConfig(name="H3_KIVI_TempWin4", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=4, temporal_mode="visual_only"),
+        KQuantizerConfig(name="H4_KIVI_TempWin8", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=8, temporal_mode="visual_only"),
+        KQuantizerConfig(name="H5_KIVI_TokenBlock4", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=4, temporal_mode="token_block"),
+        KQuantizerConfig(name="H6_KIVI_TempWin2", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=2, temporal_mode="visual_only"),
     ]
