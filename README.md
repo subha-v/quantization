@@ -387,6 +387,102 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
+## Qwen2.5-VL × LongVideoBench — Experiment G: Frame-scaling under fixed KV memory budget (staged 2026-05-09)
+
+After Exp F (KIVI per-channel-along-seq) closed 94.4% of the KV-quantization collapse at TRUE 4.00 KV bits, the open research question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget*. The theoretical math at fixed `max_pixels=360×420`:
+
+```
+relative KV memory = (frames × avg_kv_bits) / (64 × 16)
+```
+
+so 256-frame F4 (≈4 KV bits) ≈ 64-frame BF16 KV memory at 4× temporal coverage. **The headline test is whether `G4` (256f F4) beats `G0` (64f BF16) on LongVideoBench.** If it does, the contribution shifts from "we applied KIVI" to "correct KV quantization changes the long-video operating point."
+
+### Stage-1 conditions (n=64 balanced 16/bucket, 9 conditions)
+
+Reuses F-suite F0 (BF16), F4 (KIVI per-channel-seq INT4), F9 (KIVI + top-16 outlier BF16). Same n=64 stratified subset as F-suite Stage 1 so the F4 anchor is paired exactly.
+
+| ID | Frames | KV | rel KV mem | Purpose |
+|---|---:|---|---:|---|
+| G0 | 64 | BF16 | 1.00× | Baseline ceiling (re-anchor to A1=0.565) |
+| G1 | 64 | F4 INT4 | 0.25× | Re-anchor to F4=0.545; cascade & type-adaptive substrate |
+| G2 | 128 | BF16 | 2.00× | Upper-bound for what extra frames buy |
+| G3 | 128 | F4 INT4 | 0.50× | Memory-saving point: 2× frames at half KV mem |
+| **G4** | **256** | **F4 INT4** | **1.00×** | **Matched-memory headline: 4× frames at G0 budget** |
+| G5 | 128 | F9 (4.75 bits) | 0.59× | Zero-loss point at 2× frames |
+| G6 | 256 | F9 (4.75 bits) | 1.19× | Zero-loss point at 4× frames |
+| G7 | 64↗256 cascade | F4 INT4 | ≈1.00× (target avg=128) | Spend frames only on low-margin items |
+| G8 | type-adaptive 64/128/256 | F4 INT4 | ≈0.50× (target avg=128) | Detail/temporal/count/OCR → 256f; detail/action → 128f; other → 64f |
+
+### Compute structure (drives ~3.5 h Stage-1 wall vs naive ~8.4 h)
+
+The visual prefill (image-token construction, position-id generation, find_text_slice_spans, inputs dict) is the heavy work and is **identical across K-quantizer configs at the same frame count**. The driver iterates outer over `frames ∈ {64, 128, 256}`, inner over the K-quantizer configs at that frame count, sharing the prefill across F0/F4/F9 conditions. G7/G8 are pure JSONL post-processes (no new forwards).
+
+**Calibration reuse.** F-suite calibration NPZ at frames=64 is reused as-is. K-channel outlier indices are post-RoPE and frame-count-independent in theory; smoke check 8 (opt-in via `EXPG_RIGOR_HIGH=1`) verifies on 8 cal items at frames=256 with Jaccard ≥ 0.75 per (L, H_kv).
+
+### What's new in `qwen/scripts/`
+
+- `expG_frame_scaling.py` — main driver; outer loop over frame counts {64,128,256}, inner loop over K-quantizer configs (F0/F4/F9). Reuses F-suite `_run_condition_forward`, `_option_logprobs_and_pred`, `_compute_three_bit_columns`, `ensure_stage_split`, `backfill_bf16_join` verbatim. Adds `relative_kv_memory` to each row.
+- `expG_smoke.py` — 8 hard assertions: F4 dispatch at T∈{5760, 11520, 23040}; F9 calibration loadable; n=64 split present; cascade margin definition (max−second_max ≡ answer_margin@argmax); qtype classifier coverage on cal-100 (weighted_avg_frames ∈ [110, 145]); `nvidia-smi` memory feasibility for the 256f tier; G0 anchor sanity (acc bounds 0.45–0.60 to catch the Exp-D fast-processor regression); optional 8-item recalibration at frames=256 to verify outlier-index Jaccard.
+- `expG_cascade.py` — G7 confidence cascade post-process. Loads G1 (64f F4) + G4 (256f F4) rows, computes `cascade_margin = max(option_logprobs) − second_max(...)` per G1 row, picks bottom-third by margin to substitute G4 rows for. For target_avg=128, rerun fraction = (128−64)/(256−64) = 1/3 exactly. Pure JSONL stitch; zero new forwards.
+- `expG_type_adaptive.py` — G8 question-type adaptive post-process. Routes each item to G1/G3/G4 by `classify_question_type(question)` and `BUDGET_MAP`. Pure JSONL stitch; zero new forwards.
+- `question_type_classifier.py` — keyword heuristic with 6 labels (count/temporal/ocr/detail/action/other) → BUDGET_MAP {64, 128, 256}. Tunable on cal-100 split (disjoint from any stage-N eval set per `make_split` semantics).
+- `expG_analyze.py` — per-condition table with 95% bootstrap CI; **paired McNemar** for headline pairs (G4↔G0, G3↔G0, G6↔G2, G7↔G1, G8↔G1, G4↔G2); frame-budget vs accuracy frontier (sorted by `relative_kv_memory`); verdict matrix with G-specific promotion rules.
+- `run_expG.sh` — orchestrator with subcommands `smoke|stage1|stage3|cascade|analyze|full`. Env vars: `PIPELINE_MODEL`, `EXPG_N_LIMIT`, `EXPG_MIN_FREE_GB=70`, `EXPG_RIGOR_HIGH`, `CUDA_VISIBLE_DEVICES`.
+
+### Promotion rules (Stage 1 → Stage 3)
+
+```
+G4 (256f F4) ≥ G0 + 3 pp                        → promote_paper_strong  [HEADLINE]
+G4 ∈ [G0 − 3 pp, G0 + 3 pp]                     → promote_n200          (matched-memory)
+G3 (128f F4) ≥ G0                               → promote_n200          (memory-saving)
+G6 (256f F9) ≥ G2 − 1 pp                        → promote_n200          (zero-loss at 4×)
+adaptive (G7 or G8) ≥ best fixed F4 + 2 pp      → promote_n200
+G4 < G0 − 5 pp                                  → kill                  (frame coverage doesn't help)
+```
+
+### Running on tambe-server-1
+
+```bash
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+source /data/subha2/experiments/qwen_venv/bin/activate
+nvidia-smi  # confirm GPU 0 is free; co-tenant typically holds GPU 1
+tmux new -s qwen-expG
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expG.sh smoke    # ~30s (no model fwd) or ~5min (with --model)
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expG.sh stage1   # ~3.5h: G0/G1 (64f) → G2/G3/G5 (128f) → G4/G6 (256f)
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expG.sh cascade  # ~1 min post-process: G7 + G8
+bash qwen/scripts/run_expG.sh analyze                              # no GPU
+```
+
+After Stage 1: promote 4–6 conditions to Stage 3 (n=200 canonical) per the verdict matrix; expect ~11 h Stage-3 wall.
+
+Plan in `/Users/subha/.claude/plans/read-through-the-qwen-experiments-md-ancient-shell.md`.
+
+## Qwen2.5-VL × LongVideoBench — Experiment F: K-quantizer repair screening (2026-05-09, COMPLETE)
+
+**Headline: the 35.5 pp KV-quantization collapse from Exp A is *solved* by switching the K scale axis.** F4 KIVI per-channel-along-seq closes **94.4% of the F1→F0 gap (33.5 of 35.5 pp) at TRUE 4.00 KV bits**: F4 = 0.545 vs F0 BF16 ceiling 0.565, F1 INT4 floor 0.210. The fix is a one-line scale-axis change from per-(head, position, group of 128 head_dim slots) to per-(head, channel) shared across all positions — no calibration, no routing, no slice info. **None of the routing experiments (Exp B, D1, E1) were necessary**; the bottleneck was always the quantizer, not the selector.
+
+### Stage 3 Pareto frontier (n=200 canonical eval split)
+
+| KV bits | acc | condition | note |
+|---:|---:|---|---|
+| 4.000 | **0.545** | F4 KIVI per-channel-seq | **deployable headline** (4× compression, ~2 pp loss) |
+| 4.375 | 0.540 | F8 outlier-8 | dominated by F4 |
+| 4.750 | **0.560** | F9 outlier-16 | **zero-loss Pareto point** (within CI of F0) |
+| 10.000 | 0.550 | F3 all-K BF16 + V INT4 | dominated by F4 |
+| 16.000 | 0.565 | F0 BF16 (ceiling) | reference |
+
+VLM-specific scaling refinements (F5 text/visual split=0.510, F6 prompt-role split=0.525, F7 99.5%ile clip=0.540) all UNDERPERFORM F4 at the same 4-bit budget. Once the K axis is right, modality/role-aware quantization adds nothing. Score-cal closed-form variants (F10–F13) failed catastrophically (0.172–0.281); iterative scale search would be needed to revisit. Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment F".
+
+### Files of record
+
+- `qwen/scripts/k_quantizers.py` — `KQuantizerConfig` dataclass + 12 quantizer kinds + `apply_k_quantizer` dispatch.
+- `qwen/scripts/expF_calibrate.py` — single-pass cal-100 capture; per-(L, H_kv, channel) `k_channel_energy` + outlier indices + `q_energy{,_text,_visual}` via forward hooks on each layer's `q_proj`.
+- `qwen/scripts/expF_smoke.py` — Phase A (synthetic-tensor) + Phase B (live-model logits-differ) smoke checks.
+- `qwen/scripts/expF_kquant_screen.py` — tiered driver (Stages 0/1/2/3); `_compute_three_bit_columns` for K/V/KV avg-bit accounting.
+- `qwen/scripts/expF_analyze.py` — per-condition table + verdict matrix.
+- `qwen/scripts/run_expF.sh smoke|calib|stage{0,1,2,3}|analyze|full`.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment E1: Text-K Slice Ablation (2026-05-08, COMPLETE)
 
 **Headline: text-K-routing hypothesis ALSO falsified.** After D1 showed text-K is the dominant fragility (vs visual-K), E1 asked *which* of the ~140 text-K positions carry the fragility. 200 items × 11 V3K text-K-mask conditions (V always INT4, visual-K always INT4, only text-K varied):
