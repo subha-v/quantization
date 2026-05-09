@@ -68,9 +68,16 @@ HEADLINE_PAIRS = [
     ("G4_F4_256f",   "G0_BF16",         "matched_memory_headline"),
     ("G3_F4_128f",   "G0_BF16",         "memory_saving"),
     ("G6_F9_256f",   "G2_BF16_128f",    "zero_loss_at_4x_frames"),
+    ("G6_F9_256f",   "G0_BF16",         "f9_256f_vs_baseline"),
+    ("G5_F9_128f",   "G0_BF16",         "f9_128f_vs_baseline"),
     ("G7_F4_CascadeAvg128",  "G1_F4_64f",   "cascade_vs_anchor"),
     ("G8_F4_TypeAdaptive",   "G1_F4_64f",   "type_adaptive_vs_anchor"),
     ("G4_F4_256f",   "G2_BF16_128f",    "256f_quant_vs_128f_bf16"),
+    # F9-backbone adaptive variants
+    ("G7_F9_CascadeAvg192",       "G5_F9_128f",  "f9_cascade_vs_f9_anchor"),
+    ("G7_F9_CascadeAvg192",       "G6_F9_256f",  "f9_cascade_vs_f9_top"),
+    ("G8_F9_TypeAdaptiveMin128",  "G5_F9_128f",  "f9_type_adaptive_vs_f9_anchor"),
+    ("G8_F9_TypeAdaptiveMin128",  "G6_F9_256f",  "f9_type_adaptive_vs_f9_top"),
 ]
 
 
@@ -85,19 +92,22 @@ def _cond_sort_key(name: str) -> tuple[int, str]:
 
 def load_g_rows(stage: int, in_jsonl: Path,
                 cascade_jsonl: Path | None,
-                qtype_jsonl: Path | None) -> list[dict]:
+                qtype_jsonl: Path | None,
+                extra_jsonl: list[Path] | None = None) -> list[dict]:
+    """Load G stage rows from base JSONL + cascade + qtype + any extras."""
     rows: list[dict] = []
-    if in_jsonl.exists():
+    paths = [in_jsonl]
+    if cascade_jsonl is not None:
+        paths.append(cascade_jsonl)
+    if qtype_jsonl is not None:
+        paths.append(qtype_jsonl)
+    if extra_jsonl:
+        paths.extend(extra_jsonl)
+    for p in paths:
+        if p is None or not p.exists():
+            continue
         rows.extend(
-            json.loads(l) for l in in_jsonl.read_text().splitlines() if l.strip()
-        )
-    if cascade_jsonl is not None and cascade_jsonl.exists():
-        rows.extend(
-            json.loads(l) for l in cascade_jsonl.read_text().splitlines() if l.strip()
-        )
-    if qtype_jsonl is not None and qtype_jsonl.exists():
-        rows.extend(
-            json.loads(l) for l in qtype_jsonl.read_text().splitlines() if l.strip()
+            json.loads(l) for l in p.read_text().splitlines() if l.strip()
         )
     rows = [r for r in rows if r.get("error") is None and not r.get("skipped", False)]
     return rows
@@ -158,6 +168,11 @@ def verdict_g(cond: str, by_cond_acc: dict[str, float]) -> str:
          for c in ("G1_F4_64f", "G3_F4_128f", "G4_F4_256f")),
         default=float("-inf"),
     )
+    best_fixed_f9 = max(
+        (by_cond_acc.get(c, float("-inf"))
+         for c in ("G5_F9_128f", "G6_F9_256f")),
+        default=float("-inf"),
+    )
     acc = by_cond_acc.get(cond, float("nan"))
     if cond == "G4_F4_256f":
         if acc >= g0 + 0.03:
@@ -185,6 +200,13 @@ def verdict_g(cond: str, by_cond_acc: dict[str, float]) -> str:
     if cond in ("G7_F4_CascadeAvg128", "G8_F4_TypeAdaptive"):
         if acc >= best_fixed_f4 + 0.02:
             return "promote_n200"
+        return "borderline"
+    # F9-backbone adaptive variants: compare against best fixed-F9 condition.
+    if cond in ("G7_F9_CascadeAvg192", "G8_F9_TypeAdaptiveMin128"):
+        if acc >= best_fixed_f9 + 0.02:
+            return "promote_n200"
+        if acc >= best_fixed_f9 - 0.01:
+            return "borderline"
         return "borderline"
     return "unranked"
 
@@ -388,6 +410,9 @@ def main():
     ap.add_argument("--in_jsonl", type=Path, default=None)
     ap.add_argument("--cascade_jsonl", type=Path, default=None)
     ap.add_argument("--qtype_jsonl", type=Path, default=None)
+    ap.add_argument("--extra_jsonl", type=Path, nargs="*", default=None,
+                    help="Additional JSONL files to merge in (e.g. F9-backbone "
+                         "cascade/type-adaptive stitched outputs).")
     ap.add_argument("--summary", type=Path, default=None)
     ap.add_argument("--paired", type=Path, default=None)
     ap.add_argument("--frontier", type=Path, default=None)
@@ -409,7 +434,8 @@ def main():
     if args.verdict is None:
         args.verdict = RESULTS_DIR / f"expG_verdict_matrix_stage{args.stage}.md"
 
-    rows = load_g_rows(args.stage, args.in_jsonl, args.cascade_jsonl, args.qtype_jsonl)
+    rows = load_g_rows(args.stage, args.in_jsonl, args.cascade_jsonl,
+                       args.qtype_jsonl, extra_jsonl=args.extra_jsonl)
     if not rows:
         msg = f"# Exp G stage {args.stage}\n\n(no data: ran with empty JSONLs)\n"
         for path in (args.summary, args.paired, args.frontier, args.verdict):

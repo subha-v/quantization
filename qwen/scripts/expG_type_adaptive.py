@@ -142,6 +142,17 @@ def main():
                     default=CALIBRATION_DIR / "split_seed0_n64.json",
                     help="Stage-1 split. Items not in this split are dropped.")
     ap.add_argument("--stitched_name", default="G8_F4_TypeAdaptive")
+    ap.add_argument("--frames_to_gcond_json", type=str, default=None,
+                    help="JSON dict mapping frame budget (str) to source "
+                         "condition name. Default: {64:G1_F4_64f, 128:G3_F4_128f, "
+                         "256:G4_F4_256f} -- override for an F9-backbone variant "
+                         "with e.g. '{\"128\":\"G5_F9_128f\",\"256\":\"G6_F9_256f\"}'.")
+    ap.add_argument("--budget_map_json", type=str, default=None,
+                    help="JSON dict mapping qtype label to frame count. Default: "
+                         "BUDGET_MAP from question_type_classifier. Override for "
+                         "F9-backbone variants where 64f isn't available, e.g. "
+                         "'{\"count\":256,\"ocr\":256,\"detail\":256,\"temporal\":128,"
+                         "\"action\":128,\"other\":128}'.")
     args = ap.parse_args()
 
     items_all = load_all_items()
@@ -151,10 +162,20 @@ def main():
         items_all = [it for it in items_all if it.id in eval_ids]
     items_by_id = {it.id: it for it in items_all}
 
+    frames_to_gcond = FRAMES_TO_GCOND
+    if args.frames_to_gcond_json:
+        raw = json.loads(args.frames_to_gcond_json)
+        frames_to_gcond = {int(k): v for k, v in raw.items()}
+    budget_map = BUDGET_MAP
+    if args.budget_map_json:
+        budget_map = json.loads(args.budget_map_json)
+
     stitched, meta = stitch_type_adaptive(
         args.in_jsonl,
         items_by_id=items_by_id,
         stitched_cond_name=args.stitched_name,
+        budget_map=budget_map,
+        frames_to_gcond=frames_to_gcond,
     )
 
     args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
