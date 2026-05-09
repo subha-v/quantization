@@ -106,3 +106,65 @@ sees post-RoPE K/V at `[B, 4, seq, 128]`. **V2 operates over KV-heads (length 4)
 not Q-heads (28)** — each KV-head is shared by 7 Q-heads under GQA. Per-Q-head
 precision is not directly expressible without re-quantizing post-`repeat_kv`,
 which is out of scope.
+
+## Experiment F — Tiered K-quantizer repair screening (in flight)
+
+After D1 / E1 ruled out routing-within-K as a research direction (text-K
+slice and visual-K window selectors all clustered within ±5 pp of D1.3's
+0.385), the next direction is to **fix the K quantizer itself** while V
+stays at INT4. Exp F screens 14 K-quantizer variants on a tiered
+n=16 → 64 → 100 → 200 ladder (`seed=0` stratified subsets so the smaller
+splits are subsets of the larger).
+
+### Stages
+
+| Stage | n / bucket | n total | Purpose |
+|---|---:|---:|---|
+| 0 | 4 | 16 | Smoke / wiring; do NOT interpret accuracy |
+| 1 | 16 | 64 | Screen all 14 conditions |
+| 2 | 25 | 100 | Confirm borderlines (acc 0.30–0.36 in Stage 1) |
+| 3 | 50 | 200 | Final paired analysis (top survivors only) |
+
+Stage-1 verdict thresholds (anchored on prior numbers — INT4 floor 0.21,
+text-K BF16 rescue 0.385, BF16 ceiling ≈0.50–0.57): `kill ≤ 0.27`,
+`borderline 0.28–0.34`, `promote_n100 0.34–0.40`, `promote_n200 0.40–0.45`,
+`paper_strong ≥ 0.45`.
+
+### Conditions (14)
+
+**Anchors:** F0 BF16, F1 uniform INT4, F2 text-K BF16 + visual-K INT4,
+F3 all-K BF16 + V INT4 (= D1.3 / C2.1 designs re-run on n=64).
+
+**Literature-aligned K repairs (KIVI / KVQuant):**
+F4 KIVI-lite (per-channel along seq), F5 + text/visual scale split,
+F6 + per-prompt-role scales, F7 + 99.5-percentile clipping,
+F8/F9 + top-8/16 outlier channels at BF16 per (layer, kv-head).
+
+**VLM-specific score-space repairs (closed-form Q-energy reweight):**
+F10 generic score-cal K, F11 TT-heavy block-score K (w_TT=4),
+F12 balanced block-score K (all w=1), F13 text-K-only score-cal.
+
+### Layout (Exp F additions)
+
+```
+qwen/scripts/
+  k_quantizers.py            # KQuantizerConfig + 12 quantizer kinds
+  expF_calibrate.py          # cal-100 K + Q stats capture (NPZ + JSON)
+  expF_smoke.py              # Phase A (synthetic) + Phase B (live model)
+  expF_kquant_screen.py      # tiered driver (stages 0..3)
+  expF_analyze.py            # per-condition table + verdict matrix
+  run_expF.sh                # smoke|calib|stage{0,1,2,3}|analyze|full
+qwen/calibration/
+  expF_kcalib_<model>_frames<F>.{json,npz}  # one-pass cal-100 capture
+  split_seed0_n{16,64,100,200}.json          # stratified subset files
+qwen/results/
+  expF_kquant_stage{N}.jsonl                 # per (item, condition) rows
+  expF_summary_stage{N}.md                   # per-condition table
+  expF_verdict_matrix_stage{N}.md            # verdict + promotion plan
+```
+
+The cache extension lives in `fake_quant_kv_cache.py`:
+`FakeQuantKVCache(controller, k_quantizer_config=...)` dispatches the K
+path through `k_quantizers.apply_k_quantizer(...)` while V continues to use
+the BitController-driven `fake_quantize_kv`. `cache.set_slice_info(...)`
+plumbs role/modality position info to the F5/F6/F11/F12/F13 quantizers.

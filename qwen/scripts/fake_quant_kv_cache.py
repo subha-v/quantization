@@ -196,12 +196,33 @@ class FakeQuantKVCache(DynamicCache):
 
     Returns the (quantized) concatenated cache so Qwen2.5-VL's SDPA forward
     sees quantized K/V at the attention matmul (verified by smoke test).
+
+    For F-suite K-quantizer screening: pass `k_quantizer_config` (a
+    KQuantizerConfig from k_quantizers.py) and the K path is routed through
+    `apply_k_quantizer(key_states, cfg, layer_idx, slice_info=...)`. V path
+    continues to use the BitController-driven `fake_quantize_kv`.
+
+    `slice_info` (visual span + role spans, in absolute prefill coordinates)
+    must be set once per item before generate() via `set_slice_info(...)` if
+    F5/F6/F11/F12/F13 are used.
     """
 
-    def __init__(self, controller: BitController):
+    def __init__(self, controller: BitController, k_quantizer_config=None):
         super().__init__()
         self.controller = controller
         self.entropy_log: list[list[torch.Tensor]] = [[] for _ in range(controller.num_layers)]
+        # F-suite plumbing.
+        self.k_cfg = k_quantizer_config
+        self._slice_info: Optional[dict] = None
+
+    def set_slice_info(self, slice_info: Optional[dict]) -> None:
+        """F-suite: stash per-item role/modality info for the K quantizer.
+
+        slice_info should be a dict with at least:
+          v_start, v_end, seq_len, role_spans (dict[str -> (a, b)]),
+          text_positions (list[int]), visual_positions (list[int]).
+        """
+        self._slice_info = slice_info
 
     def update(
         self,
@@ -216,7 +237,14 @@ class FakeQuantKVCache(DynamicCache):
         kb, vb = self.controller.get_kv_bits_for_chunk(
             layer_idx, new_chunk_len, num_kv_heads, cache_offset
         )
-        key_q = fake_quantize_kv(key_states, kb)
+        if self.k_cfg is not None:
+            from k_quantizers import apply_k_quantizer  # local import to avoid cycles
+            key_q = apply_k_quantizer(
+                key_states, self.k_cfg, layer_idx,
+                slice_info=self._slice_info, cache_offset=cache_offset,
+            )
+        else:
+            key_q = fake_quantize_kv(key_states, kb)
         val_q = fake_quantize_kv(value_states, vb)
         return super().update(key_q, val_q, layer_idx, cache_kwargs)
 

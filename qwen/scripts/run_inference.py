@@ -121,12 +121,18 @@ def score_item(
     record_logits: bool = False,
     avg_kv_bits: Optional[float] = None,
     entropy_hook_factory=None,
+    k_quantizer_config=None,
+    slice_info: Optional[dict] = None,
 ) -> ScoreResult:
     """Score a single LongVideoBench MCQ item; return ScoreResult.
 
     controller may be None for the BF16 baseline (no cache wrapper).
     entropy_hook_factory: callable(model, cache) -> ContextManager — used by
     calibration runs and V3 online updates; pass None to skip.
+    k_quantizer_config: optional KQuantizerConfig for F-suite K-quantizer
+    repair screening. When supplied, the cache routes K through
+    apply_k_quantizer(...) instead of the BitController's bits.
+    slice_info: optional dict (per `set_slice_info`) for role/modality K kinds.
     """
     from qwen_vl_utils import process_vision_info  # type: ignore
 
@@ -141,7 +147,12 @@ def score_item(
         return_tensors="pt",
     ).to(model.device)
 
-    cache = FakeQuantKVCache(controller) if controller is not None else None
+    if controller is not None:
+        cache = FakeQuantKVCache(controller, k_quantizer_config=k_quantizer_config)
+        if slice_info is not None:
+            cache.set_slice_info(slice_info)
+    else:
+        cache = None
     cm = entropy_hook_factory(model, cache) if (entropy_hook_factory is not None and cache is not None) else nullcontext()
 
     t0 = time.perf_counter()
