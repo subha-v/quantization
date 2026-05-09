@@ -182,32 +182,76 @@ def _answer_margin(logp: list[float], correct: int) -> float:
     return float(logp[correct] - max(others))
 
 
+def _compute_three_bit_columns(cfg, mode: str, n_outliers: int,
+                               num_layers: int, num_kv_heads: int,
+                               head_dim: int = 128,
+                               n_text: int = 0, n_total: int = 1) -> tuple[float, float, float]:
+    """Return (avg_k_bits, avg_v_bits, avg_kv_bits) for the JSONL row.
+
+    F-suite convention: V is INT4 in every condition except F0 (BF16 K/V).
+
+    Outlier kinds (F8/F9): n_outliers per (L, H_kv) channels are at BF16, the
+    rest at cfg.bits (4). Total protected = n_outliers * num_layers * num_kv_heads,
+    out of total_chan = num_layers * num_kv_heads * head_dim. The K avg is the
+    weighted mean: k_bits = 16 * frac_bf16 + cfg.bits * (1 - frac_bf16).
+
+    F2 (v3k_text_bf16): K is mask-based (text BF16, visual INT4); n_text /
+    n_total define the BF16 fraction across positions.
+
+    F3 (v3k_all_bf16): K all BF16; V INT4; KV avg = 10.0.
+    """
+    if mode == "bf16":
+        return 16.0, 16.0, 16.0
+    if mode == "v3k_all_bf16":
+        return 16.0, 4.0, 10.0
+    if mode == "v3k_text_bf16":
+        n_total = max(1, int(n_total))
+        n_text = max(0, int(n_text))
+        k = (16.0 * n_text + 4.0 * (n_total - n_text)) / n_total
+        return k, 4.0, (k + 4.0) / 2.0
+    # v1_kcfg / v1_kcfg_with_slice
+    if cfg is None:
+        return 4.0, 4.0, 4.0
+    if cfg.kind == "bf16":
+        return 16.0, 4.0, 10.0
+    base_bits = float(cfg.bits)
+    if n_outliers > 0:
+        total_chan = num_layers * num_kv_heads * head_dim
+        n_out_total = n_outliers * num_layers * num_kv_heads
+        frac_bf16 = n_out_total / total_chan
+        k = 16.0 * frac_bf16 + base_bits * (1.0 - frac_bf16)
+    else:
+        k = base_bits
+    v = 4.0
+    return k, v, (k + v) / 2.0
+
+
 @torch.no_grad()
 def _run_condition_forward(model, processor, item: LVBItem, n_frames: int,
                            num_layers: int, num_kv_heads: int,
                            cond: dict, slice_info: dict, inputs):
-    """Run one (item, condition) forward; return (out, latency_ms, avg_kv_bits)."""
+    """Run one (item, condition) forward; return (out, latency_ms, (k_bits, v_bits, kv_bits))."""
     seq_len = int(inputs["input_ids"].shape[1])
     mode = cond["mode"]
+    cfg = cond.get("cfg")
+    n_out = int(cfg.n_outliers) if (cfg is not None and cfg.n_outliers) else 0
 
     if mode == "bf16":
         # F0: vanilla DynamicCache, no quant.
         from transformers.cache_utils import DynamicCache
         cache = DynamicCache()
-        avg_bits = 16.0
+        bits = _compute_three_bit_columns(cfg, mode, n_out, num_layers, num_kv_heads)
     elif mode == "v1_kcfg":
-        cfg = cond["cfg"]
         ctrl = BitController(num_layers=num_layers, num_kv_heads=num_kv_heads,
                              mode="V1", default_k_bits=cfg.bits, default_v_bits=4)
         cache = FakeQuantKVCache(ctrl, k_quantizer_config=cfg)
-        avg_bits = (float(cfg.bits) + 4.0) / 2.0
+        bits = _compute_three_bit_columns(cfg, mode, n_out, num_layers, num_kv_heads)
     elif mode == "v1_kcfg_with_slice":
-        cfg = cond["cfg"]
         ctrl = BitController(num_layers=num_layers, num_kv_heads=num_kv_heads,
                              mode="V1", default_k_bits=cfg.bits, default_v_bits=4)
         cache = FakeQuantKVCache(ctrl, k_quantizer_config=cfg)
         cache.set_slice_info(slice_info)
-        avg_bits = (float(cfg.bits) + 4.0) / 2.0
+        bits = _compute_three_bit_columns(cfg, mode, n_out, num_layers, num_kv_heads)
     elif mode == "v3k_text_bf16":
         # F2: text-K BF16 (mask=True at text positions), visual-K INT4.
         v_start = int(slice_info["v_start"])
@@ -224,15 +268,14 @@ def _run_condition_forward(model, processor, item: LVBItem, n_frames: int,
             ctrl.set_protected_mask(L, mask, hi_bits=16, lo_bits=4)
         cache = FakeQuantKVCache(ctrl)
         n_text = int(mask.sum().item())
-        n_total = seq_len
-        bits_K = (16.0 * n_text + 4.0 * (n_total - n_text)) / max(1, n_total)
-        avg_bits = (bits_K + 4.0) / 2.0
+        bits = _compute_three_bit_columns(cfg, mode, n_out, num_layers, num_kv_heads,
+                                          n_text=n_text, n_total=seq_len)
     elif mode == "v3k_all_bf16":
         # F3: all-K BF16, V INT4.
         ctrl = BitController(num_layers=num_layers, num_kv_heads=num_kv_heads,
                              mode="V1", default_k_bits=16, default_v_bits=4)
-        cache = FakeQuantKVCache(ctrl)  # K=16 from ctrl, V=4 from ctrl; no k_cfg
-        avg_bits = (16.0 + 4.0) / 2.0
+        cache = FakeQuantKVCache(ctrl)
+        bits = _compute_three_bit_columns(cfg, mode, n_out, num_layers, num_kv_heads)
     else:
         raise ValueError(f"unknown condition mode: {mode}")
 
@@ -241,7 +284,7 @@ def _run_condition_forward(model, processor, item: LVBItem, n_frames: int,
         **inputs, past_key_values=cache, max_new_tokens=1, do_sample=False,
         return_dict_in_generate=True, output_scores=True, use_cache=True,
     )
-    return out, (time.perf_counter() - t0) * 1000.0, avg_bits
+    return out, (time.perf_counter() - t0) * 1000.0, bits
 
 
 @torch.no_grad()
@@ -273,11 +316,12 @@ def run_item(model, processor, item: LVBItem, n_frames: int,
     rows: list[dict] = []
     for cond in conditions:
         try:
-            out, lat_ms, avg_bits = _run_condition_forward(
+            out, lat_ms, bits_tuple = _run_condition_forward(
                 model, processor, item, n_frames=n_frames,
                 num_layers=num_layers, num_kv_heads=num_kv_heads,
                 cond=cond, slice_info=slice_info, inputs=inputs,
             )
+            avg_k_bits, avg_v_bits, avg_kv_bits = bits_tuple
             logp, pred = _option_logprobs_and_pred(out, processor, n_options)
             margin = _answer_margin(logp, correct)
             del out
@@ -319,7 +363,9 @@ def run_item(model, processor, item: LVBItem, n_frames: int,
                      (16 if cfg_obj is not None and cfg_obj.kind == "bf16" else int(cfg_obj.bits))),
             "k_lo": (int(cfg_obj.bits) if cfg_obj is not None else 4),
             "v_bits": 4,
-            "avg_kv_bits": float(avg_bits),
+            "avg_k_bits": float(avg_k_bits),
+            "avg_v_bits": float(avg_v_bits),
+            "avg_kv_bits": float(avg_kv_bits),
             "pred_choice": int(pred),
             "is_correct": bool(pred == correct),
             "option_logprobs": [float(x) for x in logp],

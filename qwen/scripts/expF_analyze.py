@@ -105,8 +105,8 @@ def summarize_f(f_jsonl: Path, out_summary: Path, out_verdict: Path,
         "Reference numbers from prior runs: BF16 ceiling ~0.50-0.57; uniform-INT4 floor ~0.21; "
         "text-K BF16 rescue ~0.385; all-K BF16 + V INT4 (C2.1) ~0.530.\n",
         "## Per-condition table\n",
-        "| Condition | n | acc | 95% CI | mean margin | bf16-pres | margin_on_bf16_correct | Δmargin vs F1 | avg KV bits |",
-        "|---|---:|---:|---|---:|---:|---:|---:|---:|",
+        "| Condition | n | acc | 95% CI | mean margin | bf16-pres | margin_on_bf16_correct | Δmargin vs F1 | avg K bits | avg V bits | avg KV bits |",
+        "|---|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|",
     ]
 
     cond_acc: dict[str, dict] = {}
@@ -127,18 +127,25 @@ def summarize_f(f_jsonl: Path, out_summary: Path, out_verdict: Path,
         delta_margin = (float(margin_mean - f1_margin)
                         if (margin_mean == margin_mean and f1_margin == f1_margin)
                         else float("nan"))
-        avg_bits = (float(np.mean([float(r.get("avg_kv_bits", 0)) for r in rs]))
-                    if rs else float("nan"))
+        # Three-bit accounting (Stage 3+): older Stage 0/1 rows fall back to (None, None, avg_kv_bits).
+        avg_k_bits = (float(np.mean([float(r["avg_k_bits"]) for r in rs if "avg_k_bits" in r]))
+                      if any("avg_k_bits" in r for r in rs) else float("nan"))
+        avg_v_bits = (float(np.mean([float(r["avg_v_bits"]) for r in rs if "avg_v_bits" in r]))
+                      if any("avg_v_bits" in r for r in rs) else float("nan"))
+        avg_kv_bits = (float(np.mean([float(r.get("avg_kv_bits", 0)) for r in rs]))
+                       if rs else float("nan"))
         lines.append(
             f"| `{cond}` | {len(rs)} | {m:.3f} | [{lo:.3f}, {hi:.3f}] | "
             f"{margin_mean:+.3f} | {bf16_pres:.3f} (n={bf16_n}) | "
-            f"{margin_on_bf16_mean:+.3f} | {delta_margin:+.3f} | {avg_bits:.2f} |"
+            f"{margin_on_bf16_mean:+.3f} | {delta_margin:+.3f} | "
+            f"{avg_k_bits:.3f} | {avg_v_bits:.3f} | {avg_kv_bits:.3f} |"
         )
         cond_acc[cond] = {"acc": m, "lo": lo, "hi": hi,
                           "margin": margin_mean, "bf16_pres": bf16_pres,
                           "margin_on_bf16": margin_on_bf16_mean,
                           "delta_margin": delta_margin, "n": len(rs),
-                          "avg_bits": avg_bits}
+                          "avg_k_bits": avg_k_bits, "avg_v_bits": avg_v_bits,
+                          "avg_kv_bits": avg_kv_bits}
 
     # Per-bucket
     lines += ["\n## Per-bucket accuracy\n",
