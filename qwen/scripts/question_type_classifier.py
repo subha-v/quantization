@@ -5,9 +5,15 @@ matching, then maps the label to a frame budget. The mapping is intentionally
 simple — the goal is to test whether *any* text-side signal predicts which
 items deserve more frames, not to ship a great classifier.
 
-Labels are checked in order of specificity: a question that contains both
-"how many" and "color" is classified as `count`, not `detail`, because count
-questions are more frame-hungry on LongVideoBench.
+LongVideoBench items often include a long scene description prefix before
+the actual interrogative ("On a grass field, a woman dressed in a sleeveless
+white shirt is crouching on the grass. In front of her lies ... what does
+she do next?"). To avoid false-positive matches against scene-description
+prose ("during", "before", "after" occur naturally in description text), we
+classify only on the **trailing interrogative clause**: the substring after
+the last `.` (or start of string), with the trailing `?` stripped. Keywords
+are also question-form-specific ("how many", "what color is", "what does",
+not bare "many" / "color" / "doing").
 
 Used by:
   - `expG_type_adaptive.py` (post-process: routes each item's row to the
@@ -21,50 +27,111 @@ from typing import Iterable, Literal
 
 QuestionType = Literal["count", "temporal", "ocr", "detail", "action", "other"]
 
-# Frame budget per type. Tuned to land at average ~128 frames on a typical
-# LongVideoBench question mix (verified on cal-100 in expG_smoke.py).
+# Frame budget per type. Tuned to land at weighted-avg ~128-135 frames on
+# the LongVideoBench cal-100 question mix (verified by expG_smoke.py check 6).
+#
+# Design intent: items whose questions ask for high-detail content (count,
+# OCR, visual change/detail) get the full 256-frame budget; temporally-
+# anchored items (subtitle / phrase anchor) and action items get 128 because
+# the anchor narrows the relevant temporal range; everything else falls back
+# to 64. LongVideoBench is temporal-anchored-question-heavy, so temporal at
+# 128 keeps the weighted avg in target range.
 BUDGET_MAP: dict[QuestionType, int] = {
     "count": 256,
-    "temporal": 256,
     "ocr": 256,
-    "detail": 128,
+    "detail": 256,
+    "temporal": 128,
     "action": 128,
     "other": 64,
 }
 
 
-# Keyword tables. Order of `classify_question_type` matters: count > temporal
-# > ocr > detail > action > other.
-_COUNT_KEYWORDS = ("how many", "count ", "number of", "total of", "amount of")
+# Question-form keyword tables. Order of `classify_question_type` matters:
+# count > temporal > ocr > detail > action > other.
+#
+# We match against the *trailing interrogative* only (see _trim_to_question).
+# Keywords are question-form-specific to keep precision high; they assume the
+# trimmed string starts with "what/when/how/who" or similar interrogative.
+_COUNT_KEYWORDS = (
+    "how many", "the number of", "total number", "the count of",
+)
+# Temporal includes subtitle-anchored prompts ("when the subtitle ...",
+# "after mentioning ...") because those force the model to LOCATE a moment
+# in the video before answering, which benefits from denser frame coverage.
 _TEMPORAL_KEYWORDS = (
-    "when ", "after ", "before ", "begin", "end ", "ends", "ending",
-    "first time", "last time", "during", "while ", "earlier", "later",
-    "happens next", "happens first", "in the beginning", "at the end",
+    "when does", "when is", "when did", "when do",
+    "when the subtitle", "when the phrase", "when the text",
+    "when the image", "when the figure", "when '", 'when "',
+    "after the subtitle", "after the phrase", "after the text",
+    "after mentioning", "after the image",
+    "before the subtitle", "before the phrase", "before mentioning",
+    "what happens after", "what happens before",
+    "what happens next", "what happens first",
+    "what is the first", "what is the last",
+    "the first time", "the last time",
+    "in what order", "in chronological order", "sequences of scenes",
     "right before", "right after",
+    "do next", "do afterwards", "do after",
+    "happen next", "happen first", "happen last",
+    "appeared first", "appeared before", "appears first",
+    "appeared at", "appears at",
+    "scene appears", "scenes appear",
+    "appeared in", "where else has",
+    "at the same time", "simultaneously",
+    "first appearance", "first appeared", "first time",
 )
 _OCR_KEYWORDS = (
-    "text ", "sign ", "label ", "labeled ", "written", "letters", "word ",
-    "words ", "logo", "title ", "subtitle", "caption", "name on ",
+    "what text", "what is written", "what does the sign",
+    "what does the label", "what does the title",
+    "what word", "what words", "what letters", "what does the caption",
+    "what is the name on", "what is the title",
+    "what does the subtitle",
 )
 _DETAIL_KEYWORDS = (
-    "color", "shape", "small", "large", "size of", "what kind",
-    "what type of", "describe", "specific", "specifically", "exact",
-    "object on", "item on",
+    "what color", "what colour", "what shape",
+    "what is the color", "what is the colour",
+    "what is the shape", "what kind of", "what type of",
+    "what changes", "what change", "what other changes",
+    "what objects", "what object",
+    "describe", "look like",
 )
 _ACTION_KEYWORDS = (
-    "who ", "what does", "what is the man", "what is the woman",
-    "what is the person", "doing", "action", "performs", "is performing",
-    "takes", "takes the", "puts", "picks up", "places", "moves the",
+    "what does the man", "what does the woman", "what does the person",
+    "what is the man", "what is the woman", "what is the person",
+    "what did the man", "what did the woman", "what did the person",
+    "what did the", "what does the",
+    "what is he doing", "what is she doing", "what are they doing",
+    "what is this man", "what is this woman", "what is this person",
+    "what did this", "what is this",
+    "what action", "who is",
+    "do on her", "do on his", "do on their",
 )
+
+
+def _trim_to_question(q: str) -> str:
+    """Return the trailing interrogative clause: substring after the last `.`
+    (or the whole string if no `.`), lowercased, with trailing whitespace and
+    `?` stripped.
+    """
+    s = q.strip()
+    # Take everything after the last sentence-ending period. Keep the result
+    # if non-empty after stripping whitespace; otherwise fall back to the full
+    # question (no `.` at all).
+    if "." in s:
+        candidate = s.rsplit(".", 1)[-1].strip()
+        if candidate:
+            s = candidate
+    s = s.rstrip("?").strip().lower()
+    return s
 
 
 def classify_question_type(q: str) -> QuestionType:
     """Return one of {count, temporal, ocr, detail, action, other}.
 
-    Pure keyword heuristic, case-insensitive, lowest-cost dispatch. Returns
-    `other` for anything that doesn't match the more specific labels.
+    Pure keyword heuristic on the *trailing interrogative clause*, in order:
+    count > temporal > ocr > detail > action > other. Case-insensitive.
     """
-    q_low = q.lower()
+    q_low = _trim_to_question(q)
     if any(w in q_low for w in _COUNT_KEYWORDS):
         return "count"
     if any(w in q_low for w in _TEMPORAL_KEYWORDS):
