@@ -105,6 +105,20 @@ class KQuantizerConfig:
     # axis max-abs) instead of the default per-channel-along-head_dim INT4.
     # Bits per element unchanged (still INT4); axis is what changes.
     v_per_channel_seq: bool = False
+    # Exp J: alternate calib key for outlier-channel index lookup.
+    # When set, _outlier_channel_indices reads cfg.calib[outlier_idx_key]
+    # instead of the default 'outlier_channel_idx_top16'. Used to swap in
+    # cross-modal scoring schemes (TT/TV/VT/VV/BAL/PIVOT/TT+TV).
+    outlier_idx_key: Optional[str] = None
+    # Exp J: storage bits for protected outlier channels.
+    # 16 (default, F8/F9 path) = BF16 keep-from-original; 8/6 = INT-N
+    # quantize-then-restore (cheaper sidecode at the cost of small noise).
+    outlier_storage_bits: int = 16
+    # Exp J: layer-adaptive outlier budget. Resolved at build time from a
+    # tuple (cell_risk_calib_key, top_fraction) into a [num_layers, num_kv_heads]
+    # int tensor with budget=n_outliers in the top fraction of cells (by risk)
+    # and 0 elsewhere. When set as a tensor, _kivi_outlier honors it per-cell.
+    layer_adaptive_outlier_budget: Optional[object] = None
 
     def __post_init__(self):
         if self.kind not in KQUANTIZER_KINDS:
@@ -492,18 +506,36 @@ def _outlier_channel_indices(cfg: KQuantizerConfig, layer_idx: int,
                              n: int) -> torch.Tensor:
     """Return [H_kv, n] long tensor of channel indices to protect at BF16.
 
-    Source: cfg.calib['outlier_channel_idx_top16'] (precomputed at calib time
-    with n=16, then we slice the first `n`). If absent, ranks online from
-    cfg.calib['k_channel_energy'][L, H_kv, D].
+    Source priority:
+      1. cfg.outlier_idx_key (Exp J: cross-modal schemes like
+         'outlier_idx_TT_top16', 'outlier_idx_TT_TV_top16', etc.)
+      2. cfg.calib['outlier_channel_idx_top16'] (F-suite default)
+      3. Online argsort from cfg.calib['k_channel_energy'] (fallback)
+
+    The selected key must be a numpy array of shape [L, H_kv, K] where K >= n;
+    we return the first `n` columns sliced for the given layer.
     """
     if cfg.calib is None:
         raise RuntimeError(
-            f"{cfg.name}: outlier kind requires cfg.calib with 'outlier_channel_idx_top16' "
-            f"or 'k_channel_energy'."
+            f"{cfg.name}: outlier kind requires cfg.calib with an outlier-index "
+            f"array or 'k_channel_energy'."
         )
-    if "outlier_channel_idx_top16" in cfg.calib:
-        idx = cfg.calib["outlier_channel_idx_top16"]  # numpy [L, H_kv, 16]
+    key = cfg.outlier_idx_key or "outlier_channel_idx_top16"
+    if key in cfg.calib:
+        idx = cfg.calib[key]  # numpy [L, H_kv, K]
+        if idx.shape[-1] < n:
+            raise RuntimeError(
+                f"{cfg.name}: cfg.calib[{key!r}].shape[-1]={idx.shape[-1]} < n={n}; "
+                f"recalibrate with at least n protected channels per (L, H_kv)."
+            )
         return torch.as_tensor(idx[layer_idx, :, :n], dtype=torch.long)
+    if cfg.outlier_idx_key is not None:
+        # User explicitly asked for a key that's missing — fail loudly rather
+        # than silently falling back to the generic top-16.
+        raise RuntimeError(
+            f"{cfg.name}: cfg.outlier_idx_key={cfg.outlier_idx_key!r} not present in "
+            f"cfg.calib (keys: {sorted(cfg.calib)})."
+        )
     energy = cfg.calib.get("k_channel_energy")
     if energy is None:
         raise RuntimeError(f"{cfg.name}: cfg.calib missing 'k_channel_energy'.")
@@ -513,33 +545,77 @@ def _outlier_channel_indices(cfg: KQuantizerConfig, layer_idx: int,
 
 def _kivi_outlier(K: torch.Tensor, cfg: KQuantizerConfig,
                   layer_idx: int, qmax: float) -> torch.Tensor:
-    """F8/F9: top-N outlier channels at BF16; rest at INT4 per-channel-seq.
+    """F8/F9 + Exp J extensions: per-(L, H_kv) outlier-channel protection.
 
-    Build a [H_kv, D] bool mask of "protected channels", quantize all channels
-    with KIVI-style per-channel-seq scale, then restore the protected channel
-    values from the original K.
+    Pipeline:
+      1. Quantize all channels with KIVI per-channel-seq scale (F4 baseline).
+      2. For each head h, look up its outlier-channel indices and the per-cell
+         budget (uniform `cfg.n_outliers` or layer-adaptive from
+         `cfg.layer_adaptive_outlier_budget`).
+      3. Restore the protected channels from the original K (BF16) OR
+         re-quantize them at `cfg.outlier_storage_bits` (INT8/INT6 sidecode).
+
+    Layer-adaptive budget (Exp J): `cfg.layer_adaptive_outlier_budget` is a
+    pre-resolved [num_layers, num_kv_heads] int tensor. Cells with budget=0
+    contribute zero protected channels; cells with budget>0 use that count as
+    the per-cell n. The default `cfg.n_outliers` field is ignored when this
+    tensor is set.
+
+    Sidecode storage (Exp J): `cfg.outlier_storage_bits` controls how protected
+    channels are encoded:
+      16: BF16 keep-from-original (F8/F9 default; lossless-on-protected).
+      8/6: INT-N quantize-then-restore (cheaper sidecode; small added noise).
     """
     B, H, T, D = K.shape
-    n = int(cfg.n_outliers or 0)
-    if n <= 0:
-        # Degenerate: no outliers. Falls back to F4.
+    n_uniform = int(cfg.n_outliers or 0)
+
+    # Resolve per-head budget. layer_adaptive_outlier_budget overrides n_uniform.
+    la_budget = cfg.layer_adaptive_outlier_budget
+    if la_budget is not None:
+        # Expect a [L, H_kv] int tensor / numpy array. Must already be resolved
+        # (via build-time cell-risk argsort) before kernel dispatch.
+        budget_row = la_budget[layer_idx]  # length H
+        # Allow numpy array or torch tensor.
+        if not isinstance(budget_row, torch.Tensor):
+            budget_row = torch.as_tensor(budget_row, dtype=torch.long)
+        per_head_n = [int(budget_row[h].item()) for h in range(H)]
+    else:
+        per_head_n = [n_uniform] * H
+
+    # If every head has budget=0, this degenerates to F4.
+    if all(n <= 0 for n in per_head_n):
         scale = _per_channel_seq_scale(K, qmax, percentile=None)
         return _quantize_with_scale(K, scale, qmax)
 
-    outlier_idx = _outlier_channel_indices(cfg, layer_idx, H, D, n).to(K.device)  # [H, n]
+    # The outlier-index lookup uses the largest per-head n; we slice per head later.
+    n_max = max(per_head_n)
+    outlier_idx_full = _outlier_channel_indices(cfg, layer_idx, H, D, n_max).to(K.device)
+    # outlier_idx_full: [H, n_max]
 
-    # Quantize everything with KIVI per-channel-seq scale.
+    # Quantize all channels with KIVI per-channel-seq scale (F4 baseline).
     scale = _per_channel_seq_scale(K, qmax, percentile=None)  # [B, H, 1, D]
     K_q = _quantize_with_scale(K, scale, qmax)
 
-    # Restore outlier channels from original K. Build a [B, H, T, D] index expansion.
-    # Use scatter along the last dim for selected outlier channels.
-    # For each head h, channel index list outlier_idx[h] is what we restore.
+    storage_bits = int(cfg.outlier_storage_bits or 16)
+    storage_qmax = float(2 ** (storage_bits - 1) - 1) if storage_bits < 16 else None
+
     for h in range(H):
-        ch = outlier_idx[h]  # [n]
-        if ch.numel() == 0:
+        n_h = per_head_n[h]
+        if n_h <= 0:
             continue
-        K_q[:, h, :, ch] = K[:, h, :, ch]
+        ch = outlier_idx_full[h, :n_h]  # [n_h]
+        if storage_bits >= 16:
+            # F8/F9 path: BF16 keep-from-original.
+            K_q[:, h, :, ch] = K[:, h, :, ch]
+        else:
+            # Exp J INT-N sidecode: quantize protected channels with their own
+            # per-channel-seq scale at the smaller bit width, then restore.
+            K_outliers = K[:, h:h+1, :, ch]  # [B, 1, T, n_h]
+            s = K_outliers.abs().float().amax(dim=-2, keepdim=True).clamp_min(1e-8) / storage_qmax
+            s = s.to(K.dtype)
+            K_outliers_q = (K_outliers.float() / s.float()).round().clamp(
+                -storage_qmax, storage_qmax) * s.float()
+            K_q[:, h, :, ch] = K_outliers_q[:, 0, :, :].to(K.dtype)
     return K_q
 
 
@@ -664,6 +740,38 @@ def _score_cal_text_only(K: torch.Tensor, cfg: KQuantizerConfig, layer_idx: int,
 # ===================================================================
 
 
+def _resolve_layer_adaptive_budget(calib: Optional[dict], cell_risk_key: str,
+                                   top_fraction: float, n_per_cell: int = 16,
+                                   ) -> Optional[object]:
+    """Exp J: resolve a (cell_risk_key, top_fraction) budget spec into a
+    [L, H_kv] int numpy array.
+
+    Reads cfg.calib[cell_risk_key] (shape [L, H_kv], higher = riskier),
+    sorts cells globally, and assigns budget=n_per_cell to the top
+    `top_fraction × L × H_kv` cells (rounded). Other cells get 0.
+
+    Returns None if calib is None or the key is missing — callers should
+    guard.
+    """
+    import numpy as np
+    if calib is None or cell_risk_key not in calib:
+        return None
+    risk = np.asarray(calib[cell_risk_key], dtype=np.float32)  # [L, H_kv]
+    L, H_kv = risk.shape
+    n_cells = L * H_kv
+    n_keep = int(round(top_fraction * n_cells))
+    if n_keep <= 0:
+        return np.zeros((L, H_kv), dtype=np.int64)
+    if n_keep >= n_cells:
+        return np.full((L, H_kv), int(n_per_cell), dtype=np.int64)
+    flat = risk.reshape(-1)
+    # Indices of top-k by risk (descending).
+    idx_keep = np.argpartition(-flat, n_keep - 1)[:n_keep]
+    budget_flat = np.zeros(n_cells, dtype=np.int64)
+    budget_flat[idx_keep] = int(n_per_cell)
+    return budget_flat.reshape(L, H_kv)
+
+
 def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
     """Return the canonical 14-condition F-suite list.
 
@@ -735,4 +843,49 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         KQuantizerConfig(name="I_TempWin4_VidKVV", kind="kivi_temporal_window", bits=4,
                          n_temporal_windows=4, temporal_mode="visual_only",
                          v_per_channel_seq=True),
+        # --- Exp J: cross-modal outlier-channel selection (top-8 BF16) ---
+        # All J4-J8 use kind="kivi_outlier8" (n_outliers=8) with different
+        # outlier_idx_key pointing at calib-precomputed cross-modal indices.
+        KQuantizerConfig(name="J4_Outlier8_TT", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_TT_top16",
+                         calib=calib),
+        KQuantizerConfig(name="J5_Outlier8_TV", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_TV_top16",
+                         calib=calib),
+        KQuantizerConfig(name="J6_Outlier8_TT_TV", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_TT_TV_top16",
+                         calib=calib),
+        KQuantizerConfig(name="J7_Outlier8_BAL", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_BAL_top16",
+                         calib=calib),
+        KQuantizerConfig(name="J8_Outlier8_PIVOT", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_PIVOT_top16",
+                         calib=calib),
+        # --- Exp J: layer-adaptive outlier budget ---
+        # Top X% of (L, H_kv) cells (by cell-risk score) get 16 BF16 outliers;
+        # remaining cells get 0. The budget is resolved at build time from a
+        # cell-risk array in calib.
+        KQuantizerConfig(name="J9_LA_TT_TV_50pct", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, outlier_idx_key="outlier_idx_TT_TV_top16",
+                         calib=calib,
+                         layer_adaptive_outlier_budget=_resolve_layer_adaptive_budget(
+                             calib, "cell_risk_TT_TV", 0.50, n_per_cell=16)),
+        KQuantizerConfig(name="J10_LA_ALL_50pct", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib,
+                         layer_adaptive_outlier_budget=_resolve_layer_adaptive_budget(
+                             calib, "cell_risk_all", 0.50, n_per_cell=16)),
+        KQuantizerConfig(name="J11_LA_TT_TV_75pct", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, outlier_idx_key="outlier_idx_TT_TV_top16",
+                         calib=calib,
+                         layer_adaptive_outlier_budget=_resolve_layer_adaptive_budget(
+                             calib, "cell_risk_TT_TV", 0.75, n_per_cell=16)),
+        # --- Exp J: side-channel compression (INT-N storage of outliers) ---
+        # Same selected channels as F9 but stored at INT8 / INT6 instead of BF16.
+        KQuantizerConfig(name="J12_F9_INT8side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib, outlier_storage_bits=8),
+        KQuantizerConfig(name="J13_F9_INT6side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib, outlier_storage_bits=6),
+        KQuantizerConfig(name="J14_TT_TV_INT8side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, outlier_idx_key="outlier_idx_TT_TV_top16",
+                         calib=calib, outlier_storage_bits=8),
     ]

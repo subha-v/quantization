@@ -215,11 +215,30 @@ def _compute_three_bit_columns(cfg, mode: str, n_outliers: int,
     if cfg.kind == "bf16":
         return 16.0, 4.0, 10.0
     base_bits = float(cfg.bits)
-    if n_outliers > 0:
-        total_chan = num_layers * num_kv_heads * head_dim
+    # Exp J layer-adaptive outlier budget: total protected channels comes from
+    # the resolved [L, H_kv] budget tensor instead of n_outliers × L × H_kv.
+    la_budget = getattr(cfg, "layer_adaptive_outlier_budget", None)
+    if la_budget is not None:
+        import numpy as _np
+        budget_arr = _np.asarray(la_budget, dtype=_np.int64)
+        n_out_total_layeradaptive = int(budget_arr.sum())
+    else:
+        n_out_total_layeradaptive = None
+    # Exp J side-channel storage bits: protected channels carry
+    # cfg.outlier_storage_bits (default 16) instead of always BF16.
+    storage_bits = float(getattr(cfg, "outlier_storage_bits", 16) or 16)
+
+    total_chan = num_layers * num_kv_heads * head_dim
+    if n_out_total_layeradaptive is not None:
+        n_out_total = n_out_total_layeradaptive
+    elif n_outliers > 0:
         n_out_total = n_outliers * num_layers * num_kv_heads
-        frac_bf16 = n_out_total / total_chan
-        k = 16.0 * frac_bf16 + base_bits * (1.0 - frac_bf16)
+    else:
+        n_out_total = 0
+
+    if n_out_total > 0:
+        frac_protected = n_out_total / total_chan
+        k = storage_bits * frac_protected + base_bits * (1.0 - frac_protected)
     else:
         k = base_bits
     v = 4.0
