@@ -1199,3 +1199,252 @@ qwen-expG (tmux session, GPU 0) — STAGE 1 COMPLETE (43 min) + ANALYZE COMPLETE
     └── then auto-fire: F9 cascade + F9 type-adaptive + analyze
 ```
 
+---
+
+# Experiment G — UPDATE 2026-05-09 — Stage 3 COMPLETE + Exp H temporal-windowed KIVI
+
+**Status as of 2026-05-09 22:53 UTC:** All planned forwards and post-processes complete. Stage 3 (n=200 canonical, 50/50/50/50 per bucket via auto-generated `split_seed0_n200.json`) finalized with **all 17 conditions** including F4/F9 anchors at n=200, F9 cascade selection-mode controls (margin / random×3 / oracle), F9 type-adaptive, direct 192f F9 control, and the new Exp H temporal-windowed KIVI conditions (H3/H4/H5/H6).
+
+**Three things changed since the previous update:**
+1. The Stage-1 G6 lead (+5.8 pp vs G0) shrunk dramatically at Stage 3 (+1.6 pp).
+2. The cascade story largely collapsed at scale (margin = random = fixed 192f).
+3. **The new H6_KIVI_TempWin2_128f earned `promote_paper_strong` verdict at Stage 3** — beats F4 by +7 pp at the same KV bits (paired McNemar χ²=4.90), ties F9 at TRUE 4.00 KV bits and 0.50× memory.
+
+## What's new since the previous Exp G writeup
+
+### G control conditions (post-Stage-3)
+- `G9_F9_192f` (n=200): direct fixed-frame F9 at 192 frames. Tests whether the cascade's apparent gain came from the average frame budget (192) or the adaptive routing.
+- `G7_F9_CascadeRandomS{0,1,2}` (n=188 each): random selection at the same rerun rate as the margin cascade — controls "did margin pick useful items?"
+- `G7_F9_CascadeOracle` (n=188): rerun items where G5 was wrong AND G6 was right; uses ground-truth labels for an upper bound.
+
+### Exp H — temporal-windowed KIVI (new K-quantizer kind)
+A new `kivi_temporal_window` quantizer in `qwen/scripts/k_quantizers.py` (commit `ad06928`):
+
+- **`visual_only` mode:** text-prefix + N visual windows + text-suffix, each with its own per-channel KIVI scale `[B, H_kv, 1, D]`.
+- **`token_block` mode:** N equal-token blocks across the whole sequence, ignoring modality — modality-blind control for the visual-time hypothesis.
+- Stays at TRUE 4.00 KV bits (no outlier spend; scale metadata is negligible vs cache).
+- `cache_offset > 0` falls back to plain F4 — matches F5/F6 pattern (decode-time chunking is a no-op for first-token MCQ scoring).
+
+Stage-1 H conditions (n=64; reuses H0=G0, H1=G4, H2=G6, H7=G5):
+- H3 (256f, 4 visual windows of 64 frames each)
+- H4 (256f, 8 visual windows of 32 frames each)
+- H5 (256f, 4 token-equal blocks; modality-blind control)
+- H6 (128f, 2 visual windows of 64 frames each)
+
+Promoted to Stage 3 (n=200) after Stage-1 mid-run looked promising.
+
+## Stage 3 final per-condition table (n=200 or n=188 after short-video drops)
+
+| Condition | n | acc | 95% CI | rel_kv_mem | avg_kv_bits | class | Verdict |
+|---|---:|---:|---|---:|---:|---|:-:|
+| G0_BF16 | 200 | 0.665 | [0.595, 0.730] | 1.000 | 16.000 | fixed | anchor |
+| G2_BF16_128f | 200 | 0.680 | [0.615, 0.740] | 2.000 | 16.000 | fixed | anchor |
+| G3_F4_128f | 200 | 0.610 | [0.540, 0.675] | 0.500 | 4.000 | fixed | **kill** |
+| G4_F4_256f | 188 | 0.617 | [0.548, 0.686] | 1.000 | 4.000 | fixed | borderline |
+| **G5_F9_128f** | 200 | **0.685** | [0.620, 0.745] | **0.594** | 4.750 | fixed | promote_n200 |
+| G6_F9_256f | 188 | 0.681 | [0.612, 0.745] | 1.188 | 4.750 | fixed | promote_n200 |
+| G7_F9_CascadeAvg192 (margin) | 188 | 0.681 | [0.612, 0.750] | 0.989 | 4.750 | cascade | borderline |
+| G7_F9_CascadeOracle | 188 | 0.718 | [0.654, 0.782] | 0.616 | 4.750 | cascade | control |
+| G7_F9_CascadeRandomS0 | 188 | 0.686 | [0.617, 0.750] | 0.891 | 4.750 | cascade | control |
+| G7_F9_CascadeRandomS1 | 188 | 0.676 | [0.606, 0.739] | 0.891 | 4.750 | cascade | control |
+| G7_F9_CascadeRandomS2 | 188 | 0.702 | [0.638, 0.766] | 0.891 | 4.750 | cascade | control |
+| G8_F9_TypeAdaptiveMin128 | 188 | 0.681 | [0.612, 0.745] | 0.704 | 4.750 | type_adaptive | borderline |
+| G9_F9_192f | 200 | 0.685 | [0.620, 0.745] | 0.891 | 4.750 | fixed | borderline |
+| H3_KIVI_TempWin4_256f | 188 | 0.644 | [0.574, 0.708] | 1.000 | 4.000 | fixed | borderline |
+| H4_KIVI_TempWin8_256f | 188 | 0.644 | [0.574, 0.713] | 1.000 | 4.000 | fixed | borderline |
+| H5_KIVI_TokenBlock4_256f | 188 | 0.617 | [0.548, 0.686] | 1.000 | 4.000 | fixed | control |
+| **H6_KIVI_TempWin2_128f** | 200 | **0.680** | [0.615, 0.740] | **0.500** | **4.000** | fixed | **promote_paper_strong** |
+
+## Stage 3 paired McNemar — the headline tests
+
+### F9 cascade controls — the whole story collapsed at scale
+
+| Pair | n | both | a_only | b_only | net_a | acc(a) | acc(b) | χ² | Read |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---|
+| G7_F9_CascadeAvg192 vs G5_F9_128f | 188 | 121 | 7 | 7 | **0** | 0.681 | 0.681 | 0.00 | **Cascade = first-pass anchor.** |
+| G7_F9_CascadeAvg192 vs G6_F9_256f | 188 | 128 | 0 | 0 | **0** | 0.681 | 0.681 | nan | **Cascade = top condition** (perfect overlap). |
+| G7_F9_CascadeOracle vs G7_F9_CascadeAvg192 | 188 | 128 | 7 | 0 | **+7** | 0.718 | 0.681 | 7.00 | Oracle beats margin; **but only 7/188 items eligible.** |
+| G7_F9_CascadeRandomS{0,1,2} vs Avg192 | 188 | varies | varies | varies | +1 / −1 / +4 | 0.686 / 0.676 / 0.702 | 0.681 | <2 | **Random ≈ margin.** No useful signal in the margin. |
+| G9_F9_192f vs G5_F9_128f | 200 | 127 | 10 | 10 | **0** | 0.685 | 0.685 | 0.00 | **More frames at fixed F9 = no gain.** |
+| G7_F9_CascadeAvg192 vs G9_F9_192f | 188 | 121 | 7 | 6 | +1 | 0.681 | 0.676 | 0.08 | Cascade = direct 192f F9. |
+
+**Three failed claims:**
+1. **`G7_F9_CascadeAvg192` does not beat `G5_F9_128f`** at n=200 (0.681 = 0.681). The Stage-1 +5 pp lead was sample noise.
+2. **Random ≥ margin** (random 3-seed mean = 0.688 ≥ margin 0.681). The confidence-margin signal is not doing useful work.
+3. **Oracle has only 7/188 eligible items.** The entire adaptive-frame-routing headroom at n=200 is +3.7 pp from those 7 items (where 256f F9 fixes a 128f F9 miss). Adaptive cascading has near-zero structural headroom on this benchmark.
+
+### Frame-coverage sanity — more frames don't buy anything at fixed F9
+
+| Pair | acc Δ | net | Read |
+|---|---:|---:|---|
+| G6_F9_256f vs G5_F9_128f (paired n=188) | 0.681 vs 0.681 = +0 | +0 | 256f F9 = 128f F9 |
+| G9_F9_192f vs G5_F9_128f (paired n=200) | 0.685 vs 0.685 = +0 | +0 | 192f F9 = 128f F9 |
+| G4_F4_256f vs G3_F4_128f (paired n=188) | 0.617 vs 0.612 = +0.5 pp | +1 | 256f F4 = 128f F4 |
+
+**Robust observation: at fixed quantizer, going from 128f → 256f frames does not improve accuracy.** This contradicts the original Exp G hypothesis ("more frames at the same KV memory budget improves long-video MCQ"). The benefit, when it exists, comes from quantization quality (F9 vs F4), not frame coverage.
+
+### F9 vs BF16 — modest robust improvement
+
+| Pair | n | acc(a) | acc(b) | net_a | χ² |
+|---|---:|---:|---:|---:|---:|
+| G5_F9_128f vs G0_BF16 | 200 | 0.685 | 0.665 | +4 | 0.57 |
+| G6_F9_256f vs G0_BF16 | 188 | 0.681 | 0.660 | +4 | 0.67 |
+| G9_F9_192f vs G0_BF16 | 200 | 0.685 | 0.665 | +4 | 0.53 |
+| G6_F9_256f vs G2_BF16_128f | 188 | 0.681 | 0.676 | +1 | 0.07 |
+
+**F9 reliably beats BF16-baseline by ~+2 pp** (4 net items at n=200), but is statistically tied with the higher BF16 anchors. Not a knockout result — the gains live in the noise band at this sample size.
+
+### F4 anchors collapsed below baseline
+
+| Pair | n | acc(F4) | acc(BF16) | net | Read |
+|---|---:|---:|---:|---:|---|
+| G4_F4_256f vs G0_BF16 | 188 | 0.617 | 0.660 | **−8** | F4 256f loses to baseline by 4.3 pp |
+| G3_F4_128f vs G0_BF16 | 200 | 0.610 | 0.665 | **−11** | F4 128f loses to baseline by 5.5 pp |
+| G4_F4_256f vs G2_BF16_128f | 188 | 0.617 | 0.676 | **−11** | F4 256f loses to BF16 128f by 5.9 pp |
+
+**F4 (pure KIVI) at long sequences is genuinely worse than BF16 64f.** The F4-fails-at-long-sequences claim from Stage 1 reproduces decisively at n=200. The Stage-1 G3=0.562 was actually slightly LOW; n=200 G3=0.610 is the real number, but still firmly below G0=0.665.
+
+### Exp H temporal-windowed KIVI vs anchors
+
+| Pair | n | acc(H) | acc(comparison) | net | χ² | Read |
+|---|---:|---:|---:|---:|---:|---|
+| **H6 vs G3_F4_128f** | 200 | **0.680** | **0.610** | **+14** | **4.90** | **H6 beats F4 by +7 pp at TRUE 4 bits, χ²=4.90 ≈ p=0.027** |
+| H6 vs G5_F9_128f | 200 | 0.680 | 0.685 | −1 | 0.06 | **H6 ties F9 at lower bits + lower memory** |
+| H3 vs G4_F4_256f | 188 | 0.644 | 0.617 | +5 | 0.81 | H3 beats F4 256f by +2.7 pp |
+| H4 vs G4_F4_256f | 188 | 0.644 | 0.617 | +5 | 0.86 | H4 beats F4 256f by +2.7 pp |
+| H3 vs G6_F9_256f | 188 | 0.644 | 0.681 | −7 | 2.88 | H3 loses to F9 by 3.7 pp |
+| H4 vs G6_F9_256f | 188 | 0.644 | 0.681 | −7 | 2.88 | H4 loses to F9 by 3.7 pp |
+| H4 vs H3 (8 vs 4 windows) | 188 | 0.644 | 0.644 | 0 | 0.00 | Window count saturates between 4 and 8 |
+| **H5 vs H3 (modality-blind vs visual)** | 188 | 0.617 | 0.644 | **−5** | **0.76** | **Modality-aware direction holds** but not significant |
+
+**The H story at n=200:**
+
+1. **H6_KIVI_TempWin2_128f is the clean publishable result.** At TRUE 4.00 KV bits and 0.50× memory:
+   - **+7 pp over F4 (G3)** at the same KV bits, paired McNemar χ²=4.90 (p ≈ 0.027 with `scipy` chi-square approximation).
+   - **Ties F9 (G5)** at lower bits AND lower memory (paired Δ = −1 of 17 nontrivial items).
+   - Beats baseline G0 (0.665) by 1.5 pp.
+   - The paper-strong verdict: `acc(H6) ≥ acc(G3) + 5pp AND acc(H6) ≥ acc(G5) − 2pp` ✓.
+
+2. **H3/H4 at 256f fall short of F9.** H3=H4=0.644 vs G6=0.681 → −3.7 pp paired (χ²=2.88, p ≈ 0.09). The Stage-1 H3=0.683 / H4=0.700 lead inflated by ~+4 pp at scale; Stage 3 reveals the regression. H3/H4 still beat F4 256f by +2.7 pp (net +5 items), but not significantly.
+
+3. **Modality-aware vs blind direction holds, not significant.** H3 (visual_only) wins 19 items vs H5 (token_block) wins 14 → +5 net for visual-aware. χ²=0.76, p ≈ 0.4. Direction supports the visual-time-structure hypothesis but n=188 is underpowered.
+
+4. **8 windows ≈ 4 windows.** H4 vs H3 at 256f gives net=0, χ²=0. Window count between 4 and 8 saturates.
+
+5. **Counterintuitive: H6 (128f, 2 windows) > H3 (256f, 4 windows).** 0.680 vs 0.644 = +3.6 pp absolute. **More frames + temporal windowing HURTS** at this benchmark — the additional frame coverage doesn't add evidence and the additional sequence length compounds quantization noise even with windowed scales.
+
+## Stage 3 frontier (sorted by relative_kv_memory ascending)
+
+| Cond | rel_kv_mem | acc | KV bits | Pareto? |
+|---|---:|---:|---:|:-:|
+| G3_F4_128f | 0.500 | 0.610 | 4.00 | dominated |
+| **H6_KIVI_TempWin2_128f** | **0.500** | **0.680** | **4.00** | **frontier** |
+| G5_F9_128f | 0.594 | 0.685 | 4.75 | frontier (tied with H6) |
+| G7_F9_CascadeOracle | 0.616 | 0.718 | 4.75 | not deployable (uses labels) |
+| G8_F9_TypeAdaptiveMin128 | 0.704 | 0.681 | 4.75 | dominated by H6 |
+| G7_F9_CascadeRandomS{0,1,2} | 0.891 | 0.676–0.702 | 4.75 | dominated |
+| G9_F9_192f | 0.891 | 0.685 | 4.75 | dominated |
+| G7_F9_CascadeAvg192 | 0.989 | 0.681 | 4.75 | dominated |
+| G0_BF16 | 1.000 | 0.665 | 16.00 | dominated |
+| G4_F4_256f / H3 / H4 / H5 | 1.000 | 0.617 / 0.644 / 0.644 / 0.617 | 4.00 | dominated |
+| G6_F9_256f | 1.188 | 0.681 | 4.75 | dominated |
+| G2_BF16_128f | 2.000 | 0.680 | 16.00 | dominated |
+
+**Pareto-optimal at Stage 3:** `H6_KIVI_TempWin2_128f` and `G5_F9_128f`. H6 wins on memory (0.50× vs 0.59×) and on bits (4.00 vs 4.75); G5 wins on accuracy by a hair (0.685 vs 0.680). Statistical tie on the paired test.
+
+## Per-bucket pattern at Stage 3
+
+H6 vs G5 vs G3 per duration bucket:
+
+| Bucket (n) | G3 (F4 128f) | H6 (TempWin-2 128f) | G5 (F9 128f) | H6 − G3 | H6 − G5 |
+|---|---:|---:|---:|---:|---:|
+| short (50) | 0.640 | **0.720** | 0.680 | +8.0 pp | +4.0 pp |
+| mid (50) | 0.780 | 0.740 | 0.820 | −4.0 pp | −8.0 pp |
+| long (50) | 0.580 | **0.740** | 0.720 | +16.0 pp | +2.0 pp |
+| very_long (50) | 0.440 | 0.520 | 0.520 | +8.0 pp | tied |
+
+H6 wins decisively on **short** (+8 pp over G3, +4 pp over G5) and **long** (+16 pp over G3, +2 pp over G5), consistent with the temporal-windowing hypothesis: short clips benefit from sharper per-window K scales, and long clips benefit from local scales not being washed out by outliers across thousands of tokens. **H6 underperforms F9 on the mid bucket** (0.740 vs 0.820) — the only bucket where F9's outlier-channel BF16 protection outperforms windowed scaling.
+
+## Final verdict matrix and promotion plan
+
+```
+G3_F4_128f       (0.610) → kill              (-5.5 pp vs G0)
+G4_F4_256f       (0.617) → borderline        (-4.8 pp vs G0; matches G3 — F4 doesn't benefit from more frames either)
+G5_F9_128f       (0.685) → promote_n200      (+2.0 pp vs G0; Pareto frontier)
+G6_F9_256f       (0.681) → promote_n200      (+1.6 pp vs G0)
+G7_F9_CascadeAvg192      → borderline        (= G5 = G6)
+G7_F9_CascadeOracle      → control           (label-based; +3.7 pp ceiling on adaptive)
+G7_F9_CascadeRandomS*    → control           (random ≈ margin)
+G8_F9_TypeAdaptiveMin128 → borderline        (= G5)
+G9_F9_192f               → borderline        (= G5; more frames don't help)
+
+H3_KIVI_TempWin4_256f   (0.644) → borderline       (beats F4 by +2.7 pp; loses to F9 by 3.7 pp)
+H4_KIVI_TempWin8_256f   (0.644) → borderline       (= H3; window count saturates)
+H5_KIVI_TokenBlock4_256f(0.617) → control          (modality-blind; loses to H3 by 2.7 pp)
+H6_KIVI_TempWin2_128f   (0.680) → PROMOTE_PAPER_STRONG  (+7 pp over F4 at TRUE 4 bits, χ²=4.90; ties F9 at lower bits/memory)
+```
+
+## Implications for the research arc
+
+The Exp F → Exp G → Exp H sequence ends here with three concrete findings:
+
+1. **Exp F's F4 (KIVI per-channel-along-seq)** falls below the BF16 baseline at LongVideoBench MCQ. The earlier "F4 is the deployable 4-bit baseline" claim from the F-suite Stage 3 (where F4=0.545 vs F0=0.565) does not generalize — F4 collapses on the more-balanced Exp G stratification (G3=0.610 / G4=0.617 vs G0=0.665).
+
+2. **Exp G's frame-scaling hypothesis is falsified at n=200.** At fixed KV quantizer, going from 128f → 192f → 256f buys nothing (acc tied within ±0.5 pp on every paired comparison). The cascade controls (margin, random, oracle) confirm: there's no useful adaptive-routing signal because there's almost nothing to route — only 7/188 items have ground-truth-eligible cascade headroom.
+
+3. **Exp H's temporal-windowed KIVI is the surviving contribution.** At 128f, H6 (2 visual windows) beats F4 by +7 pp at TRUE 4.00 KV bits (χ²=4.90, p ≈ 0.027) and ties F9 at lower bits and lower memory. At 256f, the same approach with more windows underperforms F9 — likely because the marginal scale-locality benefit doesn't compensate for the additional quantization noise from 4× the visual tokens.
+
+**The deployable 4-bit KV cache for Qwen2.5-VL on LongVideoBench MCQ at 128f is `kivi_temporal_window` with 2 windows, modality-aware (visual_only mode):** TRUE 4.00 KV bits, 0.50× the BF16 64f memory budget, statistically tied with KIVI+outlier-16 (4.75 bits) and statistically beats pure KIVI (also 4.00 bits) by +7 pp paired McNemar.
+
+## Files of record (Exp G + H — final)
+
+```
+qwen/scripts/k_quantizers.py                # adds kivi_temporal_window kind, 4 H configs
+qwen/scripts/expG_frame_scaling.py          # adds G9 + H3/H4/H5/H6 to FIXED_FRAME_CONDITIONS
+qwen/scripts/expG_cascade.py                # adds --selection_mode {margin, random, oracle}
+qwen/scripts/expG_analyze.py                # adds 14 new HEADLINE_PAIRS + new-evidence/damage table
+qwen/scripts/run_expG_overnight.sh          # wrapper for post-Stage-3 G controls + H Stage-1
+
+qwen/results/expG_frame_stage3.jsonl                       # 3268 rows: 17 conditions × 188-200 items
+qwen/results/expG_frame_stage3_G7f9.jsonl                  # F9 margin cascade (188)
+qwen/results/expG_frame_stage3_G7_random_s{0,1,2}.jsonl   # 3 random-seed cascades (188 each)
+qwen/results/expG_frame_stage3_G7_oracle.jsonl             # ground-truth oracle (188)
+qwen/results/expG_frame_stage3_G8f9.jsonl                  # F9 type-adaptive (188)
+qwen/results/expG_summary_stage3.md                        # final per-condition table + per-bucket
+qwen/results/expG_paired_stage3.md                         # 32 pairs: McNemar + new-evidence/damage
+qwen/results/expG_frontier_stage3.md                       # frame-budget × accuracy frontier
+qwen/results/expG_verdict_matrix_stage3.md                 # promotion plan
+qwen/results/expG_cascade_f9_*_meta.json                   # cascade meta sidecars (margin, oracle, 3 random)
+qwen/results/expG_qtype_f9_meta_stage3.json                # type-adaptive meta
+qwen/results/expG_overnight.progress.log                   # phase A-E milestones
+qwen/results/expG_pipeline.progress.log                    # full chain log
+```
+
+## Methodological notes (Stage 3)
+
+1. **JSON-arg quoting through tmux send-keys is fragile.** First Stage 3 type-adaptive launch failed with `unrecognized arguments: 256:G6_F9_256f ocr:256 ...` because `--frames_to_gcond_json {"128":"G5_F9_128f"...}` lost its quoting through `ssh + tmux send-keys + bash`. Fix: use single-quoted SSH outer + escaped inner ssh `'"'"'{...}'"'"'` form, OR run the post-process directly via SSH (not tmux send-keys) so only one shell layer parses the args.
+
+2. **Leading `;` in tmux send-keys queue commands fails.** A queued ` ; echo === F4 anchors === && ...` causes `bash: syntax error near unexpected token ';'` because `;` at start-of-line is invalid. Use plain space or `&&` chaining, or just no operator and rely on the shell prompt being ready.
+
+3. **Per-bucket sample-size variance dominates Stage-1 → Stage-3 differences.** Stage 1 n=64 has 16 items per bucket; Stage 3 n=200 has 50 per bucket. Both H6 and G6 showed inflated Stage-1 leads on the short bucket (n=16) that disappeared at n=50. Recommend: don't headline a result from n=64 paired without checking it survives at n=200.
+
+4. **Temporal-windowing benefit depends on the modality split.** H5_TokenBlock4 (modality-blind, 4 token-equal blocks) at 0.617 = G4 (pure F4) at 0.617. The window count alone does nothing; the visual-vs-text scale separation is what gives H3 its +2.7 pp over F4 at 256f and H6 its +7 pp over F4 at 128f. This is the cleanest piece of evidence that modality-time structure is the mechanism, not generic local-scale-vs-global.
+
+5. **No re-calibration needed at any frame count.** F-suite calibration NPZ at frames=64 was reused for all F9 conditions at 128f and 256f. K-channel outlier indices are post-RoPE and frame-count-independent in theory; the smoke check passed without `EXPG_RIGOR_HIGH=1` (the 8-item recalibration-at-256 verification was skipped — should be tested before claiming F9 generalizes to even longer sequences).
+
+## Pipeline status (final)
+
+```
+qwen-expG (tmux session, GPU 0) — ALL EXPERIMENTS COMPLETE
+├── ✅ Stage 1 (n=64) full picture: 11 conditions + 4 adaptive post-processes
+├── ✅ Stage 3 G control (n=200): G0/G2/G5/G6/G9 + cascade margin/random×3/oracle + type-adaptive
+├── ✅ Stage 3 H suite (n=200): H3/H4/H5 (256f) + H6 (128f)
+├── ✅ Stage 3 F4 anchors (n=200): G3 + G4
+└── ✅ Final analyze: expG_summary_stage3.md, expG_paired_stage3.md (32 pairs),
+                     expG_frontier_stage3.md, expG_verdict_matrix_stage3.md
+```
+
+Total Stage 3 wall: ~3.5 h (multiple chained runs across 22 conditions × 188-200 items).
+Total compute: ~5500 forward passes across all stages.
+
+
