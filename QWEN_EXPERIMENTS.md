@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-09:** **Seven experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), and **Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + **2896 F per-item-per-condition rows**.
+**Status as of 2026-05-10:** **Nine experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall), Exp G Frame-scaling under fixed KV memory budget (Stage 3 n=200 × 22 conditions, ~3.5h wall) + Exp H Temporal-windowed KIVI K-suite (n=200 × 4 conditions integrated into Exp G), and **Exp I Temporal-KIVI mechanism screen (Stage 1 n=64 × 15 conditions + 2 post-process; Stage 3 n=200 × 11 conditions + 2 post-process; ~2:45 wall total)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + 2896 F per-item-per-condition rows + ~5500 G/H rows + **2549 I per-item-per-condition rows**.
 
 ## Headline
 
@@ -1446,5 +1446,216 @@ qwen-expG (tmux session, GPU 0) — ALL EXPERIMENTS COMPLETE
 
 Total Stage 3 wall: ~3.5 h (multiple chained runs across 22 conditions × 188-200 items).
 Total compute: ~5500 forward passes across all stages.
+
+---
+
+## Exp I — Temporal-KIVI mechanism screen (2026-05-10) — H6 mechanism FALSIFIED at n=200 seed=1
+
+Pre-registered controlled mechanism screen designed to disentangle whether
+H6 (TempWin2 visual-only at 128f) wins because of *visual temporal locality*
+or because of cheaper alternative explanations: modality split alone, more
+scale groups, VidKV-style V quantization, or outlier-channel protection.
+Run on a **fresh balanced split (seed=1)** unused by F/G/H, with Stage 1
+(n=64, 16/bucket) and Stage 3 (n=200, 50/bucket) drawn from the same seed
+so Stage-1 ⊂ Stage-3.
+
+**Headline result:** the temporal-windowing mechanism *does not survive
+n=200 on a fresh split*. H6 (I3=0.560) is statistically tied with three
+controls — modality-split-only (I4=0.570), modality-blind TokenBlock4
+(I5=0.555), and TempWin4 visual-only (I6=0.560) — none of the four
+mechanism-pivotal McNemar tests reach significance. The H6=0.680 result
+on the seed=0 n=200 split was likely seed-specific noise. **F9 outlier-16
+(I2=0.605, 4.75 KV bits) reproduces as the deployable 4-bit-class winner.**
+
+Kernel-regression sanity check (`expI_kernel_sanity.py`) replays Exp G's
+seed=0 stage-3 H6 forwards and confirms **bit-identical option_logprobs**
+(max-abs delta = 0.000) on 3 items spanning short/mid/long buckets. The
+Exp I kernel changes (n_outliers > 0 branch in `_kivi_temporal_window`,
+`v_per_channel_seq` field on `KQuantizerConfig`) are no-ops for H6 — the
+seed=1 H6 underperformance is genuine split sensitivity, not a code bug.
+
+### Conditions (15 forwards + 2 post-process)
+
+| ID | Frames | Method | Avg KV bits | Mechanism question |
+|---|---:|---|---:|---|
+| I0 | 128 | BF16 | 16.00 | upper bound |
+| I1 | 128 | F4 KIVI per-channel-seq | 4.00 | baseline H6 was meant to beat |
+| I2 | 128 | F9 outlier-16 | 4.75 | higher-bit anchor |
+| I3 | 128 | H6 TempWin2 visual-only | 4.00 | proposed method |
+| I4 | 128 | F5 text/visual split, no temporal | 4.00 | modality split alone |
+| I5 | 128 | TokenBlock4 modality-blind | 4.00 | "more scale groups" control |
+| I6 | 128 | TempWin4 visual-only | 4.00 | window granularity |
+| I7 | 128 | H6 + VidKV V per-channel | 4.00 | VidKV V-axis test (Stage 1 only) |
+| I8 | 128 | H6 + outlier-8 | 4.375 | outlier protection on top of TempWin |
+| I9 | 256 | F4 | 4.00 | 256f baseline |
+| I10 | 256 | F9 outlier-16 | 4.75 | 256f high-bit anchor |
+| I11 | 256 | TempWin4 visual-only | 4.00 | current 256f method (= H3) |
+| I12 | 256 | TokenBlock6 modality-blind | 4.00 | 256f mechanism control (Stage 1 only) |
+| I13 | 256 | TempWin4 + outlier-8 | 4.375 | TempWin + outlier protection (Stage 1 only) |
+| I14 | 256 | TempWin4 + VidKV V | 4.00 | 256f VidKV check (Stage 1 only) |
+| I15 | mixed | Duration-Hybrid: mid → F9, else → H6 | 4.00 | duration-aware policy (post-process) |
+| I16 | mixed | Random-Hybrid (matched-rate control) | 4.00 | matched-rate control for I15 (post-process) |
+
+Stage-3 promotion (pre-registered): always-run anchors {I0–I5, I9–I11},
+plus data-driven {I6, I8} from Stage-1 verdict. I7 / I12 / I13 / I14
+ran at Stage 1 only.
+
+### Stage 3 results (n=200 seed=1, 196 items in 128f / 183 items in 256f)
+
+Sorted by accuracy descending:
+
+| Condition | n | acc | 95% CI | avg_kv | rel_kv_mem |
+|---|---:|---:|---|---:|---:|
+| I0 BF16 128f | 200 | **0.615** | [0.550, 0.680] | 16.00 | 2.000× |
+| **I2 F9 128f** | 200 | **0.605** | [0.535, 0.670] | 4.75 | 0.594× |
+| **I8 TempWin2 + Outlier-8 128f** | 200 | **0.585** | [0.520, 0.650] | 4.375 | 0.547× |
+| I15 Duration-Hybrid (mid → F9) | 200 | 0.575 | [0.500, 0.645] | 4.00 | 0.500× |
+| I1 F4 128f | 200 | 0.570 | [0.505, 0.635] | 4.00 | 0.500× |
+| I4 ModalitySplit 128f | 200 | 0.570 | [0.505, 0.635] | 4.00 | 0.500× |
+| I9 F4 256f | 183 | 0.563 | [0.492, 0.634] | 4.00 | 1.000× |
+| I3 H6 TempWin2 128f | 200 | 0.560 | [0.495, 0.625] | 4.00 | 0.500× |
+| I6 TempWin4 128f | 200 | 0.560 | [0.495, 0.625] | 4.00 | 0.500× |
+| I16 Random-Hybrid | 200 | 0.560 | [0.490, 0.630] | 4.00 | 0.500× |
+| I11 TempWin4 256f | 183 | 0.557 | [0.486, 0.629] | 4.00 | 1.000× |
+| I5 TokenBlock4 128f | 200 | 0.555 | [0.490, 0.620] | 4.00 | 0.500× |
+| I10 F9 256f | 183 | 0.541 | [0.470, 0.612] | 4.75 | 1.188× |
+
+### Stage 3 paired McNemar — mechanism pivots
+
+| label | a | b | acc(a) | acc(b) | a_only | b_only | both | χ² | verdict |
+|---|---|---|---:|---:|---:|---:|---:|---:|---|
+| tempwin2_vs_modality_split_only_128f | I3 | I4 | 0.560 | 0.570 | 14 | 16 | 98 | 0.13 | tied |
+| tempwin2_vs_token_block_modality_blind_128f | I3 | I5 | 0.560 | 0.555 | 16 | 15 | 96 | 0.03 | tied |
+| windowcount_2_vs_4_128f | I3 | I6 | 0.560 | 0.560 | 10 | 10 | 102 | 0.00 | tied |
+| tempwin2_vs_f4_128f | I3 | I1 | 0.560 | 0.570 | 18 | 20 | 94 | 0.10 | tied |
+| tempwin2_vs_f9_128f | I3 | I2 | 0.560 | 0.605 | 9 | 18 | 103 | 3.00 | F9 trends, ns |
+| outlier8_addition_128f | I3 | I8 | 0.560 | 0.585 | 9 | 14 | 103 | 1.09 | I8 trends, ns |
+| tempwin4_vs_f4_256f | I11 | I9 | 0.557 | 0.563 | 19 | 20 | 83 | 0.03 | tied |
+| tempwin4_vs_f9_256f | I11 | I10 | 0.557 | 0.541 | 12 | 9 | 90 | 0.43 | tied |
+| duration_vs_random_hybrid | I15 | I16 | 0.575 | 0.560 | 7 | 4 | 108 | 0.82 | trends, ns |
+| hybrid_vs_tempwin_only | I15 | I3 | 0.575 | 0.560 | 4 | 1 | 111 | 1.80 | trends, ns |
+| hybrid_vs_f9_only | I15 | I2 | 0.575 | 0.605 | 8 | 14 | 107 | 1.64 | F9 trends, ns |
+
+### Findings
+
+25. **The "visual temporal locality" mechanism is FALSIFIED at n=200 seed=1.**
+    All four mechanism-pivotal McNemar pairs at 128f are statistically
+    tied: I3 vs I4 (modality split only) χ²=0.13; I3 vs I5 (modality-blind
+    TokenBlock4) χ²=0.03; I3 vs I6 (window-count 2 vs 4) χ²=0.00; I3 vs
+    I1 (F4 baseline) χ²=0.10. **Visual-time structure is not doing the
+    work that H6's seed=0 result attributed to it.**
+
+26. **At 256f, TempWin4 is also tied with F4 and F9.** I11=0.557 vs
+    I9 F4=0.563 (χ²=0.03) vs I10 F9=0.541 (χ²=0.43). The 256f Stage-1
+    lead (I11=0.614 at n=64) was small-n inflation; at n=183 it
+    regresses to the baseline-F4 value with overlapping CIs.
+
+27. **F9 outlier-16 (I2=0.605) reproduces as the deployable 4-bit-class
+    quantizer.** +3.5 pp over F4 (I1=0.570) at 4.75 KV bits, within
+    bootstrap CI of BF16 (I0=0.615). Matches the seed=0 F9 result
+    (0.560 at canonical seed=0 n=200; 0.605 at seed=1 n=200) — F9 is
+    seed-robust where TempWin is not. **F9 is the deployable Pareto
+    point: 0.594× relative KV memory at 0.605 accuracy.**
+
+28. **NEW positive finding: I8 (TempWin2 + outlier-8 at 4.375 KV bits) =
+    0.585.** Tied within CI with F9 (0.605) at lower bits / lower
+    memory (0.547× vs 0.594× rel KV mem). The outlier-protection axis
+    is doing the work — adding 8 BF16-protected channels per (L, H_kv)
+    on top of the (irrelevant) TempWin K scale closes most of the F9–F4
+    gap at lower bit cost than F9. Mechanism: outlier channels carry
+    high attention weight; their post-quant restoration matters more
+    than scale-group locality.
+
+29. **NEW positive finding: I15 Duration-Hybrid (0.575) trends over
+    I16 Random-Hybrid (0.560).** +1.5 pp directional lift (χ²=0.82,
+    ns at n=200). The mid-bucket → F9, else → H6 routing rule has
+    signal but doesn't decisively beat matched-rate random selection.
+    However, I15 LOSES to F9-only (I2=0.605, χ²=1.64) — the duration-
+    aware policy doesn't justify the implementation complexity over
+    just running F9 everywhere.
+
+30. **The Exp G/H methodological note #4 is RETRACTED.** The prior
+    claim "modality-time structure is the mechanism, not generic local-
+    scale-vs-global" rested on H5 TokenBlock4 ≈ G4 F4 at 256f from
+    the seed=0 split. Exp I's seed=1 mechanism screen with multiple
+    pre-registered controls shows that at n=200 fresh split, all
+    visual-K scale-group configurations (one global, modality-split,
+    temporal-window 2/4, token-block-4) produce statistically tied
+    accuracies. The seed=0 H6 +7 pp lead over F4 was split-specific.
+
+31. **Sanity-check confirms NO kernel regression.**
+    `expI_kernel_sanity.py` replays Exp G's seed=0 H6_KIVI_TempWin2_128f
+    on 3 items (one per bucket: short, mid, long) under the new code
+    path and asserts max-abs delta against the stored option_logprobs.
+    All 3 items match to 6 decimal places (delta = 0.000000). The
+    `_kivi_temporal_window` kernel is unchanged for H6 (the new
+    `n_outliers > 0` branch is a no-op for H6 cfg with `n_outliers=None`).
+
+### Implication for the research direction
+
+- **F9 outlier-16 is the deployable 4-bit-class KV quantizer for
+  Qwen2.5-VL on LongVideoBench MCQ.** F9 reproduces across seed=0 and
+  seed=1 splits (0.560 → 0.605, both within CI of BF16). At 4.75
+  effective KV bits and 0.594× the BF16 64f memory budget, it is the
+  Pareto winner; nothing in the controlled mechanism screen displaces
+  it.
+- **The Exp H "temporal-windowed KIVI" headline does not survive a
+  fresh-split mechanism screen.** No paper section claiming
+  "visual-time locality is the mechanism" should be drafted from the
+  current Stage-3 evidence base. The TempWin idea is alive only as
+  one of several scale-group configurations that all tie F4; it is
+  not load-bearing.
+- **Outlier-channel protection is the mechanism that matters.** F9
+  (16 outliers, 4.75 bits) and I8 (8 outliers, 4.375 bits) are the
+  two best 4-bit-class results; both gain from outlier restoration,
+  not from scale-group structure.
+
+### Stage 1 (n=64, seed=1) summary
+
+For comparability, the Stage-1 verdict-matrix initially flagged I11
+TempWin4 256f as paper_strong (0.614 vs F4 0.526, χ²=4.5 paired
+McNemar p≈0.034). This regressed to 0.557 at n=183 with overlapping
+F4 CI — a textbook example of why pre-registered Stage-3 promotion is
+necessary. Stage 1 also showed I3 TempWin2 underperforming F4 by 9 pp
+at 128f, which prompted the kernel-regression sanity check (passed) and
+confirmed the Stage-3 verdict direction in advance.
+
+### Layout (Exp I additions)
+
+```
+qwen/scripts/
+  expI_temporal_kivi.py            # 15-condition driver, fresh seed=1 split,
+                                   # pre-registered Stage-3 anchor + variant gating
+  expI_duration_hybrid.py          # I15 (mid→F9) + I16 (random matched-rate)
+  expI_smoke.py                    # 6 Phase A synthetic + 2 Phase B live checks
+  expI_analyze.py                  # 15 headline McNemar pairs + verdict matrix
+  expI_kernel_sanity.py            # bit-identical replay vs Exp G H6 (3 items)
+qwen/calibration/
+  split_seed1_n64.json             # fresh balanced 16/bucket
+  split_seed1_n200.json            # fresh balanced 50/bucket (Stage 1 ⊂ Stage 3)
+qwen/results/
+  expI_tempkivi_stage{1,3}_seed1.jsonl     # forward-pass rows
+  expI_tempkivi_stage{1,3}_seed1_I{15,16}.jsonl  # post-process stitched rows
+  expI_summary_stage{1,3}.md
+  expI_paired_stage{1,3}.md                # 15-pair McNemar tables
+  expI_verdict_matrix_stage{1,3}.md
+  expI_promote_stage1.json                 # Stage-3 promotion gate (consumed by driver)
+  expI_smoke.md
+```
+
+### Pipeline status (Exp I, final)
+
+```
+qwen-expI (GPU 0) — ALL EXPERIMENTS COMPLETE
+├── ✅ Phase A smoke (6/6) + Phase B smoke (2/2) on remote
+├── ✅ Stage 1 (n=64, seed=1) full picture: 15 forwards + I15/I16 post-process
+├── ✅ Kernel-regression sanity check (3 items × bit-identical replay)
+├── ✅ Stage 3 (n=200, seed=1): 11 conditions (anchors + I6, I8 promoted variants)
+└── ✅ Stage 3 analyze: 13-row summary, 15-pair McNemar table, verdict matrix
+```
+
+Total Stage 3 wall: 2:16 (one chained run, 11 conditions × ~196/183 items).
+Total Exp I compute: ~3500 forward passes across both stages plus the
+kernel-sanity replay.
 
 

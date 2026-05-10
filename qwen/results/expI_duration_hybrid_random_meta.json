@@ -1,0 +1,26 @@
+{
+  "stitched_cond_name": "I16_F9RandomMatched",
+  "f9_source_cond": "I2_F9_128f",
+  "tempwin_source_cond": "I3_TempWin2_128f",
+  "selection_mode": "random",
+  "f9_buckets": [
+    "mid"
+  ],
+  "n_items": 200,
+  "n_used_f9": 50,
+  "realized_f9_rate": 0.25,
+  "bucket_used_f9": {
+    "long": 13,
+    "short": 16,
+    "mid": 8,
+    "very_long": 13
+  },
+  "bucket_total": {
+    "very_long": 50,
+    "short": 50,
+    "long": 50,
+    "mid": 50
+  },
+  "acc": 0.56,
+  "random_seed": 1
+}
