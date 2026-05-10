@@ -50,24 +50,19 @@ log "  GPU: CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 nvidia-smi --query-gpu=index,memory.used,memory.free --format=csv | tee -a "$LOG"
 
 # ================================================================
-# Phase 1 — smoke (with existing F-suite calib NPZ for kernel sanity)
+# Phase 1 — Phase A smoke only (no model, synthetic kernel checks)
 # ================================================================
-log "--- PHASE 1: smoke ---"
-SMOKE_CALIB=""
-if [ -f "$EXISTING_F_CALIB" ]; then
-  SMOKE_CALIB="--calib_npz $EXISTING_F_CALIB"
-  log "  using existing F-suite calib for Phase B kernel sanity: $EXISTING_F_CALIB"
-fi
-python3 -u expJ_smoke.py --model "$MODEL" $SMOKE_CALIB 2>&1 | tee -a "$LOG"
+log "--- PHASE 1: Phase A smoke (synthetic, no model) ---"
+python3 -u expJ_smoke.py 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 if [ $rc -ne 0 ]; then
-  log "FAIL smoke (rc=$rc) — aborting overnight pipeline"
+  log "FAIL Phase A smoke (rc=$rc) — aborting overnight pipeline"
   exit $rc
 fi
-log "  smoke OK"
+log "  Phase A smoke OK (5/5 synthetic checks passed)"
 
 # ================================================================
-# Phase 2 — calibration
+# Phase 2 — calibration (writes the Exp J cross-modal NPZ)
 # ================================================================
 log "--- PHASE 2: cross-modal calibration ---"
 if [ -f "$CALIB_NPZ" ]; then
@@ -91,9 +86,21 @@ fi
 log "  calibration OK -> $CALIB_NPZ"
 
 # ================================================================
-# Phase 3 — Stage 1 forward pass (n=64 fresh seed=2)
+# Phase 3 — Phase B smoke (live model + Exp J calib NPZ)
 # ================================================================
-log "--- PHASE 3: Stage 1 (n=64, seed=$SEED, 128f, 15 conditions) ---"
+log "--- PHASE 3: Phase B smoke (live model + cross-modal NPZ) ---"
+python3 -u expJ_smoke.py --model "$MODEL" --calib_npz "$CALIB_NPZ" 2>&1 | tee -a "$LOG"
+rc=${PIPESTATUS[0]}
+if [ $rc -ne 0 ]; then
+  log "FAIL Phase B smoke (rc=$rc) — aborting overnight pipeline"
+  exit $rc
+fi
+log "  Phase B smoke OK (visual-span + logits-differ both passed)"
+
+# ================================================================
+# Phase 4 — Stage 1 forward pass (n=64 fresh seed=2)
+# ================================================================
+log "--- PHASE 4: Stage 1 (n=64, seed=$SEED, 128f, 15 conditions) ---"
 nvidia-smi --query-gpu=index,memory.free --format=csv,noheader | tee -a "$LOG"
 STAGE_ARGS=(--stage 1 --seed "$SEED" --calib_npz "$CALIB_NPZ")
 if [ "$N_LIMIT" -gt 0 ]; then
@@ -112,9 +119,9 @@ fi
 log "  Stage 1 OK -> $STAGE1_OUT"
 
 # ================================================================
-# Phase 4 — Analyze Stage 1
+# Phase 5 — Analyze Stage 1
 # ================================================================
-log "--- PHASE 4: analyze Stage 1 ---"
+log "--- PHASE 5: analyze Stage 1 ---"
 python3 -u expJ_analyze.py --stage 1 --seed "$SEED" 2>&1 | tee -a "$LOG"
 rc=${PIPESTATUS[0]}
 if [ $rc -ne 0 ]; then
