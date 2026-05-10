@@ -107,6 +107,24 @@ def fake_quantize_kv(x: torch.Tensor, bits: BitsLike, group_size: int = 128) -> 
     return _int_n_per_position(x, bits_t, group_size=group_size)
 
 
+def _v_per_channel_seq_quantize(V: torch.Tensor, bits: int = 4) -> torch.Tensor:
+    """Exp I VidKV-style V quant: per-(B, H_kv, 1, D) channel-axis scale.
+
+    Unlike the default `fake_quantize_kv` (which groups along head_dim for
+    INT-N), this computes max-abs along the time axis per channel d (per
+    (B, H_kv, channel)) and quantizes each channel with its own scale. This
+    is the V-side analog of KIVI's K per-channel-seq scaling. Bits per
+    element are unchanged (INT4); only the scale-grouping axis differs.
+
+    V: [B, H_kv, T, D] -> returns same shape and dtype.
+    """
+    qmax = float(2 ** (bits - 1) - 1)
+    amax = V.abs().float().amax(dim=-2, keepdim=True)  # [B, H_kv, 1, D]
+    s = amax.clamp_min(1e-8) / qmax
+    q = (V.float() / s).round().clamp(-qmax, qmax) * s
+    return q.to(V.dtype)
+
+
 # ===================================================================
 # Bit controller
 # ===================================================================
@@ -245,7 +263,12 @@ class FakeQuantKVCache(DynamicCache):
             )
         else:
             key_q = fake_quantize_kv(key_states, kb)
-        val_q = fake_quantize_kv(value_states, vb)
+        # Exp I: VidKV-style V per-channel along time axis (axis differs from
+        # default per-channel-along-head_dim INT4; bits unchanged).
+        if self.k_cfg is not None and getattr(self.k_cfg, "v_per_channel_seq", False):
+            val_q = _v_per_channel_seq_quantize(value_states, bits=4)
+        else:
+            val_q = fake_quantize_kv(value_states, vb)
         return super().update(key_q, val_q, layer_idx, cache_kwargs)
 
     def record_entropy(self, layer_idx: int, entropy_per_head: torch.Tensor) -> None:

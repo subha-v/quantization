@@ -189,3 +189,90 @@ path through `k_quantizers.apply_k_quantizer(...)` while V continues to use
 the BitController-driven `fake_quantize_kv`. `cache.set_slice_info(...)`
 plumbs role/modality position info to the F5/F6 quantizers (F11/F12/F13
 were dropped after Stage 1).
+
+## Experiment I — Temporal-KIVI mechanism screen (in progress)
+
+Tests whether H6's win at 128f comes from **visual temporal locality** (vs
+modality split alone, vs more scale groups, vs VidKV-style V quantization,
+vs outlier-channel protection). Also screens whether TempWin4 + outlier-8
+closes the gap to F9 at 256f, and pilots a duration-aware F9/H6 hybrid.
+
+### Conditions (15 forwards + 2 post-process)
+
+| ID | Frames | Method | Avg KV bits | Mechanism question |
+|---|---|---|---|---|
+| I0 | 128 | BF16 | 16.00 | upper bound |
+| I1 | 128 | F4 KIVI per-channel-seq | 4.00 | baseline H6 beats |
+| I2 | 128 | F9 outlier-16 | 4.75 | higher-bit anchor |
+| I3 | 128 | H6 TempWin2 visual-only | 4.00 | proposed method |
+| I4 | 128 | F5 text/visual split (no temporal) | 4.00 | tests modality split alone |
+| I5 | 128 | TokenBlock4 (4 blocks, modality-blind) | 4.00 | tests "more scale groups" |
+| I6 | 128 | TempWin4 visual-only | 4.00 | tests window granularity |
+| I7 | 128 | H6 + VidKV V per-channel | 4.00 | tests VidKV V claim |
+| I8 | 128 | H6 + outlier-8 | 4.375 | tests outlier on top of TempWin |
+| I9–I14 | 256 | F4 / F9 / TempWin4 / TokenBlock6 / TempWin4+Out8 / TempWin4+VidKVV | 4.00–4.75 | same questions at 256f |
+| I15 | mixed | Duration-Hybrid: mid → F9, others → H6 | data-driven | duration-aware policy |
+| I16 | mixed | Random-Hybrid (matched-rate control) | data-driven | matched-rate control for I15 |
+
+Stage 1: n=64 fresh balanced split (seed=1, 16/bucket). Stage 3: n=200 (seed=1, 50/bucket). Stage-1 ⊂ Stage-3.
+
+Stage-3 promotion (pre-registered): always run anchors {I0, I1, I2, I3, I4, I5, I9, I10, I11}; data-driven up to 2 winners from {I6, I7, I8, I12, I13, I14} plus {I15, I16} if I15 beats H6 at Stage 1.
+
+### Code additions
+
+```
+qwen/scripts/
+  expI_temporal_kivi.py         # driver — 15 fixed-frame conditions, fresh seed=1 split
+  expI_duration_hybrid.py       # post-process — I15 (duration-rule) + I16 (random control)
+  expI_smoke.py                 # Phase A (synthetic kernels) + Phase B (live-model logits-differ)
+  expI_analyze.py               # paired McNemar + verdict matrix + Stage-1 promotion JSON
+```
+
+Modifications to existing files:
+- `k_quantizers.py` — extended `_kivi_temporal_window` to accept `n_outliers > 0` (composes TempWin K with F8/F9-style outlier-channel BF16 restoration). Added `v_per_channel_seq` field to `KQuantizerConfig`. Added 5 new presets (`I_TempWin2_Outlier8`, `I_TempWin4_Outlier8`, `I_TokenBlock6`, `I_TempWin2_VidKVV`, `I_TempWin4_VidKVV`).
+- `fake_quant_kv_cache.py` — added `_v_per_channel_seq_quantize` helper (per-(B, H_kv, 1, D) channel-axis V scale). `FakeQuantKVCache.update()` routes V through it when `cfg.v_per_channel_seq=True`; default V path unchanged for all other conditions.
+
+### Headline pairs (paired McNemar)
+
+Mechanism @128f:
+- I3 vs I4 — does temporal split beat modality split alone?
+- I3 vs I5 — does visual-time structure beat modality-blind blocks at matched scale-region count?
+
+Mechanism @256f:
+- I11 vs I12 — same question at 256f (4 visual windows vs 6 modality-blind blocks)
+
+Add-ons:
+- I3 vs I7 — does VidKV-style V per-channel help on top of H6?
+- I3 vs I8 — does outlier-8 protection help on top of H6?
+- I11 vs I13 — does outlier-8 close the 256f gap to F9?
+
+Hybrid:
+- I15 vs I16 — does duration-aware bucket routing beat matched-rate random?
+- I15 vs {I3, I2} — does the hybrid beat both source conditions?
+
+### Running
+
+```bash
+# Local Phase A smoke (no GPU needed)
+python qwen/scripts/expI_smoke.py
+
+# Remote (tambe-server-1)
+cd /data/subha2/quantization && git pull
+cd qwen/scripts
+python expI_smoke.py --model Qwen/Qwen2.5-VL-7B-Instruct
+python expI_temporal_kivi.py --stage 1 --seed 1 \
+    --calib_npz ../calibration/expF_kcalib_Qwen2.5-VL-7B-Instruct_frames64.npz
+python expI_duration_hybrid.py --in_jsonl ../results/expI_tempkivi_stage1_seed1.jsonl \
+    --selection_mode duration
+python expI_duration_hybrid.py --in_jsonl ../results/expI_tempkivi_stage1_seed1.jsonl \
+    --selection_mode random
+python expI_analyze.py --stage 1   # writes expI_promote_stage1.json
+# After review:
+python expI_temporal_kivi.py --stage 3 --seed 1 \
+    --calib_npz ../calibration/expF_kcalib_Qwen2.5-VL-7B-Instruct_frames64.npz
+python expI_duration_hybrid.py --in_jsonl ../results/expI_tempkivi_stage3_seed1.jsonl \
+    --selection_mode duration
+python expI_duration_hybrid.py --in_jsonl ../results/expI_tempkivi_stage3_seed1.jsonl \
+    --selection_mode random
+python expI_analyze.py --stage 3
+```

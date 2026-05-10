@@ -100,6 +100,11 @@ class KQuantizerConfig:
     # "token_block" -> N equal-token segments across the whole sequence,
     # ignoring modality boundaries (control for the visual-time hypothesis).
     temporal_mode: str = "visual_only"
+    # Exp I: VidKV-style V quantization. When True, the cache subclass routes
+    # V through a per-(B, H_kv, 1, D) channel-axis scale (computed via time-
+    # axis max-abs) instead of the default per-channel-along-head_dim INT4.
+    # Bits per element unchanged (still INT4); axis is what changes.
+    v_per_channel_seq: bool = False
 
     def __post_init__(self):
         if self.kind not in KQUANTIZER_KINDS:
@@ -264,8 +269,10 @@ def apply_k_quantizer(K: torch.Tensor, cfg: KQuantizerConfig,
         # visual-window-1, ..., visual-window-N, text-suffix).
         # H5: per-channel scales applied to N equal-token blocks across the
         # whole sequence, ignoring modality.
+        # Exp I: when cfg.n_outliers > 0, restore top-N outlier channels at
+        # BF16 after the per-segment quantization (TempWin + outlier-N).
         return _kivi_temporal_window(
-            K, cfg, slice_info, cache_offset, qmax,
+            K, cfg, layer_idx, slice_info, cache_offset, qmax,
             n_windows=int(cfg.n_temporal_windows or 0),
             mode=str(cfg.temporal_mode or "visual_only"),
         )
@@ -386,6 +393,7 @@ def _kivi_role_split(K: torch.Tensor, cfg: KQuantizerConfig,
 
 
 def _kivi_temporal_window(K: torch.Tensor, cfg: KQuantizerConfig,
+                          layer_idx: int,
                           slice_info: Optional[dict], cache_offset: int,
                           qmax: float, n_windows: int,
                           mode: str = "visual_only") -> torch.Tensor:
@@ -403,6 +411,10 @@ def _kivi_temporal_window(K: torch.Tensor, cfg: KQuantizerConfig,
       Used as a control to test whether the visual-time structure is the
       load-bearing thing or just generic local scaling.
 
+    Exp I: when cfg.n_outliers > 0, after per-segment quantization, restore
+    the top-N outlier channels per (L, H_kv) at BF16 from the original K.
+    This composes TempWin K with F8/F9-style outlier protection.
+
     cache_offset > 0 (decode-time, not used in MCQ scoring) falls back to plain
     F4 per-channel-seq scale on the small new chunk. Matches F5/F6 pattern.
     """
@@ -418,36 +430,55 @@ def _kivi_temporal_window(K: torch.Tensor, cfg: KQuantizerConfig,
     # Degenerate window count: behave like F4.
     if n_windows is None or n_windows <= 1:
         scale = _per_channel_seq_scale(K, qmax, percentile=None)
-        return _quantize_with_scale(K, scale, qmax)
-
-    if mode == "token_block":
-        boundaries = [int(round(T * i / n_windows)) for i in range(n_windows + 1)]
+        K_q = _quantize_with_scale(K, scale, qmax)
     else:
-        # visual_only: text-prefix + N visual windows + text-suffix.
-        v_start = 0
-        v_end = T
-        if slice_info is not None and "v_start" in slice_info and "v_end" in slice_info:
-            v_start = max(0, min(T, int(slice_info["v_start"])))
-            v_end = max(v_start, min(T, int(slice_info["v_end"])))
-        if v_end <= v_start:
-            # Degenerate: no visual span detected. Fall back to F4.
-            scale = _per_channel_seq_scale(K, qmax, percentile=None)
-            return _quantize_with_scale(K, scale, qmax)
-        v_boundaries = [v_start + int(round((v_end - v_start) * i / n_windows))
-                        for i in range(n_windows + 1)]
-        boundaries = [0] + v_boundaries + [T]
-        # Dedup adjacents (handles cases where v_start==0 or v_end==T or
-        # window boundary equals v_start/v_end).
-        boundaries = sorted(set(boundaries))
+        if mode == "token_block":
+            boundaries = [int(round(T * i / n_windows)) for i in range(n_windows + 1)]
+        else:
+            # visual_only: text-prefix + N visual windows + text-suffix.
+            v_start = 0
+            v_end = T
+            if slice_info is not None and "v_start" in slice_info and "v_end" in slice_info:
+                v_start = max(0, min(T, int(slice_info["v_start"])))
+                v_end = max(v_start, min(T, int(slice_info["v_end"])))
+            if v_end <= v_start:
+                # Degenerate: no visual span detected. Fall back to F4.
+                scale = _per_channel_seq_scale(K, qmax, percentile=None)
+                K_q = _quantize_with_scale(K, scale, qmax)
+                # Outlier restoration still applies in degenerate path so I8/I13
+                # don't silently degrade if visual span detection fails.
+                n_out = int(cfg.n_outliers or 0)
+                if n_out > 0:
+                    outlier_idx = _outlier_channel_indices(cfg, layer_idx, H, D, n_out).to(K.device)
+                    for h in range(H):
+                        ch = outlier_idx[h]
+                        if ch.numel() > 0:
+                            K_q[:, h, :, ch] = K[:, h, :, ch]
+                return K_q
+            v_boundaries = [v_start + int(round((v_end - v_start) * i / n_windows))
+                            for i in range(n_windows + 1)]
+            boundaries = [0] + v_boundaries + [T]
+            # Dedup adjacents (handles cases where v_start==0 or v_end==T or
+            # window boundary equals v_start/v_end).
+            boundaries = sorted(set(boundaries))
 
-    K_q = K.clone()
-    for i in range(len(boundaries) - 1):
-        a, b = boundaries[i], boundaries[i + 1]
-        if b <= a:
-            continue
-        seg = K[:, :, a:b, :]
-        s = _per_channel_seq_scale(seg, qmax, percentile=None)
-        K_q[:, :, a:b, :] = _quantize_with_scale(seg, s, qmax)
+        K_q = K.clone()
+        for i in range(len(boundaries) - 1):
+            a, b = boundaries[i], boundaries[i + 1]
+            if b <= a:
+                continue
+            seg = K[:, :, a:b, :]
+            s = _per_channel_seq_scale(seg, qmax, percentile=None)
+            K_q[:, :, a:b, :] = _quantize_with_scale(seg, s, qmax)
+
+    # Exp I: outlier protection on top of TempWin (I8/I13).
+    n_out = int(cfg.n_outliers or 0)
+    if n_out > 0:
+        outlier_idx = _outlier_channel_indices(cfg, layer_idx, H, D, n_out).to(K.device)
+        for h in range(H):
+            ch = outlier_idx[h]
+            if ch.numel() > 0:
+                K_q[:, h, :, ch] = K[:, h, :, ch]
     return K_q
 
 
@@ -679,4 +710,29 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
                          n_temporal_windows=4, temporal_mode="token_block"),
         KQuantizerConfig(name="H6_KIVI_TempWin2", kind="kivi_temporal_window", bits=4,
                          n_temporal_windows=2, temporal_mode="visual_only"),
+        # --- Exp I: TempWin + outlier-N composition (TempWin K + F8-style restoration) ---
+        # I_TempWin2_Outlier8: H6 + 8 outlier channels at BF16 (avg KV bits 4.375).
+        KQuantizerConfig(name="I_TempWin2_Outlier8", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=2, temporal_mode="visual_only",
+                         n_outliers=8, calib=calib),
+        # I_TempWin4_Outlier8: H3 + 8 outlier channels at BF16 (avg KV bits 4.375).
+        KQuantizerConfig(name="I_TempWin4_Outlier8", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=4, temporal_mode="visual_only",
+                         n_outliers=8, calib=calib),
+        # I_TokenBlock6: 6 equal-token segments across the whole sequence,
+        # modality-blind. Same number of segments as H3's text-prefix + 4
+        # visual windows + text-suffix at 256f. Exact control for the visual-
+        # time hypothesis at the 256f tier.
+        KQuantizerConfig(name="I_TokenBlock6", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=6, temporal_mode="token_block"),
+        # --- Exp I: VidKV-style V per-channel ---
+        # I_TempWin2_VidKVV: H6 K-side + per-(B, H_kv, 1, D) V-side scale.
+        # Bits unchanged (still INT4 for V); axis is what changes.
+        KQuantizerConfig(name="I_TempWin2_VidKVV", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=2, temporal_mode="visual_only",
+                         v_per_channel_seq=True),
+        # I_TempWin4_VidKVV: H3 K-side + VidKV V-side.
+        KQuantizerConfig(name="I_TempWin4_VidKVV", kind="kivi_temporal_window", bits=4,
+                         n_temporal_windows=4, temporal_mode="visual_only",
+                         v_per_channel_seq=True),
     ]
