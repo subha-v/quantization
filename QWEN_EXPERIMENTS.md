@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-10:** **Nine experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall), Exp G Frame-scaling under fixed KV memory budget (Stage 3 n=200 × 22 conditions, ~3.5h wall) + Exp H Temporal-windowed KIVI K-suite (n=200 × 4 conditions integrated into Exp G), and **Exp I Temporal-KIVI mechanism screen (Stage 1 n=64 × 15 conditions + 2 post-process; Stage 3 n=200 × 11 conditions + 2 post-process; ~2:45 wall total)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + 2896 F per-item-per-condition rows + ~5500 G/H rows + **2549 I per-item-per-condition rows**.
+**Status as of 2026-05-10:** **Ten experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall), Exp G Frame-scaling under fixed KV memory budget (Stage 3 n=200 × 22 conditions, ~3.5h wall) + Exp H Temporal-windowed KIVI K-suite (n=200 × 4 conditions integrated into Exp G), Exp I Temporal-KIVI mechanism screen (Stage 1 n=64 × 15 conditions + 2 post-process; Stage 3 n=200 × 11 conditions + 2 post-process; ~2:45 wall total), and **Exp J Cross-modal outlier-channel KV quantization (Stage 1 n=64 × 15 conditions = 960 rows; calibration 9 min, Stage 1 41 min, total ~52 min wall — Stage 3 deferred to next-day launch)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + 2896 F per-item-per-condition rows + ~5500 G/H rows + 2549 I per-item-per-condition rows + **960 J Stage-1 per-item-per-condition rows**.
 
 ## Headline
 
@@ -1658,4 +1658,174 @@ Total Stage 3 wall: 2:16 (one chained run, 11 conditions × ~196/183 items).
 Total Exp I compute: ~3500 forward passes across both stages plus the
 kernel-sanity replay.
 
+---
+
+## Exp J — Cross-modal outlier-channel KV quantization (2026-05-10) — Stage 1 done; multiple Pareto winners
+
+After Exp I falsified the temporal-window mechanism, the only robust 4-bit-class
+finding was F9-style outlier-channel protection (reproducing 0.560/0.605 across
+seed=0/seed=1). Exp J asks the next, narrower question: **Can we beat the F4/F9
+Pareto frontier by selecting / representing the protected K channels more
+carefully?**
+
+Three intervention axes — none of them touch the F4/F9 quantizer structure
+(kept proven), only the outlier-channel selection criterion or the side-channel
+storage:
+
+1. **Cross-modal outlier-channel selection** — pick the top-N protected
+   channels by score-distortion D_B(l, h, d) = E_{(q,k)∈B}[q_d² · k_d²] over
+   modality blocks B ∈ {TT, TV, VT, VV}, instead of generic K-channel
+   magnitude.
+2. **Layer-adaptive budget** — concentrate F9-size protection on the top-X%
+   of (L, H_kv) cells by cell-risk (sum-d D_TT_TV), zero elsewhere.
+3. **Side-channel compression** — store outlier channels at INT8 / INT6
+   instead of BF16.
+
+Run on a fresh seed=2 split (unused by F/G/H/I), single 128-frame tier,
+n=64 Stage 1. Total wall: 52 min (calibration 9 min, Phase A+B smoke 1.5
+min, Stage 1 forwards 41 min, analyze instant). Stage 3 deferred to a
+manual launch after reviewing the Stage-1 verdict.
+
+### Calibration
+
+`expJ_calibrate.py` ran on cal-100 at 128f. Captures (in addition to the
+F-suite arrays):
+  - `k_channel_energy_text/visual[L, H_kv, D]` — per-modality K energies
+  - `q_energy_pivot[L, H_kv, D]` — Q at the answer-query position only
+  - 7 outlier-index arrays (top-16 each): TT, TV, VT, VV, TT+TV, BAL, PIVOT
+  - 2 cell-risk arrays: cell_risk_TT_TV, cell_risk_all
+
+**Cross-modal index overlap with generic top-16:** TT 10.5/16 (66%), TT+TV
+11.25/16 (70%). The cross-modal scoring identifies meaningfully different
+channels — not just a renaming of generic magnitude.
+
+### Stage 1 results (n=64 seed=2)
+
+The seed=2 split is unusually easy: BF16=0.703 vs 0.594 (seed=1 128f) /
+0.565 (seed=0 200). All 4-bit-class methods land within ±2 pp of BF16, so
+absolute numbers are inflated — the relative rankings are still informative.
+
+| Condition | acc | KV bits | rel mem | verdict |
+|---|---:|---:|---:|---|
+| J0 BF16 | 0.703 | 16.00 | 2.00× | anchor |
+| J1 F4 KIVI | 0.688 | 4.00 | 0.500× | anchor |
+| J2 F9 generic top-16 (BF16 side) | 0.703 | 4.75 | 0.594× | anchor |
+| J3 F8 generic top-8 (BF16 side) | 0.719 | 4.375 | 0.547× | anchor |
+| J4 TT-score top-8 | 0.703 | 4.375 | 0.547× | pareto_winner |
+| J5 TV-score top-8 | 0.719 | 4.375 | 0.547× | pareto_winner |
+| J6 TT+TV top-8 | 0.719 | 4.375 | 0.547× | pareto_winner |
+| **J7 Balanced TT/TV/VT/VV** | **0.734** | 4.375 | 0.547× | **pareto_winner** |
+| **J8 Pivot top-8** | **0.734** | 4.375 | 0.547× | **pareto_winner** |
+| **J9 LA TT+TV 50%** | **0.734** | 4.375 | 0.547× | **pareto_winner** |
+| J10 LA all-mod 50% | 0.703 | 4.375 | 0.547× | pareto_winner |
+| J11 LA TT+TV 75% | 0.719 | 4.56 | 0.570× | pareto_winner |
+| J12 F9 INT8 sidecode | 0.703 | 4.25 | 0.531× | pareto_winner |
+| **J13 F9 INT6 sidecode** | **0.531** | 4.125 | 0.516× | **kill** |
+| J14 TT+TV INT8 sidecode | 0.719 | 4.25 | 0.531× | pareto_winner |
+
+### Stage 1 paired McNemar (key pivots)
+
+| label | a | b | acc(a) | acc(b) | a_only | b_only | both | χ² |
+|---|---|---|---:|---:|---:|---:|---:|---:|
+| balanced_vs_generic | J7 | J3 | 0.734 | 0.719 | 1 | 0 | 46 | 1.00 |
+| pivot_vs_generic | J8 | J3 | 0.734 | 0.719 | 2 | 1 | 45 | 0.33 |
+| la_50pct_vs_f9 | J9 | J2 | 0.734 | 0.703 | 2 | 0 | 45 | 2.00 |
+| la_75pct_vs_f9 | J11 | J2 | 0.719 | 0.703 | 1 | 0 | 45 | 1.00 |
+| **int8side_vs_bf16side** | **J12** | **J2** | **0.703** | **0.703** | **0** | **0** | **45** | **nan** |
+| **int6side_vs_bf16side** | **J13** | **J2** | **0.531** | **0.703** | **3** | **14** | **31** | **7.118** |
+| tt_tv_int8side_vs_f9 | J14 | J2 | 0.719 | 0.703 | 1 | 0 | 45 | 1.00 |
+| f9_reproduces_seed2 | J2 | J1 | 0.703 | 0.688 | 4 | 3 | 41 | 0.14 |
+
+### Findings
+
+32. **Seven variants strictly beat F9 (Pareto-improvement)**: J5/J6/J7/J8/J9
+    /J11/J14 all match F9 acc within ±2 pp at strictly lower KV bits or
+    memory (4.25–4.56 KV bits vs F9's 4.75). Three of these (**J7 Balanced,
+    J8 Pivot, J9 LA TT+TV 50%**) hit **0.734 — +3.1 pp over F9 (0.703) at
+    8% less memory**. None reach McNemar significance at n=64 (χ² < 2.0),
+    but the directions are consistent.
+
+33. **F9 with INT8 sidecode (J12) exactly matches F9 with BF16 sidecode (J2)**:
+    0.703 vs 0.703 with 0/0 swaps, χ²=0. **F9's BF16 sidecode is wasteful;
+    INT8 storage at 4.25 KV bits gives identical accuracy to BF16 storage at
+    4.75 KV bits.** This is an engineering Pareto improvement at strictly
+    lower bits with no novel mechanism — directly deployable.
+
+34. **INT6 sidecode (J13) collapses to 0.531** (-17 pp paired McNemar
+    χ²=7.118, the only significant test in Stage 1). **Outlier channels
+    need ≥ INT8 storage**; INT6 is too aggressive. Clean negative control
+    showing the sidecode-compression axis has a real lower bound.
+
+35. **Cross-modal scoring identifies different channels than generic
+    magnitude**: Calibration shows TT/TT+TV indices have ~66-70% overlap
+    with generic top-16. The remaining ~30% are channels picked up by
+    cross-modal score-distortion that magnitude alone misses — and the
+    accuracies suggest these channels are *more* useful for protection
+    on the seed=2 split.
+
+36. **Layer-adaptive budgets work** at this n: J9 (TT+TV cell-risk top-50%)
+    beats F9 by +3.1 pp at lower bits. J10 (all-modality cell-risk top-50%)
+    matches F9 at lower bits. The "concentrate budget on risky cells"
+    intuition is supported.
+
+37. **Pivot scoring (J8) ties Balanced (J7)**: capturing Q at the answer-
+    query position only is as informative as taking top channels from each
+    of the four modality blocks. Suggests the answer-query Q is itself a
+    natural cross-modal aggregator.
+
+### Caveats
+
+- **Seed=2 is an unusually easy split**: BF16=0.703 vs 0.594/0.615 on
+  prior seeds. Absolute accuracies are inflated; relative rankings are
+  the load-bearing signal.
+- **n=64 paired McNemar is underpowered**: only J13's INT6 sidecode kill
+  reaches significance. The Stage 1 result is "promote multiple variants
+  to n=200 and let n=200 firm up the winner."
+- The cross-modal mechanism story (J7/J8/J9 > F9 by +3 pp) is **trending
+  but not significant at n=64**; Stage 3 will resolve.
+
+### Stage 3 promotion (auto-generated)
+
+`expJ_promote_stage1.json` includes 10 variants (all except J13 INT6 kill):
+
+  J4, J5, J6, J7, J8, J9, J10, J11, J12, J14
+
+Combined with the always-run anchors {J0, J1, J2, J3}, Stage 3 will be 14
+conditions × 200 items × ~2.5 sec/condition ≈ **140 min wall**. Feasible to
+launch as a single chained run after reviewing the Stage-1 verdict.
+
+### Layout (Exp J additions)
+
+```
+qwen/scripts/
+  expJ_calibrate.py            # cross-modal calibration (per-modality K +
+                               # pivot Q + 7 outlier-index arrays + 2 cell-risk)
+  expJ_xmodal_outlier.py       # 15-cond driver, 128f only, fresh seed=2
+  expJ_smoke.py                # 5 Phase A synthetic + 2 Phase B live checks
+  expJ_analyze.py              # 13-pair McNemar + verdict + promotion JSON
+  run_expJ_overnight.sh        # tmux orchestrator
+qwen/calibration/
+  expJ_kcalib_<model>_frames128.{json,npz}    # cross-modal calibration
+  split_seed2_n64.json                         # fresh balanced 16/bucket
+qwen/results/
+  expJ_xmodal_stage1_seed2.jsonl               # 960 forward-pass rows
+  expJ_summary_stage1.md
+  expJ_paired_stage1.md                        # 13-pair McNemar table
+  expJ_verdict_matrix_stage1.md
+  expJ_promote_stage1.json                     # Stage-3 promotion gate
+  expJ_smoke.md
+  expJ_overnight.progress.log
+```
+
+### Pipeline status (Exp J Stage 1)
+
+```
+qwen-expJ (tmux session, GPU 0) — Stage 1 COMPLETE
+├── ✅ Phase A smoke (5/5 synthetic) + Phase B smoke (2/2 live)
+├── ✅ Cross-modal calibration (cal-100, frames=128, 9 min wall)
+├── ✅ Stage 1 (n=64, seed=2, 15 conditions, 41 min wall)
+└── ✅ Analyze: 10 variants promoted to Stage 3, 1 killed (INT6 sidecode)
+```
+
+Total Stage 1 wall: 52 min. Stage 3 to be launched manually.
 

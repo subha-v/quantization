@@ -1,0 +1,14 @@
+{
+  "promoted": [
+    "J4_Outlier8_TT_128f",
+    "J5_Outlier8_TV_128f",
+    "J6_Outlier8_TT_TV_128f",
+    "J7_Outlier8_BAL_128f",
+    "J8_Outlier8_PIVOT_128f",
+    "J9_LA_TT_TV_50pct_128f",
+    "J10_LA_ALL_50pct_128f",
+    "J11_LA_TT_TV_75pct_128f",
+    "J12_F9_INT8side_128f",
+    "J14_TT_TV_INT8side_128f"
+  ]
+}
