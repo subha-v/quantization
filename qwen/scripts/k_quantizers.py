@@ -888,4 +888,25 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         KQuantizerConfig(name="J14_TT_TV_INT8side", kind="kivi_outlier16", bits=4,
                          n_outliers=16, outlier_idx_key="outlier_idx_TT_TV_top16",
                          calib=calib, outlier_storage_bits=8),
+        # --- Exp J Stage-3 controls (added after Stage 1 results) ---
+        # J15: random top-8 BF16 sidecode. Reads `outlier_idx_RANDOM_top16` from
+        # calib (the driver injects this array with a fixed seed at startup).
+        # Purpose: defend against "any 8-channel side-channel would work on an
+        # easy split" — must show J7/J8/J9 beat random, not just generic.
+        KQuantizerConfig(name="J15_Outlier8_RANDOM", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_RANDOM_top16",
+                         calib=calib),
+        # J16: random layer-adaptive 50% cells, generic top-16 within cells.
+        # Reads `cell_risk_RANDOM` from calib (driver injects). Control for J9/J10.
+        KQuantizerConfig(name="J16_LA_RANDOM_50pct", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib,
+                         layer_adaptive_outlier_budget=_resolve_layer_adaptive_budget(
+                             calib, "cell_risk_RANDOM", 0.50, n_per_cell=16)),
+        # J17: error-weighted Pivot top-8. Score(l,h,d) = q_pivot²·(k_d−Q4_d)²
+        # ≈ q_pivot · k_max² (uniform quantization noise variance ∝ max²/588).
+        # Reads `outlier_idx_PIVOT_ERR_top16` from calib (driver injects).
+        # More literal KVQuant-style "model-visible quantization distortion".
+        KQuantizerConfig(name="J17_Outlier8_PIVOT_ERR", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_PIVOT_ERR_top16",
+                         calib=calib),
     ]

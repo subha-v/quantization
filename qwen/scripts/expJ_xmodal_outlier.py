@@ -65,6 +65,8 @@ import json
 from pathlib import Path
 from typing import Optional
 
+import numpy as np
+
 from data_longvideobench import (
     LVBItem,
     filter_items,
@@ -112,6 +114,10 @@ FIXED_FRAME_CONDITIONS_J = [
     ("J12_F9_INT8side_128f",    128, "J12_F9_INT8side",          "v1_kcfg"),
     ("J13_F9_INT6side_128f",    128, "J13_F9_INT6side",          "v1_kcfg"),
     ("J14_TT_TV_INT8side_128f", 128, "J14_TT_TV_INT8side",       "v1_kcfg"),
+    # Stage-3 controls (random + error-weighted pivot).
+    ("J15_Outlier8_RANDOM_128f",     128, "J15_Outlier8_RANDOM",     "v1_kcfg"),
+    ("J16_LA_RANDOM_50pct_128f",     128, "J16_LA_RANDOM_50pct",     "v1_kcfg"),
+    ("J17_Outlier8_PIVOT_ERR_128f",  128, "J17_Outlier8_PIVOT_ERR",  "v1_kcfg"),
 ]
 
 
@@ -121,11 +127,17 @@ CONDITIONS_NEEDING_CALIB_J = {
     "J7_Outlier8_BAL_128f", "J8_Outlier8_PIVOT_128f",
     "J9_LA_TT_TV_50pct_128f", "J10_LA_ALL_50pct_128f", "J11_LA_TT_TV_75pct_128f",
     "J12_F9_INT8side_128f", "J13_F9_INT6side_128f", "J14_TT_TV_INT8side_128f",
+    "J15_Outlier8_RANDOM_128f", "J16_LA_RANDOM_50pct_128f",
+    "J17_Outlier8_PIVOT_ERR_128f",
 }
 
 
+# Pre-registered Stage-3 anchors (always run regardless of Stage-1 verdict).
+# J15/J16/J17 are pre-registered controls added at Stage 3.
 ANCHORS_ALWAYS_PROMOTED = {
     "J0_BF16_128f", "J1_F4_128f", "J2_F9_128f", "J3_F8_128f",
+    "J15_Outlier8_RANDOM_128f", "J16_LA_RANDOM_50pct_128f",
+    "J17_Outlier8_PIVOT_ERR_128f",
 }
 VARIANTS_DATA_DRIVEN = {
     "J4_Outlier8_TT_128f", "J5_Outlier8_TV_128f", "J6_Outlier8_TT_TV_128f",
@@ -338,6 +350,32 @@ def main():
             f"Available keys: {sorted(calib)}. "
             f"Re-run expJ_calibrate.py."
         )
+
+    # Inject Stage-3 control arrays (J15 random, J16 random-cell, J17
+    # error-weighted pivot). Computed on the fly with fixed seeds so the
+    # randomness is reproducible and doesn't require recalibration.
+    L, H_kv, D = calib["k_channel_energy"].shape
+    n_top = int(calib["outlier_idx_TT_top16"].shape[-1])
+    rng_chan = np.random.default_rng(42)
+    # J15: random top-16 outlier indices per (L, H_kv).
+    random_idx = np.empty((L, H_kv, n_top), dtype=np.int32)
+    for L_i in range(L):
+        for h in range(H_kv):
+            random_idx[L_i, h] = rng_chan.choice(D, size=n_top, replace=False).astype(np.int32)
+    calib["outlier_idx_RANDOM_top16"] = random_idx
+    # J16: random per-(L, H_kv) cell-risk score, used by layer-adaptive resolver.
+    rng_cell = np.random.default_rng(43)
+    calib["cell_risk_RANDOM"] = rng_cell.standard_normal((L, H_kv)).astype(np.float32)
+    # J17: error-weighted pivot — score(l, h, d) ∝ q_pivot · k_max² (uniform
+    # INT4 quantization noise variance ∝ max²/588; constant drops out of argsort).
+    q_pivot = np.asarray(calib["q_energy_pivot"], dtype=np.float64)  # [L, H_kv, D]
+    k_max = np.asarray(calib["k_abs_max"], dtype=np.float64)
+    score_pivot_err = q_pivot * (k_max ** 2)
+    pivot_err_idx = np.argsort(score_pivot_err, axis=-1)[..., -n_top:][..., ::-1].copy().astype(np.int32)
+    calib["outlier_idx_PIVOT_ERR_top16"] = pivot_err_idx
+    print(f"[expJ] injected Stage-3 control arrays: outlier_idx_RANDOM_top16 "
+          f"(seed=42), cell_risk_RANDOM (seed=43), outlier_idx_PIVOT_ERR_top16 "
+          f"(q_pivot · k_max²)", flush=True)
 
     conditions = build_j_conditions(calib=calib)
 

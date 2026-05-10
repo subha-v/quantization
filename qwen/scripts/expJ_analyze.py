@@ -61,6 +61,20 @@ HEADLINE_PAIRS_J = [
     ("J13_F9_INT6side_128f",    "J2_F9_128f", "int6side_vs_bf16side"),
     ("J14_TT_TV_INT8side_128f", "J2_F9_128f", "tt_tv_int8side_vs_f9"),
 
+    # Random controls (J15, J16) — defend cross-modal/LA findings from
+    # "any side-channel budget works on an easy split" objection.
+    ("J15_Outlier8_RANDOM_128f",    "J3_F8_128f", "random_vs_generic"),
+    ("J7_Outlier8_BAL_128f",        "J15_Outlier8_RANDOM_128f", "balanced_beats_random"),
+    ("J8_Outlier8_PIVOT_128f",      "J15_Outlier8_RANDOM_128f", "pivot_beats_random"),
+    ("J6_Outlier8_TT_TV_128f",      "J15_Outlier8_RANDOM_128f", "tt_tv_beats_random"),
+    ("J16_LA_RANDOM_50pct_128f",    "J2_F9_128f", "random_LA_vs_f9"),
+    ("J9_LA_TT_TV_50pct_128f",      "J16_LA_RANDOM_50pct_128f", "LA_TT_TV_beats_random_LA"),
+
+    # Error-weighted pivot (J17) — refinement of energy-only pivot (J8).
+    ("J17_Outlier8_PIVOT_ERR_128f", "J8_Outlier8_PIVOT_128f",   "pivot_err_vs_pivot_energy"),
+    ("J17_Outlier8_PIVOT_ERR_128f", "J3_F8_128f",               "pivot_err_vs_generic"),
+    ("J17_Outlier8_PIVOT_ERR_128f", "J2_F9_128f",               "pivot_err_vs_f9"),
+
     # Reproducibility on seed=2
     ("J2_F9_128f", "J1_F4_128f", "f9_reproduces_seed2"),
     ("J3_F8_128f", "J1_F4_128f", "f8_reproduces_seed2"),
@@ -144,6 +158,27 @@ def verdict_j(cond: str, by_cond_acc: dict[str, float],
         return "anchor"
     if cond == "J3_F8_128f":
         return "anchor"
+
+    # J15 / J16 (random controls): judged as "control" — informative only.
+    # A control "wins" the experiment design when it loses to the real
+    # variants; if it accidentally matches them, the cross-modal claim is
+    # undermined.
+    if cond == "J15_Outlier8_RANDOM_128f":
+        return "control_random"
+    if cond == "J16_LA_RANDOM_50pct_128f":
+        return "control_random"
+
+    # J17 (error-weighted Pivot): judged vs J2 F9 (same rules as cross-modal).
+    if cond == "J17_Outlier8_PIVOT_ERR_128f":
+        if np.isfinite(j2) and acc >= j2 - 0.01 and kv_self < kv_j2 - 0.001:
+            return "pareto_winner"
+        if np.isfinite(j2) and acc >= j2 + 0.03:
+            return "paper_strong"
+        if np.isfinite(j2) and acc >= j2 - 0.01:
+            return "promote_n200"
+        if np.isfinite(j2) and acc < j2 - 0.05:
+            return "kill"
+        return "borderline"
 
     return "borderline"
 

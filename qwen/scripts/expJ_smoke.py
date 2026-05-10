@@ -179,13 +179,18 @@ def _check_bits_accounting_J() -> tuple[bool, str]:
     calib = {
         "outlier_channel_idx_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
         "k_channel_energy": np.ones((L, Hkv, D), dtype=np.float32),
+        "k_abs_max": np.ones((L, Hkv, D), dtype=np.float32),
         "outlier_idx_TT_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
         "outlier_idx_TV_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
         "outlier_idx_TT_TV_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
         "outlier_idx_BAL_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
         "outlier_idx_PIVOT_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
+        "outlier_idx_RANDOM_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
+        "outlier_idx_PIVOT_ERR_top16": np.zeros((L, Hkv, 16), dtype=np.int32),
+        "q_energy_pivot": np.ones((L, Hkv, D), dtype=np.float32),
         "cell_risk_TT_TV": np.random.default_rng(0).standard_normal((L, Hkv)).astype(np.float32),
         "cell_risk_all": np.random.default_rng(1).standard_normal((L, Hkv)).astype(np.float32),
+        "cell_risk_RANDOM": np.random.default_rng(2).standard_normal((L, Hkv)).astype(np.float32),
     }
     fc = {cfg.name: cfg for cfg in build_f_conditions(calib=calib)}
     spec = {
@@ -203,6 +208,9 @@ def _check_bits_accounting_J() -> tuple[bool, str]:
         "J12_F9_INT8side":       4.250,
         "J13_F9_INT6side":       4.125,
         "J14_TT_TV_INT8side":    4.250,
+        "J15_Outlier8_RANDOM":     4.375,
+        "J16_LA_RANDOM_50pct":     4.375,
+        "J17_Outlier8_PIVOT_ERR":  4.375,
     }
     bad = []
     for name, expected in spec.items():
