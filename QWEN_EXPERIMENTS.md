@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-11:** **Ten experiments complete.** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall), Exp G Frame-scaling under fixed KV memory budget (Stage 3 n=200 × 22 conditions, ~3.5h wall) + Exp H Temporal-windowed KIVI K-suite (n=200 × 4 conditions integrated into Exp G), Exp I Temporal-KIVI mechanism screen (Stage 1 n=64 × 15 conditions + 2 post-process; Stage 3 n=200 × 11 conditions + 2 post-process; ~2:45 wall total), and **Exp J Cross-modal outlier-channel KV quantization (Stage 1 n=64 × 15 conditions = 960 rows; Stage 3 n=200 × 17 conditions = 3400 rows; calibration 9 min, Stage 1 41 min, Stage 3 2h 21min; total ~3h 11min wall)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + 2896 F per-item-per-condition rows + ~5500 G/H rows + 2549 I per-item-per-condition rows + **960 J Stage-1 + 3400 J Stage-3 per-item-per-condition rows**.
+**Status as of 2026-05-11:** **Eleven experiments complete (Exp K seed=1 only; seed=0/seed=2 deferred).** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall), Exp G Frame-scaling under fixed KV memory budget (Stage 3 n=200 × 22 conditions, ~3.5h wall) + Exp H Temporal-windowed KIVI K-suite (n=200 × 4 conditions integrated into Exp G), Exp I Temporal-KIVI mechanism screen (Stage 1 n=64 × 15 conditions + 2 post-process; Stage 3 n=200 × 11 conditions + 2 post-process; ~2:45 wall total), and **Exp J Cross-modal outlier-channel KV quantization (Stage 1 n=64 × 15 conditions = 960 rows; Stage 3 n=200 × 17 conditions = 3400 rows; calibration 9 min, Stage 1 41 min, Stage 3 2h 21min; total ~3h 11min wall)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + 2896 F per-item-per-condition rows + ~5500 G/H rows + 2549 I per-item-per-condition rows + **960 J Stage-1 + 3400 J Stage-3 per-item-per-condition rows**.
 
 ## Headline
 
@@ -1977,5 +1977,138 @@ qwen-expJ (tmux session, GPU 0) — ALL COMPLETE
 
 Total Exp J wall (calib + smoke + Stage 1 + Stage 3 + analyze): ~3h 11min.
 Total Exp J compute: ~4500 forward passes across both stages.
+
+---
+
+## Exp K — Balanced Cross-Modal Replication (2026-05-11) — Seed=1 result: J7 does NOT replicate; J12 INT8 sidecode DOES
+
+After Exp J Stage 3 produced two paper-strength findings on seed=2 — J7
+(balanced cross-modal top-2/block, +3 pp over F9 at lower bits, paired
+McNemar significant against generic AND random controls) and J12 (F9 with
+INT8 sidecode, exact paired tie at lower bits) — Exp K asks whether these
+replicate on the other seeds. Specifically:
+
+  Q1. Does J7 replicate on seed=1 (the harder split)?
+  Q2. Does J7 still beat both generic and random controls?
+  Q3. Is the J7 win about cross-modal scoring or just balance structure?
+      (Tested via K10 balanced-random-by-channel-position partition.)
+  Q4. Can J7 use INT8 sidecode for free (K7 at 4.125 KV bits)?
+
+Reuses the existing Exp J cross-modal calibration NPZ (no additional
+calibration). 12 conditions × n=200 per seed, single 128f tier. seed=1
+ran first (the hardest split) under contested GPU 0 conditions (43 GB
+co-tenant), 2:57 wall.
+
+### Stage 3 seed=1 results (n=200)
+
+| Condition | acc | 95% CI | KV bits | rel mem | verdict |
+|---|---:|---|---:|---:|---|
+| K0 BF16 128f | 0.615 | [0.550, 0.680] | 16.00 | 2.000× | anchor |
+| **K3 F9 INT8 sidecode** | **0.605** | [0.540, 0.670] | **4.25** | **0.531×** | **pareto_winner** |
+| K11 Pivot top-8 BF16 | 0.600 | [0.535, 0.665] | 4.375 | 0.547× | replicates_pivot_win |
+| **K2 F9 BF16 sidecode (anchor)** | **0.595** | [0.525, 0.660] | 4.75 | 0.594× | anchor |
+| K5 Random8 BF16 (control) | 0.590 | [0.520, 0.655] | 4.375 | 0.547× | control_random |
+| K9 Balanced 3/block | 0.590 | [0.525, 0.655] | 4.56 | 0.570× | matches_K6 |
+| K8 Balanced 1/block | 0.585 | [0.520, 0.650] | 4.19 | 0.523× | matches_K6 |
+| K7 Balanced+INT8 sidecode | 0.580 | [0.515, 0.645] | 4.125 | 0.516× | borderline |
+| K1 F4 (anchor) | 0.570 | [0.505, 0.635] | 4.00 | 0.500× | anchor |
+| K4 F8 BF16 sidecode (anchor) | 0.570 | [0.505, 0.635] | 4.375 | 0.547× | anchor |
+| K10 Balanced-random by position | 0.570 | [0.500, 0.640] | 4.375 | 0.547× | control_ties_K6 |
+| **K6 Balanced 2/block (J7 replication)** | **0.560** | [0.495, 0.630] | 4.375 | 0.547× | **fails_to_replicate** |
+
+### Seed=1 paired McNemar (load-bearing pairs)
+
+| label | a vs b | acc(a) | acc(b) | a_only | b_only | χ² |
+|---|---|---:|---:|---:|---:|---:|
+| **balanced_vs_generic** | K6 vs K4 | 0.560 | 0.570 | 6 | 8 | **0.29 — NS** |
+| **balanced_vs_random** | K6 vs K5 | 0.560 | 0.590 | 11 | 17 | **1.29 — random BEATS balanced** |
+| **crossmodal_vs_balanced_random** | K6 vs K10 | 0.560 | 0.570 | 14 | 16 | **0.13 — tied with random-pos** |
+| **K6_vs_F9** | K6 vs K2 | 0.560 | 0.595 | 8 | 15 | **2.13 — F9 trends ahead of K6** |
+| f9_int8_vs_bf16 | K3 vs K2 | 0.605 | 0.595 | 7 | 5 | 0.33 — clean tie at lower bits |
+| balanced_int8_vs_bf16 | K7 vs K6 | 0.580 | 0.560 | 10 | 6 | 1.00 |
+| K7_vs_F9_pareto | K7 vs K2 | 0.580 | 0.595 | 10 | 13 | 0.39 — F9 still ahead |
+| top1pb_vs_top2pb | K8 vs K6 | 0.585 | 0.560 | 11 | 6 | 1.47 |
+| top3pb_vs_top2pb | K9 vs K6 | 0.590 | 0.560 | 10 | 4 | 2.57 — top-3/block trends over top-2/block |
+| pivot_vs_generic | K11 vs K4 | 0.600 | 0.570 | 12 | 6 | 2.00 — pivot trends |
+| f9_reproduces | K2 vs K1 | 0.595 | 0.570 | 15 | 10 | 1.00 |
+
+### Findings
+
+46. **J7 (Balanced top-2/block) does NOT replicate on seed=1.** K6 = 0.560,
+    LOWER than K4 generic top-8 (0.570) and LOWER than K5 random top-8
+    (0.590). Paired McNemar K6 vs K4 χ²=0.29 (NS); K6 vs K5 favors RANDOM
+    by 6 paired swaps (χ²=1.29). The seed=2 J7 win (0.725 vs F8=0.695,
+    χ²=4.50 paper-strong) was seed-specific.
+
+47. **The cross-modal mechanism story is fully falsified at n=200 seed=1.**
+    K6 (balanced cross-modal) vs K10 (balanced-RANDOM by channel-position):
+    0.560 vs 0.570, χ²=0.13. Neither cross-modal SCORING nor random-by-
+    position scoring beats the other. Combined with K6 ≤ K5 fully-random,
+    **outlier-channel selection criterion does not matter on seed=1.**
+
+48. **J12 (F9 with INT8 sidecode) DOES replicate cleanly.** K3 = 0.605 vs
+    K2 F9 = 0.595 at 4.25 vs 4.75 KV bits, paired McNemar 7/5 swaps,
+    χ²=0.33 — clean tie at strictly lower bits. **The engineering Pareto
+    finding survives on seed=1.**
+
+49. **K11 Pivot top-8 weakly beats generic** (+3 pp, χ²=2.00, p ≈ 0.16 NS
+    but trending). The "score using Q at the answer-query position" idea
+    holds direction across seeds but doesn't reach paired significance on
+    n=200 seed=1.
+
+50. **K9 (Balanced 3/block) > K6 (Balanced 2/block)** at +3 pp paired
+    χ²=2.57 trending. Suggests if the balanced approach has any signal,
+    a larger budget is needed. But K9 ≈ K11 ≈ K2 ≈ K3 at the 0.590–0.605
+    plateau — no clean Pareto winner over F9 on seed=1.
+
+51. **F9 reproduces over F4 on seed=1** at +2.5 pp (0.595 vs 0.570),
+    paired χ²=1.0. Smaller lift than seed=2 (+5 pp) and consistent with
+    seed=0 Stage-3 (0.560 vs 0.545 = +1.5 pp). F9 anchor still robust.
+
+### What this changes about the research direction
+
+- **The J7 paper claim from Exp J Stage 3 is retracted.** The cross-modal-
+  balance mechanism does not generalize to seed=1; the seed=2 result was
+  enhanced by the unusually easy split (BF16=0.705 there vs 0.615 here).
+  J7 at seed=2=0.725 — beautiful number, single seed, did not replicate.
+- **The surviving deployable result is now J12/K3**: F9 with INT8
+  sidecode at 4.25 KV bits, replicating across seed=1 (0.605) and
+  seed=2 (0.695, J12). At strictly lower bits than F9-BF16-sidecode with
+  paired-tied accuracy. Drop-in for any F9 inference path.
+- **F9 itself remains the robust 4-bit-class anchor** across all three
+  seeds (seed=0: 0.560, seed=1: 0.595, seed=2: 0.695). The F4→F9 lift
+  (+1.5/+2.5/+5.0 pp) is consistent in direction.
+- **Seed=0 and seed=2 reruns are deferred** pending GPU availability.
+  seed=0 would tell us whether K3's J12-replication holds on the
+  canonical F-suite split (very likely given seed=1 and seed=2 both
+  show it); whether the J7 result replicates is largely moot at this
+  point given seed=1 falsification.
+
+### Layout
+
+```
+qwen/scripts/
+  expK_balanced_replication.py   # 12-cond driver, per-seed split routing
+  expK_analyze.py                # 13 headline McNemar pairs + verdict_K
+  expK_smoke.py                  # 5 Phase A synthetic checks
+  run_expK_overnight.sh          # tmux orchestrator (3 seeds; ran seed=1 only)
+qwen/results/
+  expK_balanced_stage3_seed1.jsonl   # 2400 rows
+  expK_summary_seed1.md
+  expK_paired_seed1.md
+  expK_verdict_matrix_seed1.md
+  expK_smoke.md
+```
+
+### Pipeline status (Exp K seed=1)
+
+```
+qwen-expK seed=1 — COMPLETE
+├── ✅ Phase A smoke (5/5 synthetic)
+├── ✅ Stage 3 (n=200, 12 conditions, 2:57 wall under 43 GB co-tenant)
+└── ✅ Analyze: J7 fails to replicate; J12/K3 INT8 sidecode replicates clean
+
+seed=0 and seed=2 reruns deferred (GPU contention).
+```
 
 
