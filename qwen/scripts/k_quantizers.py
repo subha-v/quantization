@@ -740,6 +740,85 @@ def _score_cal_text_only(K: torch.Tensor, cfg: KQuantizerConfig, layer_idx: int,
 # ===================================================================
 
 
+def _balanced_random_top_indices(num_layers: int, num_kv_heads: int,
+                                 head_dim: int, n_per_block: int = 2,
+                                 n_blocks: int = 4, n_top: int = 16,
+                                 seed: int = 99):
+    """Exp K K10 control: partition channel-dim into `n_blocks` equal
+    contiguous slices (e.g. [0,32), [32,64), [64,96), [96,128) for D=128
+    and 4 blocks) and randomly pick `n_per_block` channels from each slice
+    per (L, H_kv). Result: [L, H_kv, n_top] int32 with the first
+    n_blocks*n_per_block entries holding the random-per-block selections;
+    padded with random remainder channels (not in earlier picks) up to n_top.
+
+    This is the structural-balance-without-cross-modal-scoring control: it
+    tests whether the J7 win is about cross-modal channel relevance, or just
+    about enforcing balanced coverage across some arbitrary partition.
+    """
+    import numpy as np
+    if head_dim % n_blocks != 0:
+        raise ValueError(f"head_dim={head_dim} not divisible by n_blocks={n_blocks}")
+    block_size = head_dim // n_blocks
+    rng = np.random.default_rng(seed)
+    out = np.full((num_layers, num_kv_heads, n_top), -1, dtype=np.int32)
+    for L_i in range(num_layers):
+        for h in range(num_kv_heads):
+            picked: list[int] = []
+            seen = set()
+            for b in range(n_blocks):
+                pool = list(range(b * block_size, (b + 1) * block_size))
+                chosen = rng.choice(pool, size=n_per_block, replace=False)
+                for c in chosen.tolist():
+                    if c not in seen and len(picked) < n_top:
+                        seen.add(int(c))
+                        picked.append(int(c))
+            # Pad with random remaining channels.
+            remainder = [d for d in range(head_dim) if d not in seen]
+            rng.shuffle(remainder)
+            for c in remainder:
+                if len(picked) >= n_top:
+                    break
+                picked.append(c)
+                seen.add(c)
+            out[L_i, h] = np.array(picked[:n_top], dtype=np.int32)
+    return out
+
+
+def _balanced_per_block_top_indices(scores_by_block: dict, n_per_block: int,
+                                    n_top: int):
+    """Exp K K8/K6/K9: take top-`n_per_block` from each modality block in
+    scores_by_block (keys typically 'TT','TV','VT','VV'; values [L, H_kv, D]),
+    dedup per (L, H_kv), pad to n_top from a composite score.
+
+    Returns [L, H_kv, n_top] int32 (descending priority within picks).
+    """
+    import numpy as np
+    keys = list(scores_by_block.keys())
+    first = scores_by_block[keys[0]]
+    L, Hkv, D = first.shape
+    out = np.full((L, Hkv, n_top), -1, dtype=np.int32)
+    composite = sum(scores_by_block[k] for k in keys)
+    composite_sort = np.argsort(composite, axis=-1)[..., ::-1]
+    for L_i in range(L):
+        for h in range(Hkv):
+            picked: list[int] = []
+            seen = set()
+            for k in keys:
+                k_top = np.argsort(scores_by_block[k][L_i, h])[-n_per_block:][::-1]
+                for c in k_top.tolist():
+                    if c not in seen and len(picked) < n_top:
+                        seen.add(int(c))
+                        picked.append(int(c))
+            for c in composite_sort[L_i, h].tolist():
+                if len(picked) >= n_top:
+                    break
+                if c not in seen:
+                    seen.add(int(c))
+                    picked.append(int(c))
+            out[L_i, h] = np.array(picked[:n_top], dtype=np.int32)
+    return out
+
+
 def _resolve_layer_adaptive_budget(calib: Optional[dict], cell_risk_key: str,
                                    top_fraction: float, n_per_cell: int = 16,
                                    ) -> Optional[object]:
@@ -909,4 +988,46 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         KQuantizerConfig(name="J17_Outlier8_PIVOT_ERR", kind="kivi_outlier8", bits=4,
                          n_outliers=8, outlier_idx_key="outlier_idx_PIVOT_ERR_top16",
                          calib=calib),
+        # ============================================================
+        # Exp K: balanced cross-modal sidecode replication
+        # ============================================================
+        # K2 / K3: F9 generic top-16 sidecode at BF16 vs INT8.
+        # K2 same as J2_F9_128f (already in F-suite as F9). Re-emit for K-only
+        # condition lists; identical config.
+        KQuantizerConfig(name="K2_F9_BF16side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib, outlier_storage_bits=16),
+        KQuantizerConfig(name="K3_F9_INT8side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib, outlier_storage_bits=8),
+        # K4: F8 generic top-8 BF16 (same as F8/J3).
+        KQuantizerConfig(name="K4_F8_BF16side", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, calib=calib, outlier_storage_bits=16),
+        # K5: random top-8 BF16 (same as J15). Reads outlier_idx_RANDOM_top16.
+        KQuantizerConfig(name="K5_Random8_BF16side", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_RANDOM_top16",
+                         calib=calib, outlier_storage_bits=16),
+        # K6: J7 balanced top-2/block BF16. Reads outlier_idx_BAL_top2_per_block_top16.
+        KQuantizerConfig(name="K6_Bal2pb_BF16side", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_BAL_top2_per_block_top16",
+                         calib=calib, outlier_storage_bits=16),
+        # K7: J7 balanced top-2/block INT8. Same indices as K6; INT8 sidecode.
+        KQuantizerConfig(name="K7_Bal2pb_INT8side", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_BAL_top2_per_block_top16",
+                         calib=calib, outlier_storage_bits=8),
+        # K8: balanced top-1/block BF16 (4 channels total).
+        KQuantizerConfig(name="K8_Bal1pb_BF16side", kind="kivi_outlier8", bits=4,
+                         n_outliers=4, outlier_idx_key="outlier_idx_BAL_top1_per_block_top16",
+                         calib=calib, outlier_storage_bits=16),
+        # K9: balanced top-3/block BF16 (12 channels total).
+        KQuantizerConfig(name="K9_Bal3pb_BF16side", kind="kivi_outlier16", bits=4,
+                         n_outliers=12, outlier_idx_key="outlier_idx_BAL_top3_per_block_top16",
+                         calib=calib, outlier_storage_bits=16),
+        # K10: balanced-random by channel-position blocks (decouples balance
+        # structure from cross-modal scoring). Reads outlier_idx_BAL_RANDOM_POS_top16.
+        KQuantizerConfig(name="K10_BalRandomPos_BF16side", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_BAL_RANDOM_POS_top16",
+                         calib=calib, outlier_storage_bits=16),
+        # K11: pivot top-8 BF16 (same as J8).
+        KQuantizerConfig(name="K11_Pivot8_BF16side", kind="kivi_outlier8", bits=4,
+                         n_outliers=8, outlier_idx_key="outlier_idx_PIVOT_top16",
+                         calib=calib, outlier_storage_bits=16),
     ]
