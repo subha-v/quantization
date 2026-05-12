@@ -298,14 +298,16 @@ def main():
     log(f"answer_token_ids (A,B,C,D): {answer_ids}")
 
     # 5. Forward each (condition, item) and gather diagnostics
+    # Use F9 (BF16 sidecode) as the cleaner anchor for P2-P6 per review.
+    f9_cfg = find_k_cfg("F9_KIVI_Outlier16", calib)
     conditions = [
-        ("P0",  None,    RoutePolicy("none"),                 False),
-        ("P1",  f4_cfg,  RoutePolicy("none"),                 False),
-        ("P2",  j12_cfg, RoutePolicy("none"),                 True),
-        ("P3",  j12_cfg, RoutePolicy("quest_sparse", 0.25),   True),
-        ("P4",  j12_cfg, RoutePolicy("random_sparse", 0.25),  True),
-        ("P5",  j12_cfg, RoutePolicy("oracle_sparse"),        True),
-        ("P6",  j12_cfg, RoutePolicy("formatbook_quest", 0.5), True),
+        ("P0",  None,    RoutePolicy("none"),                       False),
+        ("P1",  f4_cfg,  RoutePolicy("none"),                       False),
+        ("P2",  f9_cfg,  RoutePolicy("none"),                       True),
+        ("P3",  f9_cfg,  RoutePolicy("quest_sparse", 0.25),         True),
+        ("P4",  f9_cfg,  RoutePolicy("random_sparse", 0.25),        True),
+        ("P5",  f9_cfg,  RoutePolicy("oracle_sparse", 0.25),        True),
+        ("P6",  f9_cfg,  RoutePolicy("formatbook_quest", 0.5),      True),
     ]
     log(f"\n## Running {len(conditions)} conditions on {len(smoke_items)} items")
     results: list[dict] = []
