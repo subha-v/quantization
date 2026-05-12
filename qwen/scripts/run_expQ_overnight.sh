@@ -39,6 +39,15 @@ done
 : "${CUDA_VISIBLE_DEVICES:?Must set CUDA_VISIBLE_DEVICES before launching}"
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
+# Activate the project venv if it exists; otherwise rely on the inherited PATH.
+# Override with QWEN_VENV=/path/to/venv to point at a custom interpreter.
+QWEN_VENV="${QWEN_VENV:-/data/subha2/experiments/qwen_venv}"
+if [ -f "$QWEN_VENV/bin/activate" ]; then
+  # shellcheck disable=SC1091
+  source "$QWEN_VENV/bin/activate"
+  echo "Activated venv: $QWEN_VENV (python=$(which python3))"
+fi
+
 LOG="$QWEN_DIR/results/expQ_overnight.progress.log"
 RESULTS_DIR="$QWEN_DIR/results"
 CALIB_DIR="$QWEN_DIR/calibration"
