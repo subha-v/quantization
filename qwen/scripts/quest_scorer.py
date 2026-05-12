@@ -150,11 +150,16 @@ def select_active_pages(layout: PageLayout,
             needle_in_active=(layout.needle_page_idx in routable_idx),
         )
 
-    if budget_fraction is None:
+    # oracle_needle_only ignores budget_fraction (always returns just the needle);
+    # other selection policies require a budget.
+    if policy != "oracle_needle_only" and budget_fraction is None:
         raise ValueError(f"policy={policy} requires budget_fraction")
     import math
-    k = max(1, math.ceil(budget_fraction * n))
-    k = min(k, n)
+    if budget_fraction is not None:
+        k = max(1, math.ceil(budget_fraction * n))
+        k = min(k, n)
+    else:
+        k = 1  # oracle_needle_only never reads k; satisfy the type
 
     if policy == "quest_top":
         if scores is None:
