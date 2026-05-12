@@ -146,7 +146,13 @@ def write_summary(rows: list[dict], out_md: Path) -> None:
     lines.append("")
     lines.append("| condition | n | acc | 95% CI | needle_hit (layer-avg) | logical_page_read | needle_rank median | latency_ms | seq_len mean |")
     lines.append("|---|---|---|---|---|---|---|---|---|")
-    cond_order = ["P0", "P1", "P2", "P2b", "P3", "P3b", "P4", "P4b", "P5", "P6"]
+    cond_order = [
+        "P0", "P1", "P2", "P2b",
+        "P3", "P3b",
+        "P4", "P4_s1", "P4_s2", "P4b",
+        "P5", "P5_only",
+        "P6", "P6R", "P6O",
+    ]
     seen = set()
     for c in cond_order + sorted(set(by_cond) - set(cond_order)):
         if c not in by_cond or c in seen:
@@ -186,10 +192,15 @@ def write_summary(rows: list[dict], out_md: Path) -> None:
 
 PAIRS = [
     ("P1", "P0", "F4 same-benchmark anchor: F4 vs BF16 dense"),
+    ("P2", "P0", "F9 same-benchmark anchor: F9 vs BF16 dense"),
     ("P3", "P4", "Quest vs Random at top-25% sparse"),
-    ("P5", "P3", "Oracle headroom over Quest"),
-    ("P6", "P2", "FormatBook vs dense J12"),
+    ("P5", "P3", "Oracle (budget-matched) headroom over Quest"),
+    ("P5_only", "P3", "Oracle (needle-only) vs Quest at top-25% — does needle alone suffice?"),
+    ("P6", "P2", "FormatBook (Quest top-50%) vs dense F9"),
+    ("P6", "P6R", "FormatBook Quest vs Random — does Quest selection matter?"),
+    ("P6O", "P6", "FormatBook Oracle headroom over Quest"),
     ("P6", "P1", "FormatBook vs dense F4"),
+    ("P2b", "P2", "J12 (INT8 sidecode) vs F9 dense — INT8 confound check"),
 ]
 
 
@@ -320,7 +331,13 @@ def write_verdict(rows: list[dict], out_md: Path) -> None:
     lines.append("## Per-condition status")
     lines.append("| condition | n | acc | status |")
     lines.append("|---|---|---|---|")
-    cond_order = ["P0", "P1", "P2", "P2b", "P3", "P3b", "P4", "P4b", "P5", "P6"]
+    cond_order = [
+        "P0", "P1", "P2", "P2b",
+        "P3", "P3b",
+        "P4", "P4_s1", "P4_s2", "P4b",
+        "P5", "P5_only",
+        "P6", "P6R", "P6O",
+    ]
     for c in cond_order:
         if c not in by_cond:
             continue

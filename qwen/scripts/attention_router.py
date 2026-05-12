@@ -66,30 +66,45 @@ def _f4_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
 class RoutePolicy:
     """Parsed routing policy.
 
-    name:
-      "none" -> no-op (P0, P2)
-      "quest_sparse" / "random_sparse" / "oracle_sparse" -> mask cold (P3/P4/P5)
-      "formatbook_quest" -> downgrade cold (P6)
-    budget_fraction: top-K fraction of routable pages to keep active
-                     (ignored by "none" and "oracle_sparse")
-    gqa_aggregate: "sum" or "max" — how to combine Q-head Quest scores
+    name (sparse: mask cold pages with -inf on last query row):
+      "none"               -> no-op (P0/P1/P2)
+      "quest_sparse"       -> Quest top-K (P3)
+      "random_sparse"      -> random top-K (P4; per-(item, condition) seeded)
+      "oracle_sparse"      -> needle + Quest top-(K-1) fill at matched budget (P5)
+      "oracle_needle_only" -> needle ONLY, no fill (P5_only; strict)
+
+    name (formatbook: cold pages stay but downgrade to F4):
+      "formatbook_quest"   -> Quest top-K hot pages get J12, others F4 (P6)
+      "formatbook_random"  -> Random top-K hot pages get J12, others F4 (P6R)
+      "formatbook_oracle"  -> Oracle (needle + Quest fill) hot, others F4 (P6O)
+
+    budget_fraction: required for everything except "none" and
+                     "oracle_needle_only".
+    gqa_aggregate:   "sum" or "max" — Q-head aggregation for Quest scoring.
     """
     name: str
     budget_fraction: Optional[float] = None
     gqa_aggregate: str = "sum"
 
     def is_sparse(self) -> bool:
-        return self.name in ("quest_sparse", "random_sparse", "oracle_sparse")
+        return self.name in (
+            "quest_sparse", "random_sparse", "oracle_sparse", "oracle_needle_only",
+        )
 
     def is_formatbook(self) -> bool:
-        return self.name in ("formatbook_quest",)
+        return self.name in (
+            "formatbook_quest", "formatbook_random", "formatbook_oracle",
+        )
 
     def selection_policy(self) -> str:
         return {
             "quest_sparse": "quest_top",
             "random_sparse": "random_top",
             "oracle_sparse": "oracle_needle",
+            "oracle_needle_only": "oracle_needle_only",
             "formatbook_quest": "quest_top",
+            "formatbook_random": "random_top",
+            "formatbook_oracle": "oracle_needle",
         }[self.name]
 
 

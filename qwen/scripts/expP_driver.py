@@ -59,30 +59,48 @@ class CondSpec:
     use_page_cache: bool
 
 
+F9 = "F9_KIVI_Outlier16"
+F4 = "F4_KIVI_PerChannelSeq"
+J12 = "J12_F9_INT8side"
+
+
 def primary_conditions() -> list[CondSpec]:
-    # P5 oracle is now budget-matched to P3 (top-25%): the needle is forced into
-    # the active set, and the remaining (K-1) slots are filled by top-Quest. This
-    # makes P5 a valid upper bound for P3 at matched budget. See
-    # quest_scorer.select_active_pages("oracle_needle_topfill").
+    """Primary diagnostic conditions for the FormatBook + Quest routing test.
+
+    P5 oracle is budget-matched to P3 (top-25%): needle forced into active,
+    remaining (K-1) slots filled by top-Quest. P6/P6R/P6O are the three
+    FormatBook variants — without P6R/P6O a positive P6 result is ambiguous
+    (could just mean "any 50% of pages at J12 works").
+    """
     return [
-        CondSpec("P0", None, RoutePolicy("none"), False),
-        CondSpec("P1", "F4_KIVI_PerChannelSeq", RoutePolicy("none"), False),
-        CondSpec("P2", "F9_KIVI_Outlier16", RoutePolicy("none"), True),
-        CondSpec("P3", "F9_KIVI_Outlier16", RoutePolicy("quest_sparse", 0.25), True),
-        CondSpec("P4", "F9_KIVI_Outlier16", RoutePolicy("random_sparse", 0.25), True),
-        CondSpec("P5", "F9_KIVI_Outlier16", RoutePolicy("oracle_sparse", 0.25), True),
-        CondSpec("P6", "F9_KIVI_Outlier16", RoutePolicy("formatbook_quest", 0.5), True),
+        CondSpec("P0",  None, RoutePolicy("none"),                       False),
+        CondSpec("P1",  F4,   RoutePolicy("none"),                       False),
+        CondSpec("P2",  F9,   RoutePolicy("none"),                       True),
+        CondSpec("P3",  F9,   RoutePolicy("quest_sparse", 0.25),         True),
+        CondSpec("P4",  F9,   RoutePolicy("random_sparse", 0.25),        True),
+        CondSpec("P5",  F9,   RoutePolicy("oracle_sparse", 0.25),        True),
+        # FormatBook trio at top-50% — Quest / Random / Oracle hot-page selection.
+        CondSpec("P6",  F9,   RoutePolicy("formatbook_quest", 0.5),      True),
+        CondSpec("P6R", F9,   RoutePolicy("formatbook_random", 0.5),     True),
+        CondSpec("P6O", F9,   RoutePolicy("formatbook_oracle", 0.5),     True),
     ]
 
 
 def stretch_conditions() -> list[CondSpec]:
-    # P2b: same routing as P2 (dense, no mask) but with J12 (F9+INT8 sidecode)
-    # K config — characterizes the INT8-sidecode confound separately so the
-    # primary P2-P6 results remain clean on F9/BF16-sidecode.
+    """Stretch conditions — same JSONL, run after primary if budget allows."""
     return [
-        CondSpec("P3b", "F9_KIVI_Outlier16", RoutePolicy("quest_sparse", 0.5), True),
-        CondSpec("P4b", "F9_KIVI_Outlier16", RoutePolicy("random_sparse", 0.5), True),
-        CondSpec("P2b", "J12_F9_INT8side", RoutePolicy("none"), True),
+        # Multi-seed random sparse (noise reduction for the Quest > Random claim)
+        CondSpec("P4_s1",   F9, RoutePolicy("random_sparse", 0.25),  True),
+        CondSpec("P4_s2",   F9, RoutePolicy("random_sparse", 0.25),  True),
+        # Top-50% sparse stretch (Pareto curve)
+        CondSpec("P3b",     F9, RoutePolicy("quest_sparse", 0.5),    True),
+        CondSpec("P4b",     F9, RoutePolicy("random_sparse", 0.5),   True),
+        # Strict needle-only oracle (no Quest fill) — tests whether the model
+        # needs ANY surrounding pages or just the needle.
+        CondSpec("P5_only", F9, RoutePolicy("oracle_needle_only"),   True),
+        # J12 (F9 + INT8 sidecode) dense — characterizes the INT8-sidecode
+        # confound separately so primary P2-P6 stay clean on F9/BF16-sidecode.
+        CondSpec("P2b",     J12, RoutePolicy("none"),                True),
     ]
 
 
@@ -138,11 +156,12 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
                 needle_idx_in_images=item.needle_idx_in_images,
             )
             cache = PageAwareFakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
-            # Deterministic per-item RNG so random_sparse is reproducible across
-            # reruns and resumes. The item_id alone is enough — we don't fold
-            # in condition name because we WANT P4 and P4b to share the same
-            # random samples on the same item where they share routable count.
-            rng_seed = (abs(hash(item.id)) % (2**31)) ^ 0xCAFEBABE
+            # Deterministic per-(item, condition) RNG so:
+            #  - reruns and resumes reproduce the exact random samples
+            #  - P4 / P4_s1 / P4_s2 produce DIFFERENT random samples on the
+            #    same item (multi-seed noise reduction for the Quest > Random
+            #    claim)
+            rng_seed = (abs(hash(f"{item.id}:{cond.name}")) % (2**31)) ^ 0xCAFEBABE
             cache.set_page_layout(layout, rng_seed=rng_seed)
         else:
             cache = FakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)

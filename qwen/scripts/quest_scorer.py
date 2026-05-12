@@ -194,6 +194,12 @@ def select_active_pages(layout: PageLayout,
         else:
             fill = []
         active = sorted(([needle_idx] if needle_idx is not None else []) + fill)
+    elif policy == "oracle_needle_only":
+        # Strict oracle: needle ONLY in active set, regardless of budget.
+        # Tests whether the needle page alone (+ text + choice images, which
+        # are always-on) is enough to answer.
+        needle_idx = layout.needle_page_idx
+        active = [needle_idx] if needle_idx is not None else []
     else:
         raise ValueError(f"unknown policy={policy!r}")
 
