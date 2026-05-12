@@ -110,34 +110,19 @@ class RoutePolicy:
 
 # ---------------- core last-row computation ----------------
 
-def _compute_last_row_attention(query: torch.Tensor, key: torch.Tensor,
-                                value: torch.Tensor, cold_token_mask: torch.Tensor,
-                                scale: Optional[float],
-                                attn_mask: Optional[torch.Tensor] = None,
-                                is_causal: bool = False) -> torch.Tensor:
-    """Compute attention output for the last query row, with -inf added at
-    `cold_token_mask` positions on the keys.
+def _build_last_row_mask(cold_token_mask: torch.Tensor,
+                          attn_mask: Optional[torch.Tensor],
+                          T_k: int, device, dtype) -> torch.Tensor:
+    """Build a [1, 1, 1, T_k] additive mask for the last query row.
 
-    query: [B, H, T_q, D]
-    key/value: [B, H, T_k, D]
-    cold_token_mask: [T_k] bool — True at positions inside cold pages
-    attn_mask: optional explicit attention mask supplied to the original SDPA
-               call. Shape may be 2D [T_q, T_k], 3D [B, T_q, T_k], or 4D
-               [B, H, T_q, T_k]. We extract the last-query-row slice and add
-               it before softmax. For single-item unpadded prefill this is a
-               no-op (None or all-zero); the code is here for robustness when
-               padding masks ever land.
-    is_causal: ignored — the last query row attends to all prior keys under
-               causality, so we don't need to materialize the causal mask
-               for row T_q-1 specifically.
-    Returns: [B, H, 1, D]
+    Combines:
+      - `cold_token_mask`: bool [T_k], True at cold-page tokens → -inf
+      - `attn_mask`: optional original mask (2D/3D/4D), last-row slice added in
     """
-    B, H, T_q, D = query.shape
-    T_k = key.shape[-2]
-    q_last = query[:, :, -1:, :]                           # [B, H, 1, D]
-    s = scale if scale is not None else 1.0 / math.sqrt(D)
-    scores = torch.matmul(q_last, key.transpose(-1, -2)) * s  # [B, H, 1, T_k]
-    # Defensive: apply the last-row slice of an explicit attention mask.
+    out = torch.zeros(1, 1, 1, T_k, dtype=dtype, device=device)
+    if cold_token_mask is not None:
+        m = cold_token_mask.to(device, non_blocking=True)
+        out = out.masked_fill(m.view(1, 1, 1, T_k), float("-inf"))
     if attn_mask is not None:
         if attn_mask.dim() == 4:
             last_attn = attn_mask[..., -1:, :]                  # [B, H, 1, T_k]
@@ -149,17 +134,11 @@ def _compute_last_row_attention(query: torch.Tensor, key: torch.Tensor,
             last_attn = None
         if last_attn is not None:
             if last_attn.dtype == torch.bool:
-                # True = keep; SDPA convention: pre-softmax additive 0 / -inf.
                 last_attn = torch.where(last_attn,
-                                        torch.zeros_like(scores),
-                                        torch.full_like(scores, float("-inf")))
-            scores = scores + last_attn.to(scores.dtype).to(scores.device)
-    if cold_token_mask is not None:
-        # Broadcast over (B, H); the mask is over keys (last dim).
-        m = cold_token_mask.to(scores.device, non_blocking=True)
-        scores = scores.masked_fill(m.view(1, 1, 1, T_k), float("-inf"))
-    weights = torch.softmax(scores, dim=-1)               # [B, H, 1, T_k]
-    return torch.matmul(weights, value)                   # [B, H, 1, D]
+                                        torch.zeros_like(out),
+                                        torch.full_like(out, float("-inf")))
+            out = out + last_attn.to(out.dtype).to(out.device)
+    return out
 
 
 # ---------------- token-mask builder ----------------
@@ -274,16 +253,22 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
                                  scale=scale, **kwargs)
 
         # Sparse routes: compute full SDPA causally, then overwrite the last row
-        # with a manually-masked version. This preserves the K/V contributions
-        # of non-last rows to all upstream layers.
+        # with a separately-masked SDPA call on q_last only. We use the original
+        # SDPA (not our patched copy) so GQA / scaling / kernel dispatch are
+        # handled identically to the non-routed call — preserving the K/V
+        # contributions of non-last rows to all upstream layers.
         full = original_sdpa(query, key, value, attn_mask=attn_mask,
                              dropout_p=dropout_p, is_causal=is_causal,
                              scale=scale, **kwargs)
         if not cold_token_mask.any():
             return full
-        last_row = _compute_last_row_attention(query, key, value, cold_token_mask,
-                                                scale=scale, attn_mask=attn_mask,
-                                                is_causal=is_causal)
+        last_mask = _build_last_row_mask(cold_token_mask, attn_mask,
+                                          T_k=T_k, device=query.device,
+                                          dtype=query.dtype)
+        q_last = query[:, :, -1:, :]
+        last_row = original_sdpa(q_last, key, value, attn_mask=last_mask,
+                                  dropout_p=dropout_p, is_causal=False,
+                                  scale=scale, **kwargs)
         full = full.clone()
         full[:, :, -1:, :] = last_row
         return full
