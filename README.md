@@ -387,6 +387,64 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
+## Qwen2.5-VL × MM-NIAH — Experiment P: Query-Adaptive Page-Format Routing (VLM-FormatBook diagnostic, 2026-05-12)
+
+After the static-KV story for Qwen2.5-VL × LongVideoBench MCQ was effectively exhausted (F4 deployable, F9 zero-loss, J12 engineering Pareto; J7 retracted, K9 trending), Exp P pivots from *"how many bits per element?"* to *"which pages does this query need to read at all?"* This is the Quest/PRISM-style query-adaptive page-routing direction, combined with per-page format selection (FormatBook). Structurally orthogonal to F4/F9/J12 — those decide encoding; Quest/FormatBook decides access and format-per-page.
+
+**Benchmark switch.** LongVideoBench MCQ is text-anchored on the answer query (Exps D1/E1 falsified visual-K routing), so it's the wrong stress test. P0 uses **MM-NIAH** (OpenGVLab/MM-NIAH, NeurIPS 2024) retrieval-image, which has a well-defined visual needle page that varies by query.
+
+### Primary conditions (n=200 stratified by context-length bucket)
+
+| Code | Description | Active K | Cold K | Attention | Page budget |
+|---|---|---|---|---|---|
+| P0 | BF16 baseline | BF16 | BF16 | dense | — |
+| P1 | Full F4 KIVI | F4 | F4 | dense | — (MM-NIAH F4 anchor) |
+| P2 | Full J12 (F9 + INT8 sidecode) | J12 | J12 | dense | — (dense anchor) |
+| P3 | **Quest sparse** | J12 | masked (-inf) | sparse, last-Q row only | **top-25% visual + all text** |
+| P4 | **Random sparse** | J12 | masked (-inf) | sparse, last-Q row only | top-25% visual + all text |
+| P5 | **Oracle sparse** | J12 | masked (-inf) | sparse, last-Q row only | needle page + text only |
+| P6 | **FormatBook** | J12 | F4 (per-page) | dense | top-50% visual = J12 |
+
+Stretch: P3b/P4b at top-50% budget.
+
+### Key implementation details
+
+- **Prefill-not-decode masking.** With `max_new_tokens=1`, first-token logits come from the prefill forward at the last prompt position — there is *no* length-1 decode step before the scored token. The SDPA wrapper therefore patches `torch.nn.functional.scaled_dot_product_attention` *during prefill* and writes -inf only into the last query row's cold-page columns. All other query rows attend normally, preserving correct K/V values for upstream layers.
+- **Per-page envelopes captured during prefill.** Inside `PageAwareFakeQuantKVCache.update()`, after K is quantized, we compute (k_min, k_max) per (KV head, channel, page) and stash them as `most_recent_envelope` for the SDPA wrapper to read within the same layer's attention forward (no global counter).
+- **GQA aggregation.** 28 Q heads share 4 KV heads (group of 7). Quest scores are aggregated across the 7 Q-heads sharing each KV-head via sum (default; smoke test compares vs max).
+- **FormatBook downgrade.** P6 doesn't mask attention — it re-quantizes cold-page K rows in place from J12 to F4 inside the SDPA wrapper, then runs dense SDPA. Tests "noisier K for low-attention pages" vs P3's "skip the page entirely."
+
+### What's new in `qwen/scripts/`
+
+- `mm_niah_loader.py` — MM-NIAH retrieval-image loader: dataclass, stratified split by `context_length` bucket (short/mid/long), interleaved-image Qwen2.5-VL chat formatting, needle-page identification via `find-image`/`abnormal_pic` path heuristic (validated on 520/520 val records).
+- `page_layout.py` — `find_all_visual_spans` (multi-image extension of `find_visual_token_span`) + `build_page_layout` that builds the per-item page table (text + in-context-image + choice-image roles).
+- `quest_scorer.py` — per-page (k_min, k_max) envelope computation + Quest upper-bound score `sum_d max(q*k_min, q*k_max)` against the last query row + routing decision builder.
+- `page_envelope_cache.py` — `PageAwareFakeQuantKVCache(FakeQuantKVCache)`: overrides `update()` to capture envelopes and write `most_recent_envelope` / `most_recent_layer_idx` for the SDPA wrapper.
+- `attention_router.py` — `page_routing_sdpa_context` context manager: monkey-patches `F.scaled_dot_product_attention` with a wrapper that (a) writes -inf into the last query row's cold-page columns for sparse routes, or (b) re-quantizes cold-page K in place for FormatBook. Last-row trick preserves non-last K contributions for upstream layers.
+- `expP_smoke.py` — n=5 short-bucket smoke. Asserts: page coverage, envelope well-formedness, layer-index sync, **prefill-mask changes logits** (load-bearing), oracle needle-hit, cooperative pass-through.
+- `expP_driver.py` — sweep 7 primary + 2 stretch conditions on stratified n=200 MM-NIAH items. Periodic summary callback; per-item routing diagnostics.
+- `expP_analyze.py` — accuracy ± bootstrap CI, McNemar paired pairs (P1/P0, P3/P4, P5/P3, P6/P2, P6/P1), verdict matrix.
+
+### Pass/fail question
+
+> Can query-aware page selection find the visual needle page better than random, AND can FormatBook match full J12 accuracy while reading fewer J12-format pages?
+
+A pass: any of (1) Quest needle-hit > random at top-25%, (2) P3 acc > P4 acc (McNemar p<0.05), (3) P6 acc ≥ P2 acc CI at ≤50% sidecode-read, (4) P5 >> P3 ≈ P4 (benchmark has signal, scorer needs work). A clear fail: Quest needle-hit ≈ random AND P3 ≈ P4 AND P5 ≈ P3.
+
+### Running on tambe-server-1
+
+```bash
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv
+# MM-NIAH val is at /data/subha2/mm_niah/mm_niah_val/{annotations/retrieval-image.jsonl, images/}
+CUDA_VISIBLE_DEVICES=<idx> python3 qwen/scripts/expP_smoke.py --bucket short --n-items 5
+CUDA_VISIBLE_DEVICES=<idx> python3 qwen/scripts/expP_driver.py --n-items 200
+python3 qwen/scripts/expP_analyze.py  # no GPU
+```
+
+Plan: `/Users/subha/.claude/plans/look-through-the-qwen-crispy-curry.md`.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment G: Frame-scaling under fixed KV memory budget (staged 2026-05-09)
 
 After Exp F (KIVI per-channel-along-seq) closed 94.4% of the KV-quantization collapse at TRUE 4.00 KV bits, the open research question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget*. The theoretical math at fixed `max_pixels=360×420`:
