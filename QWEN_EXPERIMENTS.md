@@ -1,6 +1,6 @@
 # Qwen2.5-VL × LongVideoBench — KV-cache Quantization Experiments
 
-**Status as of 2026-05-11:** **Eleven experiments complete (Exp K seed=1 only; seed=0/seed=2 deferred).** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall), Exp G Frame-scaling under fixed KV memory budget (Stage 3 n=200 × 22 conditions, ~3.5h wall) + Exp H Temporal-windowed KIVI K-suite (n=200 × 4 conditions integrated into Exp G), Exp I Temporal-KIVI mechanism screen (Stage 1 n=64 × 15 conditions + 2 post-process; Stage 3 n=200 × 11 conditions + 2 post-process; ~2:45 wall total), and **Exp J Cross-modal outlier-channel KV quantization (Stage 1 n=64 × 15 conditions = 960 rows; Stage 3 n=200 × 17 conditions = 3400 rows; calibration 9 min, Stage 1 41 min, Stage 3 2h 21min; total ~3h 11min wall)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + 2896 F per-item-per-condition rows + ~5500 G/H rows + 2549 I per-item-per-condition rows + **960 J Stage-1 + 3400 J Stage-3 per-item-per-condition rows**.
+**Status as of 2026-05-12:** **Twelve experiments complete (Exp K seed=1, Exp L seed=1 recalibration sanity check; Exp K seed=0/seed=2 deferred).** Exp A (8/8 conditions × 200 eval items), Exp B Online Precision-Need Routing (8 routed conditions × 200 eval items at avg=4 KV bits), Exp C K/V isolation mini-sweep (4 conditions × 100 stratified eval items at avg=10 / avg=9 KV bits), Exp D0 Evidence-window diagnostic (200 items × 8 BF16 conditions, 1h 26min wall), Exp D1 Cross-modal K/V quantization (200 items × 14 V3K-K-mask conditions, 1h 42min wall), Exp E1 Text-K slice ablation (200 items × 11 V3K-text-K-mask conditions, 89 min wall), Exp F K-quantizer repair screening (Stage 1 n=64 × 14 conditions = 896 rows, 33 min wall; Stage 3 n=200 × 10 conditions = 2000 rows, 76 min wall), Exp G Frame-scaling under fixed KV memory budget (Stage 3 n=200 × 22 conditions, ~3.5h wall) + Exp H Temporal-windowed KIVI K-suite (n=200 × 4 conditions integrated into Exp G), Exp I Temporal-KIVI mechanism screen (Stage 1 n=64 × 15 conditions + 2 post-process; Stage 3 n=200 × 11 conditions + 2 post-process; ~2:45 wall total), and **Exp J Cross-modal outlier-channel KV quantization (Stage 1 n=64 × 15 conditions = 960 rows; Stage 3 n=200 × 17 conditions = 3400 rows; calibration 9 min, Stage 1 41 min, Stage 3 2h 21min; total ~3h 11min wall)**. Total: ~3600 baseline rollouts + 33,600 diagnostic signal rows + 200 D0 per-item rows + 2800 D1 per-item-per-condition rows + 2200 E1 per-item-per-condition rows + 2896 F per-item-per-condition rows + ~5500 G/H rows + 2549 I per-item-per-condition rows + **960 J Stage-1 + 3400 J Stage-3 per-item-per-condition rows**.
 
 ## Headline
 
@@ -2110,5 +2110,181 @@ qwen-expK seed=1 — COMPLETE
 
 seed=0 and seed=2 reruns deferred (GPU contention).
 ```
+
+---
+
+## Exp L — Calibration sanity check for J7 on seed=1 (2026-05-12)
+
+**Motivation.** Exp K seed=1 reused the Exp J cross-modal calibration NPZ,
+which was derived from **seed=0 cal-100** data. So Exp K evaluated the
+seed=1 eval-200 items with channel indices calibrated *elsewhere*. The
+J7 failure on seed=1 (K6 = 0.560, below random K5 = 0.590) is therefore
+ambiguous between two interpretations:
+  (a) the cross-modal-balance mechanism is genuinely seed=2-specific
+      (calibration source doesn't matter; the J7 = 0.725 win was the split)
+  (b) the J7 mechanism depends on calibration alignment — seed=1 evaluation
+      with seed=1-calibrated channel indices might recover J7
+
+Exp L generates a **fresh seed=1 cal-100** split, disjoint from the existing
+seed=1 eval-200 (so paired McNemar against Exp K stays valid), then
+re-runs the K-suite on the SAME seed=1 eval items with the new calibration.
+
+**Setup:**
+- New cal split: `split_seed1_cal100_for_existing_eval.json` — 100
+  stratified items (25/bucket) sampled with rng seed=1009 from items NOT
+  in the existing seed=1 eval-200. Disjointness verified.
+- New calibration NPZ: `expJ_kcalib_Qwen2.5-VL-7B-Instruct_frames128_seed1cal.npz`,
+  802 sec wall (13 min). Outlier-index overlap with generic top-16: TT
+  10.6/16 (66%), TT+TV 11.3/16 (71%) — same shape as seed=0-derived calib.
+- Stage 3: same 12 K-suite conditions, same seed=1 eval-200 items, 2h 59min
+  wall on contested GPU (wsjang 43 GB co-tenant).
+
+### Side-by-side: Exp K (seed=0 cal) vs Exp L (seed=1 cal), seed=1 eval n=200
+
+| Condition | Exp K seed=0-cal | Exp L seed=1-cal | Δ | KV bits |
+|---|---:|---:|---:|---:|
+| K0 BF16 | 0.615 | 0.615 | 0.0 | 16.0 |
+| K1 F4 | 0.570 | 0.570 | 0.0 | 4.0 |
+| **K2 F9 BF16 side** | **0.595** | **0.615** | **+2.0** | 4.75 |
+| K3 F9 INT8 side | 0.605 | 0.600 | −0.5 | 4.25 |
+| K4 F8 generic | 0.570 | 0.575 | +0.5 | 4.375 |
+| K5 Random8 | 0.590 | 0.585 | −0.5 | 4.375 |
+| **K6 Balanced 2/block (J7)** | **0.560** | **0.575** | **+1.5** | 4.375 |
+| K7 Balanced+INT8 | 0.580 | 0.575 | −0.5 | 4.125 |
+| K8 Balanced 1/block | 0.585 | 0.595 | +1.0 | 4.19 |
+| **K9 Balanced 3/block** | **0.590** | **0.630** | **+4.0** | 4.56 |
+| K10 Bal-Random | 0.570 | 0.565 | −0.5 | 4.375 |
+| K11 Pivot top-8 | 0.600 | 0.610 | +1.0 | 4.375 |
+
+### Stage 3 paired McNemar (seed=1 calibration)
+
+| label | a vs b | acc(a) | acc(b) | a_only | b_only | χ² |
+|---|---|---:|---:|---:|---:|---:|
+| **top3pb_vs_top2pb** | K9 vs K6 | 0.630 | 0.575 | 13 | 2 | **8.07 — significant p≈0.0045** |
+| K6_vs_F9 | K6 vs K2 | 0.575 | 0.615 | 6 | 14 | 3.20 — F9 trends ahead |
+| pivot_vs_generic | K11 vs K4 | 0.610 | 0.575 | 13 | 6 | 2.58 — pivot trends |
+| K7_vs_F9_pareto | K7 vs K2 | 0.575 | 0.615 | 10 | 18 | 2.29 — F9 trends ahead |
+| f9_reproduces | K2 vs K1 | 0.615 | 0.570 | 19 | 10 | 2.79 — F9 stronger lift |
+| balanced_vs_generic | K6 vs K4 | 0.575 | 0.575 | 10 | 10 | 0.00 — exact tie |
+| balanced_vs_random | K6 vs K5 | 0.575 | 0.585 | 14 | 16 | 0.13 |
+| crossmodal_vs_balanced_random | K6 vs K10 | 0.575 | 0.565 | 18 | 16 | 0.12 |
+| f9_int8_vs_bf16 | K3 vs K2 | 0.600 | 0.615 | 3 | 6 | 1.00 |
+| balanced_int8_vs_bf16 | K7 vs K6 | 0.575 | 0.575 | 9 | 9 | 0.00 — exact tie |
+| top1pb_vs_top2pb | K8 vs K6 | 0.595 | 0.575 | 13 | 9 | 0.73 |
+
+### Findings
+
+52. **F9 (K2) is the biggest beneficiary of seed-correct calibration**:
+    +2 pp lift (0.595 → 0.615) — **matches BF16 (0.615) exactly** with
+    seed=1-derived outlier indices. F9 vs F4 paired McNemar χ²=2.79
+    (trending p≈0.10). The F9 anchor is calibration-sensitive, not
+    just split-sensitive.
+
+53. **K6 (J7 balanced top-2/block) does NOT recover to J7's seed=2 numbers.**
+    With seed=1 calibration K6 = 0.575, ties K4 generic (0.575, χ²=0).
+    Slight improvement from Exp K's 0.560 (+1.5 pp from calibration
+    correction), but still nowhere near J7's seed=2 value (0.725). The
+    cross-modal-balance mechanism does NOT replicate, even with correct
+    calibration. The seed=2 J7 win was the split, not the calibration.
+
+54. **K9 (Balanced top-3/block at 4.56 KV bits) is the NEW standout result.**
+    Jumps from 0.590 to **0.630** with seed=1 calibration — matching
+    BF16 (0.615) within CI and beating K6 (top-2/block) by +5.5 pp paired
+    **McNemar χ²=8.07 (p≈0.0045) — significant.** This is the only
+    significant paired test in Exp L.
+
+55. **K9 > K2 F9 numerically** (0.630 vs 0.615) but paired test is NS
+    (n=200 not enough). K9 at 4.56 KV bits vs F9 at 4.75 KV bits: 4%
+    less memory, +1.5 pp acc directional. This is a candidate Pareto
+    improvement that needs another seed to confirm.
+
+56. **K11 Pivot top-8 keeps trending** over generic at +3.5 pp (χ²=2.58,
+    p≈0.11). Direction stable across calibrations and seeds; effect
+    size hovering at the n=200 power threshold.
+
+57. **K3 (F9 INT8 sidecode) lost its Pareto-tie with K2 F9 BF16 sidecode**:
+    0.600 vs 0.615 at 4.25 vs 4.75 bits. Paired McNemar 3/6 swaps,
+    χ²=1.0 NS. Drops the clean engineering Pareto win story. With
+    seed=1 calibration, INT8 sidecode trades 1.5 pp acc for 0.5 KV bits
+    less. Still a viable Pareto point but not a free win.
+
+58. **K10 (balanced-random by channel-position) STILL ties K6** (0.565
+    vs 0.575, χ²=0.12). Cross-modal scoring and balance-without-scoring
+    are still indistinguishable on seed=1, even with correct calibration.
+
+### Interpretation
+
+The J7 retraction from Exp K stands, but the picture is more nuanced:
+- **The J7 (top-2/block) result is dead** — calibration was not the issue,
+  the mechanism truly doesn't generalize.
+- **But the balanced FAMILY has signal at larger budgets**: K9 (top-3/block,
+  12 BF16 outlier channels, 4.56 KV bits) is the only Exp L condition
+  with a significantly different accuracy from any anchor. It beats
+  Balanced top-2/block by +5.5 pp paired χ²=8.07, and matches BF16
+  numerically.
+- **Calibration source matters more than expected** — F9 gained +2 pp
+  with seed=correct calibration. This is a real caveat for cross-seed
+  comparisons in the previous experiments (F, G, H, I, J, K).
+
+### The new candidate Pareto frontier (seed=1 n=200, with seed=1 calibration)
+
+| Rank | Cond | acc | KV bits | rel mem | Note |
+|---|---|---:|---:|---:|---|
+| 1 | **K9 Balanced 3/block** | **0.630** | 4.56 | 0.570× | matches BF16, beats K6 sig. |
+| 2 | K0 BF16 | 0.615 | 16.0 | 2.00× | ceiling |
+| 2 | K2 F9 BF16 side | 0.615 | 4.75 | 0.594× | = BF16 |
+| 4 | K11 Pivot top-8 | 0.610 | 4.375 | 0.547× | trends over generic |
+| 5 | K3 F9 INT8 side | 0.600 | 4.25 | 0.531× | -1.5pp from K2, lower bits |
+| 6 | K8 Balanced 1/block | 0.595 | 4.19 | 0.523× | |
+| 7 | K5 Random8 | 0.585 | 4.375 | 0.547× | random outperforms generic |
+| 8 | K4 F8 / K6 Bal 2/block / K7 Bal+INT8 | 0.575 | 4.13–4.375 | 0.516–0.547× | |
+| 11 | K1 F4 / K10 Bal-Random | 0.565–0.570 | 4.0–4.375 | 0.500–0.547× | |
+
+### What this means for the research direction
+
+- **The deployable result on seed=1 is now K9** (Balanced top-3/block at
+  4.56 KV bits, matches BF16, paired-significant vs K6). This is a
+  candidate paper finding but needs seed=0 or seed=2 confirmation.
+- **F9 with seed=correct calibration matches BF16 exactly on seed=1.**
+  The F9 anchor is the most robust 4.75-bit result across all
+  experiments now.
+- **The K3 J12-replication is weaker than the Exp K reading suggested.**
+  With seed=correct calibration, INT8 sidecode trades 1.5 pp for 0.5
+  KV bits. Still useful but not a free Pareto win.
+- **The original J7 (top-2/block) finding is fully retracted.** Even
+  with correct seed=1 calibration, K6 matches generic exactly (χ²=0).
+  The seed=2 result was split-specific noise that survived random and
+  generic controls there but not on seed=1.
+
+### Layout
+
+```
+qwen/scripts/
+  make_seed1_cal_split.py      # generates cal split disjoint from existing eval
+  run_expL_overnight.sh        # 4-phase orchestrator
+qwen/calibration/
+  split_seed1_cal100_for_existing_eval.json
+  expJ_kcalib_Qwen2.5-VL-7B-Instruct_frames128_seed1cal.{json,npz}
+qwen/results/
+  expL_seed1_recalib_stage3.jsonl       # 2400 rows
+  expL_summary_seed1_recalib.md
+  expL_paired_seed1_recalib.md
+  expL_verdict_matrix_seed1_recalib.md
+  expL_overnight.progress.log
+```
+
+### Pipeline status (Exp L)
+
+```
+qwen-expL seed=1 recalib — COMPLETE
+├── ✅ Phase 1: generated seed=1 cal-100 split (disjoint from eval-200)
+├── ✅ Phase 2: cross-modal calibration on seed=1 cal-100 (13 min wall)
+├── ✅ Phase 3: Stage 3 on seed=1 eval-200 with seed=1 calib (2:59 wall)
+└── ✅ Phase 4: analyze — K9 paper-significant; J7 retraction confirmed;
+                F9-INT8 weaker than initial K reading
+```
+
+Total Exp L wall: 3:13 (cal split + calibration + Stage 3 + analyze).
+Total compute: 2400 forward passes + 100 cal items.
 
 

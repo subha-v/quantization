@@ -1,0 +1,16 @@
+{
+  "model": "Qwen/Qwen2.5-VL-7B-Instruct",
+  "frames": 128,
+  "n_cal_items": 100,
+  "n_done": 100,
+  "n_failed": 0,
+  "num_layers": 28,
+  "num_kv_heads": 4,
+  "head_dim": 128,
+  "max_q_per_item": 256,
+  "k_outlier_n_top": 16,
+  "captured_at": "2026-05-11T22:59:10",
+  "wall_seconds": 802,
+  "outlier_overlap_TT_vs_generic_mean": 10.625,
+  "outlier_overlap_TT_TV_vs_generic_mean": 11.321428571428571
+}
