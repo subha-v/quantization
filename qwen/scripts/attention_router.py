@@ -158,10 +158,13 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
 
     def patched(query, key, value, attn_mask=None, dropout_p=0.0,
                 is_causal=False, scale=None, **kwargs):
-        layout = cache.page_layout
-        env = cache.most_recent_envelope
-        layer_idx = cache.most_recent_layer_idx
-        # No layout / no envelope yet (very first layer): fall through.
+        # Use getattr defaults so a non-page-aware cache (e.g. plain
+        # FakeQuantKVCache for P1) or pre-LLM-layer SDPA calls (e.g. vision
+        # encoder, which fires before any language-model decoder layer has set
+        # `most_recent_envelope`) cleanly pass through.
+        layout = getattr(cache, "page_layout", None)
+        env = getattr(cache, "most_recent_envelope", None)
+        layer_idx = getattr(cache, "most_recent_layer_idx", None)
         if layout is None or env is None or policy.name == "none":
             return original_sdpa(query, key, value, attn_mask=attn_mask,
                                  dropout_p=dropout_p, is_causal=is_causal,
