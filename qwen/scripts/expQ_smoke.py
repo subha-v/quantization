@@ -1,0 +1,470 @@
+"""Exp Q smoke: pre-flight wiring checks for FormatBook v2 conditions.
+
+Runs a small (n=3) sweep of Q0..Q11 + the smoke-only Q_allhot sanity on the
+shortest MM-NIAH retrieval-image items, then asserts every load-bearing
+invariant before approving the full overnight launch.
+
+Assertions (in addition to standard P-style A-E checks):
+
+  F. RoleOnly zero hot — Q3 (formatbook_role_only) keeps zero in-context pages
+     hot per layer; cold set equals all routable pages.
+
+  G. All-hot matches F9 dense — Q_allhot (formatbook_all_hot, budget=1.0)
+     first-token logits match Q2 (F9 dense) within 1e-4 L2 over A-D positions.
+     Catches bugs in page-format dispatch.
+
+  H. INT2 cold is harsher than F4 cold — `_int2_per_channel_seq` introduces
+     strictly larger reconstruction error than `_f4_per_channel_seq` on the
+     same K tensor (because INT2's grid {-s, 0, +s} is coarser than INT4's).
+
+  I. Effective-bit math — `effective_k_bits` matches the analytical reference:
+     Q0 (BF16) = 16.0, Q1 (F4) = 4.0, Q2 (F9) = 5.50, Q3 (RoleOnly) between
+     4.0 and 5.50 (token-weighted mix of cold F4 in-context vs always-on F9
+     text+choice).
+
+Writes `qwen/results/expQ_smoke.md` and exits non-zero on failure.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import sys
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import torch
+
+from attention_router import (
+    RoutePolicy, _f4_per_channel_seq, _int2_per_channel_seq,
+    page_routing_sdpa_context,
+)
+from fake_quant_kv_cache import BitController, FakeQuantKVCache
+from k_quantizers import build_f_conditions
+from mm_niah_loader import (
+    MMNiahItem, answer_token_ids, format_mcq_messages, load_all_items,
+)
+from page_envelope_cache import PageAwareFakeQuantKVCache
+from page_layout import build_page_layout, coverage_ok, page_summary
+from run_inference import load_model
+
+import expQ_driver
+from expQ_driver import (
+    CondSpec, HOT, F4, PAGE_K_BITS, V_BITS,
+    q_conditions_slice_a, q_conditions_smoke_only,
+    _compute_bit_metrics, resolve_k_cfg, num_layers_and_kv_heads,
+)
+
+
+SCRIPTS_DIR = Path(__file__).resolve().parent
+CALIBRATION_DIR = SCRIPTS_DIR.parent / "calibration"
+RESULTS_DIR = SCRIPTS_DIR.parent / "results"
+
+
+# ---------------- single-item forward (mirror of expP_smoke.forward_with_resolved) ----------------
+
+@torch.no_grad()
+def forward_with_resolved(model, processor, item: MMNiahItem, cond: CondSpec,
+                          k_cfg_obj, num_layers: int, num_kv_heads: int,
+                          answer_ids: list[int],
+                          max_pixels_context: int,
+                          max_pixels_choices: int,
+                          return_layout: bool = False) -> dict:
+    messages = format_mcq_messages(item, max_pixels_context=max_pixels_context,
+                                   max_pixels_choices=max_pixels_choices)
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    from qwen_vl_utils import process_vision_info  # type: ignore
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                       padding=True, return_tensors="pt").to(model.device)
+    input_ids = inputs["input_ids"]
+    seq_len = int(input_ids.shape[1])
+
+    layout = None
+    cache = None
+    if k_cfg_obj is not None or cond.use_page_cache:
+        controller = BitController(num_layers=num_layers, num_kv_heads=num_kv_heads,
+                                   mode="V1", default_k_bits=4, default_v_bits=4)
+        if cond.use_page_cache:
+            layout = build_page_layout(
+                input_ids, processor,
+                n_in_context_images=item.num_images,
+                n_choice_images=4,
+                needle_idx_in_images=item.needle_idx_in_images,
+            )
+            cache = PageAwareFakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
+            rng_seed = (abs(hash(f"{item.id}:{cond.name}")) % (2**31)) ^ 0xCAFEBABE
+            cache.set_page_layout(layout, rng_seed=rng_seed)
+        else:
+            cache = FakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
+
+    t0 = time.perf_counter()
+    if cache is not None and cond.route.name != "none":
+        with page_routing_sdpa_context(cache, cond.route):
+            out = model.generate(**inputs, past_key_values=cache, max_new_tokens=1,
+                                 do_sample=False, return_dict_in_generate=True,
+                                 output_scores=True, use_cache=True)
+    elif cache is not None:
+        with page_routing_sdpa_context(cache, RoutePolicy("none")):
+            out = model.generate(**inputs, past_key_values=cache, max_new_tokens=1,
+                                 do_sample=False, return_dict_in_generate=True,
+                                 output_scores=True, use_cache=True)
+    else:
+        out = model.generate(**inputs, max_new_tokens=1, do_sample=False,
+                             return_dict_in_generate=True, output_scores=True,
+                             use_cache=True)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    first_logits = out.scores[0]
+    logprobs = torch.log_softmax(first_logits.float(), dim=-1)[0, answer_ids].tolist()
+    pred = int(max(range(len(answer_ids)), key=lambda i: logprobs[i]))
+
+    result = {
+        "condition": cond.name,
+        "item_id": item.id,
+        "seq_len": seq_len,
+        "latency_ms": latency_ms,
+        "first_logits_AD": first_logits[0, answer_ids].float().cpu().tolist(),
+        "logprobs": logprobs,
+        "pred": pred,
+        "correct": item.correct_choice,
+        "is_correct": (pred == item.correct_choice),
+    }
+    if layout is not None:
+        result["layout"] = {
+            "n_pages": layout.n_pages,
+            "n_in_context": layout.n_in_context_images,
+            "n_choice": layout.n_choice_images,
+            "needle_page_idx": layout.needle_page_idx,
+            "coverage_ok": coverage_ok(layout),
+            "_warnings": layout._warnings,
+        }
+        if return_layout:
+            result["_layout_summary"] = page_summary(layout)
+    if cache is not None and cond.use_page_cache and isinstance(cache, PageAwareFakeQuantKVCache):
+        env_shapes = {l: tuple(e.shape) for l, e in cache.envelopes.items()}
+        result["envelope_layer_count"] = len(cache.envelopes)
+        result["envelope_shape"] = next(iter(env_shapes.values())) if env_shapes else None
+        for l, e in cache.envelopes.items():
+            if not (e[..., 0] <= e[..., 1]).all().item():
+                result.setdefault("envelope_errors", []).append(l)
+        if cache.routing_log:
+            n_logged = len(cache.routing_log)
+            sample_layer = next(iter(cache.routing_log))
+            sample = cache.routing_log[sample_layer]
+            result["routing_log"] = {
+                "n_layers_logged": n_logged,
+                "sample_layer": sample_layer,
+                "sample_active": len(sample.get("active_routable_pages", [])),
+                "sample_cold": len(sample.get("cold_routable_pages", [])),
+                "sample_needle_in_active": sample.get("needle_in_active"),
+                "sample_needle_rank": sample.get("needle_rank"),
+            }
+            # Full per-layer hot/cold partitions for assertion F.
+            result["all_active_per_layer"] = [
+                list(v.get("active_routable_pages", [])) for v in cache.routing_log.values()
+            ]
+            result["all_cold_per_layer"] = [
+                list(v.get("cold_routable_pages", [])) for v in cache.routing_log.values()
+            ]
+            hits = [v.get("needle_in_active") for v in cache.routing_log.values()]
+            result["routing_needle_hit_per_layer"] = hits
+        # Per-page bit metrics (for assertion I).
+        bits = _compute_bit_metrics(layout, cache, cond)
+        result.update(bits)
+    elif layout is None and not cond.use_page_cache:
+        # Dense path bit metrics.
+        k_bits = expQ_driver._page_k_bits_dense(cond.k_cfg_name)
+        result["effective_k_bits"] = float(k_bits)
+        result["effective_kv_bits"] = float((k_bits + V_BITS) / 2.0)
+    return result
+
+
+def _l2(a, b):
+    a = np.array(a, dtype=np.float64)
+    b = np.array(b, dtype=np.float64)
+    return float(np.linalg.norm(a - b))
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
+    ap.add_argument("--n-items", type=int, default=3)
+    ap.add_argument("--bucket", default="short",
+                    help="MM-NIAH context-length bucket: short / mid / long.")
+    ap.add_argument("--calib-npz", type=Path,
+                    default=CALIBRATION_DIR / "expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz")
+    ap.add_argument("--task", default="retrieval-image")
+    ap.add_argument("--out", type=Path, default=RESULTS_DIR / "expQ_smoke.md")
+    ap.add_argument("--out-jsonl", type=Path, default=RESULTS_DIR / "expQ_smoke.jsonl")
+    ap.add_argument("--max-pixels-context", type=int, default=336 * 336)
+    ap.add_argument("--max-pixels-choices", type=int, default=336 * 336)
+    ap.add_argument("--gpu", type=int, default=0)
+    args = ap.parse_args()
+
+    os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+    args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
+    log_lines: list[str] = []
+    def log(msg):
+        print(msg, flush=True)
+        log_lines.append(msg)
+
+    log(f"# Exp Q smoke — {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    log(f"\nargs: {vars(args)}\n")
+
+    # 1. Load items
+    log("## Loading MM-NIAH items")
+    items = load_all_items(task=args.task)
+    log(f"total items loaded: {len(items)}")
+    by_bucket: dict[str, list[MMNiahItem]] = {}
+    for it in items:
+        by_bucket.setdefault(it.context_length_bucket, []).append(it)
+    log(f"by bucket: { {k: len(v) for k, v in by_bucket.items()} }")
+    pool = by_bucket.get(args.bucket, [])
+    if len(pool) < args.n_items:
+        log(f"WARN: bucket {args.bucket!r} has only {len(pool)} items")
+    smoke_items = pool[:args.n_items]
+    log(f"selected {len(smoke_items)} smoke items from bucket={args.bucket}")
+    for it in smoke_items:
+        log(f"  id={it.id} n_imgs={it.num_images} ctx_len={it.context_length} "
+            f"needle_idx={it.needle_idx_in_images} placed_depth={it.placed_depth:.2f}")
+
+    # 2. Calibration
+    log(f"\n## Loading calibration NPZ {args.calib_npz}")
+    if not args.calib_npz.exists():
+        log(f"FATAL: calibration NPZ not found at {args.calib_npz}")
+        sys.exit(2)
+    calib_arrays = np.load(args.calib_npz)
+    calib = {k: calib_arrays[k] for k in calib_arrays.files}
+    log(f"calib keys: {sorted(calib.keys())[:10]}... ({len(calib)} total)")
+
+    # 3. Model
+    log(f"\n## Loading model {args.model}")
+    model, processor = load_model(args.model, dtype="bfloat16", attn_impl="sdpa",
+                                  device_map="auto")
+    num_layers, num_kv_heads = num_layers_and_kv_heads(model)
+    log(f"model loaded: num_layers={num_layers} num_kv_heads={num_kv_heads}")
+    answer_ids = answer_token_ids(processor, n=4)
+    log(f"answer_token_ids (A,B,C,D): {answer_ids}")
+
+    # 4. Build conditions for smoke: Q0..Q9 (skip Q10/Q11 for fast smoke) + Q_allhot
+    primary = q_conditions_slice_a(include_int2=False)
+    # Add Q10 only (skip Q11 for smoke brevity) so assertion H has a real INT2 path.
+    primary.append(CondSpec("Q10", HOT,
+                            RoutePolicy("formatbook_quest", 0.25, cold_quantizer="int2"),
+                            True))
+    primary.extend(q_conditions_smoke_only())
+    cond_to_kcfg = {c.name: resolve_k_cfg(c.k_cfg_name, calib) if c.k_cfg_name else None
+                    for c in primary}
+
+    log(f"\n## Running {len(primary)} conditions on {len(smoke_items)} items")
+    results: list[dict] = []
+    with open(args.out_jsonl, "w") as fjsonl:
+        for cond in primary:
+            for it in smoke_items:
+                r = forward_with_resolved(
+                    model, processor, it, cond,
+                    k_cfg_obj=cond_to_kcfg[cond.name],
+                    num_layers=num_layers, num_kv_heads=num_kv_heads,
+                    answer_ids=answer_ids,
+                    max_pixels_context=args.max_pixels_context,
+                    max_pixels_choices=args.max_pixels_choices,
+                    return_layout=(it is smoke_items[0] and cond.name == "Q2"),
+                )
+                r_jsonl = {k: v for k, v in r.items() if k != "_layout_summary"}
+                fjsonl.write(json.dumps(r_jsonl) + "\n")
+                fjsonl.flush()
+                results.append(r)
+                ekvb = r.get("effective_kv_bits")
+                ekvb_str = f"{ekvb:.2f}" if ekvb is not None else "—"
+                log(f"  [{cond.name}] id={it.id} seq_len={r['seq_len']} pred={r['pred']} "
+                    f"correct={r['correct']} kv_bits={ekvb_str} "
+                    f"logprobs={[f'{x:.3f}' for x in r['logprobs']]} "
+                    f"latency_ms={r['latency_ms']:.0f}")
+                if "_layout_summary" in r:
+                    log("    " + r["_layout_summary"].replace("\n", "\n    "))
+
+    # 5. Assertions
+    log("\n## Assertions")
+    by_cond: dict[str, dict[str, dict]] = {}
+    for r in results:
+        by_cond.setdefault(r["condition"], {})[r["item_id"]] = r
+
+    n_pass, n_fail = 0, 0
+    def check(name, ok, detail=""):
+        nonlocal n_pass, n_fail
+        if ok:
+            log(f"  [PASS] {name} {detail}")
+            n_pass += 1
+        else:
+            log(f"  [FAIL] {name} {detail}")
+            n_fail += 1
+
+    # A. Coverage
+    for it in smoke_items:
+        for cond in ("Q2", "Q3", "Q4", "Q5", "Q6", "Q7", "Q8", "Q9", "Q10", "Q_allhot"):
+            r = by_cond.get(cond, {}).get(it.id, {})
+            cov = r.get("layout", {}).get("coverage_ok")
+            check(f"A.coverage {cond} item={it.id}", cov is True, f"coverage_ok={cov}")
+
+    # B. Envelope shape + ordering
+    for it in smoke_items:
+        for cond in ("Q2", "Q3", "Q4", "Q7", "Q10"):
+            r = by_cond.get(cond, {}).get(it.id, {})
+            errs = r.get("envelope_errors", [])
+            n_layers_seen = r.get("envelope_layer_count", 0)
+            check(f"B.envelope {cond} item={it.id}",
+                  not errs and n_layers_seen == num_layers,
+                  f"errors={errs} n_layers_seen={n_layers_seen}")
+
+    # C. Layer sync — routing_log size == num_layers for routed conditions
+    for it in smoke_items:
+        for cond in ("Q3", "Q4", "Q7", "Q10", "Q_allhot"):
+            r = by_cond.get(cond, {}).get(it.id, {})
+            rl = r.get("routing_log", {})
+            check(f"C.layer_sync {cond} item={it.id}",
+                  rl.get("n_layers_logged") == num_layers,
+                  f"logged={rl.get('n_layers_logged')} expected={num_layers}")
+
+    # D. Mask affects logits — Q4 vs Q0 (FormatBook K downgrade should perturb)
+    for it in smoke_items:
+        q0 = by_cond.get("Q0", {}).get(it.id, {})
+        q4 = by_cond.get("Q4", {}).get(it.id, {})
+        d = _l2(q0.get("first_logits_AD", [0]*4), q4.get("first_logits_AD", [0]*4))
+        check(f"D.mask_affects_logits item={it.id}", d > 1e-3,
+              f"||Q4-Q0||_2 over A-D = {d:.6f}")
+
+    # E. Pass-through — PageAware cache + route='none' (Q2 setup) matches BF16 Q0
+    # only insofar as F9 is near-lossless; we check the dedicated BF16 wrapper path
+    # like Exp P did.
+    log("\n## E. Cooperative pass-through (PageAware cache + route='none' vs BF16 Q0)")
+    for it in smoke_items:
+        cache = PageAwareFakeQuantKVCache(
+            BitController(num_layers=num_layers, num_kv_heads=num_kv_heads,
+                          mode="V1", default_k_bits=16, default_v_bits=16),
+            k_quantizer_config=None,
+        )
+        from qwen_vl_utils import process_vision_info  # type: ignore
+        messages = format_mcq_messages(it, max_pixels_context=args.max_pixels_context,
+                                       max_pixels_choices=args.max_pixels_choices)
+        text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        image_inputs, video_inputs = process_vision_info(messages)
+        inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                           padding=True, return_tensors="pt").to(model.device)
+        layout = build_page_layout(inputs["input_ids"], processor,
+                                   n_in_context_images=it.num_images,
+                                   n_choice_images=4,
+                                   needle_idx_in_images=it.needle_idx_in_images)
+        rng_seed = (abs(hash(it.id)) % (2**31)) ^ 0xCAFEBABE
+        cache.set_page_layout(layout, rng_seed=rng_seed)
+        with page_routing_sdpa_context(cache, RoutePolicy("none")):
+            out = model.generate(**inputs, past_key_values=cache, max_new_tokens=1,
+                                 do_sample=False, return_dict_in_generate=True,
+                                 output_scores=True, use_cache=True)
+        ad = out.scores[0][0, answer_ids].float().cpu().tolist()
+        q0 = by_cond.get("Q0", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+        d = _l2(q0, ad)
+        check(f"E.passthrough item={it.id}", d < 1e-3,
+              f"||wrapper_BF16 - Q0||_2 = {d:.6f}")
+        del cache
+
+    # F. RoleOnly zero hot — Q3
+    log("\n## F. RoleOnly zero hot (Q3)")
+    for it in smoke_items:
+        r = by_cond.get("Q3", {}).get(it.id, {})
+        actives = r.get("all_active_per_layer", [])
+        colds = r.get("all_cold_per_layer", [])
+        # Every layer's active routable list must be empty.
+        all_empty = bool(actives) and all(len(a) == 0 for a in actives)
+        # Every layer's cold list must equal the full routable set (same for all layers).
+        cold_sizes = {tuple(sorted(c)) for c in colds} if colds else set()
+        layout = r.get("layout", {})
+        n_in_ctx = layout.get("n_in_context", 0)
+        # Cold count per layer should match the routable count (= n_in_ctx).
+        cold_correct = all(len(c) == n_in_ctx for c in colds)
+        # No needle should be active in any layer.
+        hits = r.get("routing_needle_hit_per_layer", [])
+        no_hit = bool(hits) and not any(h for h in hits)
+        check(f"F.role_only_zero_hot item={it.id}",
+              all_empty and cold_correct and no_hit,
+              f"all_active_empty={all_empty} cold_size_match={cold_correct} "
+              f"no_needle_hit={no_hit} n_routable={n_in_ctx} layers_with_unique_cold={len(cold_sizes)}")
+
+    # G. All-hot matches F9 dense — Q_allhot vs Q2 logits within 1e-4
+    log("\n## G. All-hot matches F9 dense (Q_allhot vs Q2)")
+    for it in smoke_items:
+        q2 = by_cond.get("Q2", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+        qa = by_cond.get("Q_allhot", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+        d = _l2(q2, qa)
+        check(f"G.allhot_matches_F9_dense item={it.id}", d < 1e-4,
+              f"||Q_allhot - Q2||_2 over A-D = {d:.6e}")
+
+    # H. INT2 cold is harsher than F4 cold
+    log("\n## H. INT2 cold > F4 cold reconstruction error")
+    # Synthesize a representative K tensor (random BF16, plausible scale).
+    rng = np.random.default_rng(123)
+    K_np = rng.standard_normal(size=(1, 4, 256, 128)).astype(np.float32)
+    K = torch.from_numpy(K_np).to(torch.bfloat16)
+    K_f4 = _f4_per_channel_seq(K)
+    K_int2 = _int2_per_channel_seq(K)
+    err_f4 = (K.float() - K_f4.float()).abs().mean().item()
+    err_int2 = (K.float() - K_int2.float()).abs().mean().item()
+    check("H.int2_cold_smaller",
+          err_int2 > err_f4 * 1.5,
+          f"mean |K - K_int2|={err_int2:.4f} vs mean |K - K_f4|={err_f4:.4f}")
+
+    # I. Effective-bit math
+    log("\n## I. Effective-bit math sanity")
+    # Q0 BF16 dense: K-bits == 16.0
+    for it in smoke_items:
+        q0 = by_cond.get("Q0", {}).get(it.id, {})
+        k_bits = q0.get("effective_k_bits")
+        check(f"I.bits_Q0_BF16 item={it.id}", k_bits == 16.0, f"k_bits={k_bits}")
+    # Q1 F4 dense: K-bits == 4.0
+    for it in smoke_items:
+        q1 = by_cond.get("Q1", {}).get(it.id, {})
+        k_bits = q1.get("effective_k_bits")
+        check(f"I.bits_Q1_F4 item={it.id}", k_bits == 4.0, f"k_bits={k_bits}")
+    # Q2 F9 dense: K-bits == 5.50
+    for it in smoke_items:
+        q2 = by_cond.get("Q2", {}).get(it.id, {})
+        k_bits = q2.get("effective_k_bits")
+        check(f"I.bits_Q2_F9 item={it.id}", abs(k_bits - 5.50) < 1e-3, f"k_bits={k_bits}")
+    # Q3 RoleOnly: K-bits in (4.0, 5.50). Token-weighted mix of F4 in-context vs F9 always-on.
+    for it in smoke_items:
+        q3 = by_cond.get("Q3", {}).get(it.id, {})
+        k_bits = q3.get("effective_k_bits")
+        ok = (k_bits is not None and 4.0 < k_bits < 5.50)
+        check(f"I.bits_Q3_RoleOnly_range item={it.id}", ok, f"k_bits={k_bits}")
+    # Q7 Quest top-25 FormatBook: K-bits between 4.0 and 5.50
+    for it in smoke_items:
+        q7 = by_cond.get("Q7", {}).get(it.id, {})
+        k_bits = q7.get("effective_k_bits")
+        ok = (k_bits is not None and 4.0 <= k_bits <= 5.50)
+        check(f"I.bits_Q7_top25_FB_range item={it.id}", ok, f"k_bits={k_bits}")
+    # Q10 INT2-cold top-25 Quest: K-bits between 2.0 and 5.50
+    for it in smoke_items:
+        q10 = by_cond.get("Q10", {}).get(it.id, {})
+        k_bits = q10.get("effective_k_bits")
+        ok = (k_bits is not None and 2.0 <= k_bits <= 5.50)
+        check(f"I.bits_Q10_INT2cold_range item={it.id}", ok, f"k_bits={k_bits}")
+
+    log(f"\n## SUMMARY")
+    log(f"PASS: {n_pass}")
+    log(f"FAIL: {n_fail}")
+
+    args.out.write_text("\n".join(log_lines) + "\n")
+    log(f"\nwrote {args.out}")
+
+    if n_fail > 0:
+        sys.exit(3)
+    sys.exit(0)
+
+
+if __name__ == "__main__":
+    main()

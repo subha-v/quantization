@@ -107,6 +107,24 @@ def fake_quantize_kv(x: torch.Tensor, bits: BitsLike, group_size: int = 128) -> 
     return _int_n_per_position(x, bits_t, group_size=group_size)
 
 
+def _v_per_channel_seq_quantize(V: torch.Tensor, bits: int = 4) -> torch.Tensor:
+    """Exp I VidKV-style V quant: per-(B, H_kv, 1, D) channel-axis scale.
+
+    Unlike the default `fake_quantize_kv` (which groups along head_dim for
+    INT-N), this computes max-abs along the time axis per channel d (per
+    (B, H_kv, channel)) and quantizes each channel with its own scale. This
+    is the V-side analog of KIVI's K per-channel-seq scaling. Bits per
+    element are unchanged (INT4); only the scale-grouping axis differs.
+
+    V: [B, H_kv, T, D] -> returns same shape and dtype.
+    """
+    qmax = float(2 ** (bits - 1) - 1)
+    amax = V.abs().float().amax(dim=-2, keepdim=True)  # [B, H_kv, 1, D]
+    s = amax.clamp_min(1e-8) / qmax
+    q = (V.float() / s).round().clamp(-qmax, qmax) * s
+    return q.to(V.dtype)
+
+
 # ===================================================================
 # Bit controller
 # ===================================================================
@@ -196,12 +214,33 @@ class FakeQuantKVCache(DynamicCache):
 
     Returns the (quantized) concatenated cache so Qwen2.5-VL's SDPA forward
     sees quantized K/V at the attention matmul (verified by smoke test).
+
+    For F-suite K-quantizer screening: pass `k_quantizer_config` (a
+    KQuantizerConfig from k_quantizers.py) and the K path is routed through
+    `apply_k_quantizer(key_states, cfg, layer_idx, slice_info=...)`. V path
+    continues to use the BitController-driven `fake_quantize_kv`.
+
+    `slice_info` (visual span + role spans, in absolute prefill coordinates)
+    must be set once per item before generate() via `set_slice_info(...)` if
+    F5/F6/F11/F12/F13 are used.
     """
 
-    def __init__(self, controller: BitController):
+    def __init__(self, controller: BitController, k_quantizer_config=None):
         super().__init__()
         self.controller = controller
         self.entropy_log: list[list[torch.Tensor]] = [[] for _ in range(controller.num_layers)]
+        # F-suite plumbing.
+        self.k_cfg = k_quantizer_config
+        self._slice_info: Optional[dict] = None
+
+    def set_slice_info(self, slice_info: Optional[dict]) -> None:
+        """F-suite: stash per-item role/modality info for the K quantizer.
+
+        slice_info should be a dict with at least:
+          v_start, v_end, seq_len, role_spans (dict[str -> (a, b)]),
+          text_positions (list[int]), visual_positions (list[int]).
+        """
+        self._slice_info = slice_info
 
     def update(
         self,
@@ -216,8 +255,20 @@ class FakeQuantKVCache(DynamicCache):
         kb, vb = self.controller.get_kv_bits_for_chunk(
             layer_idx, new_chunk_len, num_kv_heads, cache_offset
         )
-        key_q = fake_quantize_kv(key_states, kb)
-        val_q = fake_quantize_kv(value_states, vb)
+        if self.k_cfg is not None:
+            from k_quantizers import apply_k_quantizer  # local import to avoid cycles
+            key_q = apply_k_quantizer(
+                key_states, self.k_cfg, layer_idx,
+                slice_info=self._slice_info, cache_offset=cache_offset,
+            )
+        else:
+            key_q = fake_quantize_kv(key_states, kb)
+        # Exp I: VidKV-style V per-channel along time axis (axis differs from
+        # default per-channel-along-head_dim INT4; bits unchanged).
+        if self.k_cfg is not None and getattr(self.k_cfg, "v_per_channel_seq", False):
+            val_q = _v_per_channel_seq_quantize(value_states, bits=4)
+        else:
+            val_q = fake_quantize_kv(value_states, vb)
         return super().update(key_q, val_q, layer_idx, cache_kwargs)
 
     def record_entropy(self, layer_idx: int, entropy_per_head: torch.Tensor) -> None:

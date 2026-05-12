@@ -387,6 +387,236 @@ Static late-layer W2 demotion does not collapse on standard LIBERO Long at n=20 
 
 Pilot output: `results/expB_w4__static_pilot_n20_{rollouts.jsonl,summary.md}`. Phase 2 (full 8-condition sweep) pending GPU availability on tambe-server-1.
 
+## Qwen2.5-VL × MM-NIAH — Experiment P: Query-Adaptive Page-Format Routing (VLM-FormatBook diagnostic, 2026-05-12)
+
+After the static-KV story for Qwen2.5-VL × LongVideoBench MCQ was effectively exhausted (F4 deployable, F9 zero-loss, J12 engineering Pareto; J7 retracted, K9 trending), Exp P pivots from *"how many bits per element?"* to *"which pages does this query need to read at all?"* This is the Quest/PRISM-style query-adaptive page-routing direction, combined with per-page format selection (FormatBook). Structurally orthogonal to F4/F9/J12 — those decide encoding; Quest/FormatBook decides access and format-per-page.
+
+**Benchmark switch.** LongVideoBench MCQ is text-anchored on the answer query (Exps D1/E1 falsified visual-K routing), so it's the wrong stress test. P0 uses **MM-NIAH** (OpenGVLab/MM-NIAH, NeurIPS 2024) retrieval-image, which has a well-defined visual needle page that varies by query.
+
+### Primary conditions (n=200 stratified by context-length bucket)
+
+| Code | Description | Active K | Cold K | Attention | Page budget |
+|---|---|---|---|---|---|
+| P0 | BF16 baseline | BF16 | BF16 | dense | — |
+| P1 | Full F4 KIVI | F4 | F4 | dense | — (MM-NIAH F4 anchor) |
+| P2 | Full F9 (F4 + top-16 BF16 outliers) | F9 | F9 | dense | — (dense anchor, clean: BF16 sidecode) |
+| P3 | **Quest sparse** | F9 | masked (-inf) | sparse, last-Q row only | **top-25% visual + all text** |
+| P4 | **Random sparse** (seeded per item) | F9 | masked (-inf) | sparse, last-Q row only | top-25% visual + all text |
+| P5 | **Oracle sparse** (budget-matched: needle + top-(K-1) Quest) | F9 | masked (-inf) | sparse, last-Q row only | top-25% (= P3 budget, but needle forced into active) |
+| P6 | **FormatBook** (Quest-routed F9, cold F4) | F9 | F4 (per-page) | dense | top-50% visual = F9 |
+
+Stretch: P3b/P4b at top-50% budget; **P2b** = F9+INT8 sidecode (J12) dense, characterizes the INT8-sidecode confound separately so primary P2-P6 stay clean on F9/BF16-sidecode.
+
+**Note on absolute accuracy.** F9 calibration is reused from the LongVideoBench seed=0 NPZ (out-of-distribution on MM-NIAH); a follow-up should recalibrate F9 on MM-NIAH before claiming absolute accuracy numbers. Paired routing comparisons (P3 vs P4, P5 vs P3, P6 vs P2) remain valid since they share the same calibration and quantizer family. `logical_page_read_fraction` is the *implied* sparsity per the routing decision, not measured bandwidth — both sparse and FormatBook routes still run dense SDPA underneath, with cold pages masked/downgraded only at the last query row.
+
+### Key implementation details
+
+- **Prefill-not-decode masking.** With `max_new_tokens=1`, first-token logits come from the prefill forward at the last prompt position — there is *no* length-1 decode step before the scored token. The SDPA wrapper therefore patches `torch.nn.functional.scaled_dot_product_attention` *during prefill* and writes -inf only into the last query row's cold-page columns. All other query rows attend normally, preserving correct K/V values for upstream layers.
+- **Per-page envelopes captured during prefill.** Inside `PageAwareFakeQuantKVCache.update()`, after K is quantized, we compute (k_min, k_max) per (KV head, channel, page) and stash them as `most_recent_envelope` for the SDPA wrapper to read within the same layer's attention forward (no global counter).
+- **GQA aggregation.** 28 Q heads share 4 KV heads (group of 7). Quest scores are aggregated across the 7 Q-heads sharing each KV-head via sum (default; smoke test compares vs max).
+- **FormatBook downgrade.** P6 doesn't mask attention — it re-quantizes cold-page K rows in place from J12 to F4 inside the SDPA wrapper, then runs dense SDPA. Tests "noisier K for low-attention pages" vs P3's "skip the page entirely."
+
+### What's new in `qwen/scripts/`
+
+- `mm_niah_loader.py` — MM-NIAH retrieval-image loader: dataclass, stratified split by `context_length` bucket (short/mid/long), interleaved-image Qwen2.5-VL chat formatting, needle-page identification via `find-image`/`abnormal_pic` path heuristic (validated on 520/520 val records).
+- `page_layout.py` — `find_all_visual_spans` (multi-image extension of `find_visual_token_span`) + `build_page_layout` that builds the per-item page table (text + in-context-image + choice-image roles).
+- `quest_scorer.py` — per-page (k_min, k_max) envelope computation + Quest upper-bound score `sum_d max(q*k_min, q*k_max)` against the last query row + routing decision builder.
+- `page_envelope_cache.py` — `PageAwareFakeQuantKVCache(FakeQuantKVCache)`: overrides `update()` to capture envelopes and write `most_recent_envelope` / `most_recent_layer_idx` for the SDPA wrapper.
+- `attention_router.py` — `page_routing_sdpa_context` context manager: monkey-patches `F.scaled_dot_product_attention` with a wrapper that (a) writes -inf into the last query row's cold-page columns for sparse routes, or (b) re-quantizes cold-page K in place for FormatBook. Last-row trick preserves non-last K contributions for upstream layers.
+- `expP_smoke.py` — n=5 short-bucket smoke. Asserts: page coverage, envelope well-formedness, layer-index sync, **prefill-mask changes logits** (load-bearing), oracle needle-hit, cooperative pass-through.
+- `expP_driver.py` — sweep 7 primary + 2 stretch conditions on stratified n=200 MM-NIAH items. Periodic summary callback; per-item routing diagnostics.
+- `expP_analyze.py` — accuracy ± bootstrap CI, McNemar paired pairs (P1/P0, P3/P4, P5/P3, P6/P2, P6/P1), verdict matrix.
+
+### Pass/fail question
+
+> Can query-aware page selection find the visual needle page better than random, AND can FormatBook match full J12 accuracy while reading fewer J12-format pages?
+
+A pass: any of (1) Quest needle-hit > random at top-25%, (2) P3 acc > P4 acc (McNemar p<0.05), (3) P6 acc ≥ P2 acc CI at ≤50% sidecode-read, (4) P5 >> P3 ≈ P4 (benchmark has signal, scorer needs work). A clear fail: Quest needle-hit ≈ random AND P3 ≈ P4 AND P5 ≈ P3.
+
+### Running on tambe-server-1
+
+```bash
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv
+# MM-NIAH val is at /data/subha2/mm_niah/mm_niah_val/{annotations/retrieval-image.jsonl, images/}
+CUDA_VISIBLE_DEVICES=<idx> python3 qwen/scripts/expP_smoke.py --bucket short --n-items 5
+CUDA_VISIBLE_DEVICES=<idx> python3 qwen/scripts/expP_driver.py --n-items 200
+python3 qwen/scripts/expP_analyze.py  # no GPU
+```
+
+Plan: `/Users/subha/.claude/plans/look-through-the-qwen-crispy-curry.md`.
+
+## Qwen2.5-VL × MM-NIAH — Experiment Q: FormatBook v2 (staged 2026-05-12)
+
+Exp P established that Quest envelope scoring finds the needle (McNemar χ²≈36) but the win doesn't translate to accuracy under sparse masking. The one place Quest helps is **FormatBook** — when cold pages stay resident at lower precision rather than being masked. P6 FormatBook Quest (0.337) beat P6R Random (0.305) by +3.2 pp at top-50%. Two limits capped P:
+
+1. **The budget rarely binds.** Only 47/190 P eval items had `num_images ≥ 8`; for the rest, "top-25%" forces at least 1 page active out of 1–4 routable.
+2. **The image budget was too low.** `max_pixels=144²` capped P0 BF16 at 0.353; raising to 336² lifted P0 to 0.719.
+
+Exp Q answers a different question:
+> **Can FormatBook match full F9 accuracy while assigning F9 only to query-relevant visual pages, at lower effective KV bits?**
+
+### Slice A — retrieval-image multi-image (primary)
+
+Filter: `task=retrieval-image`, `num_images ≥ 8`, `context_length ≤ 32K`. Full pool (≈100–130 items). Equal-resolution context vs choices at **336² = 112,896 px** (Exp P had unequal resolutions that biased the answer signal through choice pages). Hot format = **F9 with BF16 sidecode** (not J12 — J12 was −3.1 pp on MM-NIAH).
+
+| Code | Description | Hot K | Cold K | Page budget |
+|---|---|---|---|---|
+| Q0 | BF16 dense | BF16 | BF16 | — |
+| Q1 | F4 dense | F4 | F4 | — |
+| Q2 | F9 dense (clean anchor) | F9 | F9 | — |
+| Q3 | **RoleOnly FormatBook** (new — tests if in-context routing matters at all) | F9 (text/choice only) | F4 (all in-context) | 0% in-context hot |
+| Q4 | Quest FormatBook | F9 | F4 | top-50% in-context |
+| Q5 | Random FormatBook (seed 0) | F9 | F4 | top-50% in-context |
+| Q6 | Oracle FormatBook (needle + Quest fill) | F9 | F4 | top-50% in-context |
+| Q7 | Quest FormatBook | F9 | F4 | top-25% in-context |
+| Q8 | Random FormatBook (seed 0) | F9 | F4 | top-25% in-context |
+| Q9 | Oracle FormatBook | F9 | F4 | top-25% in-context |
+| Q10 | INT2-cold Quest (stretch) | F9 | cold-K INT2 / V INT4 | top-25% in-context |
+| Q11 | INT2-cold Random (stretch, seed 0) | F9 | cold-K INT2 / V INT4 | top-25% in-context |
+
+Branch-conditional reseeds (Q5_s1/s2, Q8_s1/s2, Q11_s1/s2) launch only if a Quest-vs-Random gap fires: `acc gap ≥ 0.02` OR `paired_net ≥ 5`. Top-25 reseed has priority over top-50 (lower bits Pareto). Also a 448² mini-check on Q0/Q2/Q4 at n=32 (`max_pixels=200704`, matches official MM-NIAH InternVL eval).
+
+### Slice B — reasoning-image (deferred, not auto-launched)
+
+If Slice A still looks choice-dominated (Q3 ≈ Q2 AND Q4 ≤ Q5), the analyzer writes `slice_b_recommendation: RUN` into `expQ_branch_sliceA.json`. The orchestrator only launches Slice B (R0..R8 + fresh F9 calibration NPZ) when invoked with `--slice-b`. Reasoning-image is the cleaner page-precision-routing target because the needle's content matters, not just its location.
+
+### Metrics (load-bearing, requested explicitly)
+
+- **`effective_kv_bits` / `effective_k_bits`** — token-weighted average from the per-page format assignment. F9 = K-bits 5.50; F4 = 4.00; cold-K INT2 = 2.00; V uniformly INT4 = 4.00. `effective_kv_bits = (effective_k_bits + 4) / 2`. **Do not confuse the KV-average (4.75 for F9) with K-bits-alone.**
+- **`f9_sidecode_token_fraction`** — fraction of tokens stored at F9 precision. FormatBook reduces this; F9 dense = 1.0.
+- **`logical_page_read`** — fraction of routable pages kept active (sparse-route read reduction; = 1.0 for FormatBook).
+- **`needle_hit`** — layer-averaged fraction of layers where the needle is in the active set.
+- **Per-num_images breakdown** (8–11 / 12–19 / 20+) — tests whether Quest helps only in the long-context regime where the budget binds.
+
+Latency is logged but is **diagnostic-only** (dense attention runs throughout in this fake-quant implementation).
+
+### What's new in `qwen/scripts/`
+
+- `expQ_driver.py` — Slice A/B driver. `--task retrieval-image|reasoning-image`, `--include-int2-stretch`, `--include-reseed`. Per-page bits accounting in `score_item` via `_compute_bit_metrics`.
+- `expQ_smoke.py` — n=3 smoke. New assertions: **F.role_only_zero_hot**, **G.allhot_matches_F9_dense** (FormatBook with budget=1.0 must match Q2 logits within 1e-4), **H.int2_cold_smaller**, **I.effective_bits_math**.
+- `expQ_analyze.py` — summary + paired McNemar (13 load-bearing pairs for Slice A, 9 for Slice B) + verdict matrix + branch-check JSON. New columns: `effective_kv_bits`, `effective_k_bits`, `f9_sidecode_token_fraction`. New section: per-num_images breakdown.
+- `expQ_calibrate_reasoning.py` — fresh F9 outlier calibration on reasoning-image cal-100 (Slice B only).
+- `run_expQ_overnight.sh` — tmux orchestrator with branching: smoke → Slice A main → analyze → conditional reseed → 448² mini-check → final analyze → Slice B (only on explicit `--slice-b`).
+- Shared-module edits (additive):
+  - `attention_router.py`: `_int2_per_channel_seq` cold quantizer + `RoutePolicy.cold_quantizer` field + `formatbook_role_only` / `formatbook_all_hot` policies.
+  - `mm_niah_loader.py`: `--task reasoning-image` support via `_find_needle_idx_reasoning` (uses `meta["needles"]` filenames) + per-task split files.
+  - `quest_scorer.py`: `role_only` and `all_hot` selection policies.
+
+### Running on tambe-server-1
+
+```bash
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expQ_overnight.sh
+# After Slice A completes, check the recommendation:
+#   cat qwen/results/expQ_branch_sliceA.json
+# If slice_b_recommendation == "RUN", launch Slice B explicitly:
+#   CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expQ_overnight.sh --slice-b
+```
+
+**Wall estimate:** 6–8 h core (Slice A + 448² mini-check); up to ~12 h if reseed triggers. Slice B adds ~4–6 h on top.
+
+Plan: `/Users/subha/.claude/plans/read-through-qwen-and-golden-nebula.md`.
+
+## Qwen2.5-VL × LongVideoBench — Experiment G: Frame-scaling under fixed KV memory budget (staged 2026-05-09)
+
+After Exp F (KIVI per-channel-along-seq) closed 94.4% of the KV-quantization collapse at TRUE 4.00 KV bits, the open research question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget*. The theoretical math at fixed `max_pixels=360×420`:
+
+```
+relative KV memory = (frames × avg_kv_bits) / (64 × 16)
+```
+
+so 256-frame F4 (≈4 KV bits) ≈ 64-frame BF16 KV memory at 4× temporal coverage. **The headline test is whether `G4` (256f F4) beats `G0` (64f BF16) on LongVideoBench.** If it does, the contribution shifts from "we applied KIVI" to "correct KV quantization changes the long-video operating point."
+
+### Stage-1 conditions (n=64 balanced 16/bucket, 9 conditions)
+
+Reuses F-suite F0 (BF16), F4 (KIVI per-channel-seq INT4), F9 (KIVI + top-16 outlier BF16). Same n=64 stratified subset as F-suite Stage 1 so the F4 anchor is paired exactly.
+
+| ID | Frames | KV | rel KV mem | Purpose |
+|---|---:|---|---:|---|
+| G0 | 64 | BF16 | 1.00× | Baseline ceiling (re-anchor to A1=0.565) |
+| G1 | 64 | F4 INT4 | 0.25× | Re-anchor to F4=0.545; cascade & type-adaptive substrate |
+| G2 | 128 | BF16 | 2.00× | Upper-bound for what extra frames buy |
+| G3 | 128 | F4 INT4 | 0.50× | Memory-saving point: 2× frames at half KV mem |
+| **G4** | **256** | **F4 INT4** | **1.00×** | **Matched-memory headline: 4× frames at G0 budget** |
+| G5 | 128 | F9 (4.75 bits) | 0.59× | Zero-loss point at 2× frames |
+| G6 | 256 | F9 (4.75 bits) | 1.19× | Zero-loss point at 4× frames |
+| G7 | 64↗256 cascade | F4 INT4 | ≈1.00× (target avg=128) | Spend frames only on low-margin items |
+| G8 | type-adaptive 64/128/256 | F4 INT4 | ≈0.50× (target avg=128) | Detail/temporal/count/OCR → 256f; detail/action → 128f; other → 64f |
+
+### Compute structure (drives ~3.5 h Stage-1 wall vs naive ~8.4 h)
+
+The visual prefill (image-token construction, position-id generation, find_text_slice_spans, inputs dict) is the heavy work and is **identical across K-quantizer configs at the same frame count**. The driver iterates outer over `frames ∈ {64, 128, 256}`, inner over the K-quantizer configs at that frame count, sharing the prefill across F0/F4/F9 conditions. G7/G8 are pure JSONL post-processes (no new forwards).
+
+**Calibration reuse.** F-suite calibration NPZ at frames=64 is reused as-is. K-channel outlier indices are post-RoPE and frame-count-independent in theory; smoke check 8 (opt-in via `EXPG_RIGOR_HIGH=1`) verifies on 8 cal items at frames=256 with Jaccard ≥ 0.75 per (L, H_kv).
+
+### What's new in `qwen/scripts/`
+
+- `expG_frame_scaling.py` — main driver; outer loop over frame counts {64,128,256}, inner loop over K-quantizer configs (F0/F4/F9). Reuses F-suite `_run_condition_forward`, `_option_logprobs_and_pred`, `_compute_three_bit_columns`, `ensure_stage_split`, `backfill_bf16_join` verbatim. Adds `relative_kv_memory` to each row.
+- `expG_smoke.py` — 8 hard assertions: F4 dispatch at T∈{5760, 11520, 23040}; F9 calibration loadable; n=64 split present; cascade margin definition (max−second_max ≡ answer_margin@argmax); qtype classifier coverage on cal-100 (weighted_avg_frames ∈ [110, 145]); `nvidia-smi` memory feasibility for the 256f tier; G0 anchor sanity (acc bounds 0.45–0.60 to catch the Exp-D fast-processor regression); optional 8-item recalibration at frames=256 to verify outlier-index Jaccard.
+- `expG_cascade.py` — G7 confidence cascade post-process. Loads G1 (64f F4) + G4 (256f F4) rows, computes `cascade_margin = max(option_logprobs) − second_max(...)` per G1 row, picks bottom-third by margin to substitute G4 rows for. For target_avg=128, rerun fraction = (128−64)/(256−64) = 1/3 exactly. Pure JSONL stitch; zero new forwards.
+- `expG_type_adaptive.py` — G8 question-type adaptive post-process. Routes each item to G1/G3/G4 by `classify_question_type(question)` and `BUDGET_MAP`. Pure JSONL stitch; zero new forwards.
+- `question_type_classifier.py` — keyword heuristic with 6 labels (count/temporal/ocr/detail/action/other) → BUDGET_MAP {64, 128, 256}. Tunable on cal-100 split (disjoint from any stage-N eval set per `make_split` semantics).
+- `expG_analyze.py` — per-condition table with 95% bootstrap CI; **paired McNemar** for headline pairs (G4↔G0, G3↔G0, G6↔G2, G7↔G1, G8↔G1, G4↔G2); frame-budget vs accuracy frontier (sorted by `relative_kv_memory`); verdict matrix with G-specific promotion rules.
+- `run_expG.sh` — orchestrator with subcommands `smoke|stage1|stage3|cascade|analyze|full`. Env vars: `PIPELINE_MODEL`, `EXPG_N_LIMIT`, `EXPG_MIN_FREE_GB=70`, `EXPG_RIGOR_HIGH`, `CUDA_VISIBLE_DEVICES`.
+
+### Promotion rules (Stage 1 → Stage 3)
+
+```
+G4 (256f F4) ≥ G0 + 3 pp                        → promote_paper_strong  [HEADLINE]
+G4 ∈ [G0 − 3 pp, G0 + 3 pp]                     → promote_n200          (matched-memory)
+G3 (128f F4) ≥ G0                               → promote_n200          (memory-saving)
+G6 (256f F9) ≥ G2 − 1 pp                        → promote_n200          (zero-loss at 4×)
+adaptive (G7 or G8) ≥ best fixed F4 + 2 pp      → promote_n200
+G4 < G0 − 5 pp                                  → kill                  (frame coverage doesn't help)
+```
+
+### Running on tambe-server-1
+
+```bash
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+source /data/subha2/experiments/qwen_venv/bin/activate
+nvidia-smi  # confirm GPU 0 is free; co-tenant typically holds GPU 1
+tmux new -s qwen-expG
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expG.sh smoke    # ~30s (no model fwd) or ~5min (with --model)
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expG.sh stage1   # ~3.5h: G0/G1 (64f) → G2/G3/G5 (128f) → G4/G6 (256f)
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expG.sh cascade  # ~1 min post-process: G7 + G8
+bash qwen/scripts/run_expG.sh analyze                              # no GPU
+```
+
+After Stage 1: promote 4–6 conditions to Stage 3 (n=200 canonical) per the verdict matrix; expect ~11 h Stage-3 wall.
+
+Plan in `/Users/subha/.claude/plans/read-through-the-qwen-experiments-md-ancient-shell.md`.
+
+## Qwen2.5-VL × LongVideoBench — Experiment F: K-quantizer repair screening (2026-05-09, COMPLETE)
+
+**Headline: the 35.5 pp KV-quantization collapse from Exp A is *solved* by switching the K scale axis.** F4 KIVI per-channel-along-seq closes **94.4% of the F1→F0 gap (33.5 of 35.5 pp) at TRUE 4.00 KV bits**: F4 = 0.545 vs F0 BF16 ceiling 0.565, F1 INT4 floor 0.210. The fix is a one-line scale-axis change from per-(head, position, group of 128 head_dim slots) to per-(head, channel) shared across all positions — no calibration, no routing, no slice info. **None of the routing experiments (Exp B, D1, E1) were necessary**; the bottleneck was always the quantizer, not the selector.
+
+### Stage 3 Pareto frontier (n=200 canonical eval split)
+
+| KV bits | acc | condition | note |
+|---:|---:|---|---|
+| 4.000 | **0.545** | F4 KIVI per-channel-seq | **deployable headline** (4× compression, ~2 pp loss) |
+| 4.375 | 0.540 | F8 outlier-8 | dominated by F4 |
+| 4.750 | **0.560** | F9 outlier-16 | **zero-loss Pareto point** (within CI of F0) |
+| 10.000 | 0.550 | F3 all-K BF16 + V INT4 | dominated by F4 |
+| 16.000 | 0.565 | F0 BF16 (ceiling) | reference |
+
+VLM-specific scaling refinements (F5 text/visual split=0.510, F6 prompt-role split=0.525, F7 99.5%ile clip=0.540) all UNDERPERFORM F4 at the same 4-bit budget. Once the K axis is right, modality/role-aware quantization adds nothing. Score-cal closed-form variants (F10–F13) failed catastrophically (0.172–0.281); iterative scale search would be needed to revisit. Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment F".
+
+### Files of record
+
+- `qwen/scripts/k_quantizers.py` — `KQuantizerConfig` dataclass + 12 quantizer kinds + `apply_k_quantizer` dispatch.
+- `qwen/scripts/expF_calibrate.py` — single-pass cal-100 capture; per-(L, H_kv, channel) `k_channel_energy` + outlier indices + `q_energy{,_text,_visual}` via forward hooks on each layer's `q_proj`.
+- `qwen/scripts/expF_smoke.py` — Phase A (synthetic-tensor) + Phase B (live-model logits-differ) smoke checks.
+- `qwen/scripts/expF_kquant_screen.py` — tiered driver (Stages 0/1/2/3); `_compute_three_bit_columns` for K/V/KV avg-bit accounting.
+- `qwen/scripts/expF_analyze.py` — per-condition table + verdict matrix.
+- `qwen/scripts/run_expF.sh smoke|calib|stage{0,1,2,3}|analyze|full`.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment E1: Text-K Slice Ablation (2026-05-08, COMPLETE)
 
 **Headline: text-K-routing hypothesis ALSO falsified.** After D1 showed text-K is the dominant fragility (vs visual-K), E1 asked *which* of the ~140 text-K positions carry the fragility. 200 items × 11 V3K text-K-mask conditions (V always INT4, visual-K always INT4, only text-K varied):
