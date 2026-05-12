@@ -142,9 +142,11 @@ def write_summary(rows: list[dict], out_md: Path) -> None:
     lines = [f"# Exp P summary — {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
     lines.append(f"Total rows: {len(rows)} across {len(by_cond)} conditions.")
     lines.append("")
-    lines.append("| condition | n | acc | 95% CI | needle_hit (layer-avg) | page_read | needle_rank median | latency_ms | seq_len mean |")
+    lines.append("> `logical_page_read` = fraction of routable visual pages kept active per the routing decision. This is the *implied* sparsity, not measured bandwidth or runtime — both sparse and FormatBook routes still run dense SDPA underneath, with the cold pages masked or downgraded only at the last query row.")
+    lines.append("")
+    lines.append("| condition | n | acc | 95% CI | needle_hit (layer-avg) | logical_page_read | needle_rank median | latency_ms | seq_len mean |")
     lines.append("|---|---|---|---|---|---|---|---|---|")
-    cond_order = ["P0", "P1", "P2", "P3", "P3b", "P4", "P4b", "P5", "P6"]
+    cond_order = ["P0", "P1", "P2", "P2b", "P3", "P3b", "P4", "P4b", "P5", "P6"]
     seen = set()
     for c in cond_order + sorted(set(by_cond) - set(cond_order)):
         if c not in by_cond or c in seen:
@@ -217,6 +219,60 @@ def write_paired(rows: list[dict], out_md: Path) -> None:
     out_md.write_text("\n".join(lines) + "\n")
 
 
+def paired_needle_hit_p3_vs_p4(p3_rows: dict[str, dict],
+                                p4_rows: dict[str, dict]) -> dict:
+    """Compare per-item needle-hit (Quest top-K vs Random top-K) on items that
+    appear in BOTH conditions. Reports:
+      - mean per-item delta in layer-averaged needle hit (P3 - P4)
+      - paired sign test on majority-vote per-item needle hits (binary)
+      - n routable-pages > 1 (the only items where routing is non-trivial)
+    """
+    keys = sorted(set(p3_rows) & set(p4_rows))
+    deltas: list[float] = []
+    p3_majority_wins = 0
+    p4_majority_wins = 0
+    ties = 0
+    n_nontrivial = 0  # items where the routing choice mattered (>1 routable)
+    for k in keys:
+        a = p3_rows[k]
+        b = p4_rows[k]
+        # Layer-averaged needle hit fraction
+        ah = a.get("needle_in_active_layer_mean")
+        bh = b.get("needle_in_active_layer_mean")
+        if ah is None or bh is None:
+            continue
+        # Skip items where there was no real routing choice (≤1 routable page →
+        # active set is forced to contain the needle trivially).
+        n_routable = (
+            (a.get("active_routable_pages_layer_mean") or 0) +
+            (a.get("cold_routable_pages_layer_mean") or 0)
+        )
+        if n_routable <= 1:
+            continue
+        n_nontrivial += 1
+        deltas.append(ah - bh)
+        # Majority vote per item: was the needle in active for >50% of layers?
+        a_hit = ah > 0.5
+        b_hit = bh > 0.5
+        if a_hit and not b_hit:
+            p3_majority_wins += 1
+        elif b_hit and not a_hit:
+            p4_majority_wins += 1
+        else:
+            ties += 1
+    mean_delta = float(np.mean(deltas)) if deltas else 0.0
+    chi2, p = mcnemar(p3_majority_wins, p4_majority_wins)
+    return {
+        "n_nontrivial": n_nontrivial,
+        "mean_delta": mean_delta,
+        "p3_majority_wins": p3_majority_wins,
+        "p4_majority_wins": p4_majority_wins,
+        "ties": ties,
+        "chi2": chi2,
+        "p": p,
+    }
+
+
 def write_verdict(rows: list[dict], out_md: Path) -> None:
     by_cond = group_by_condition(rows)
     rows_by_item = {c: map_by_item(rs) for c, rs in by_cond.items()}
@@ -225,21 +281,20 @@ def write_verdict(rows: list[dict], out_md: Path) -> None:
     if "P3" in rows_by_item and "P4" in rows_by_item:
         m = paired_mcnemar(rows_by_item["P3"], rows_by_item["P4"])
         if m["chi2"] >= 6.63 and m["favored"] == "A":  # p < 0.01 threshold
-            verdicts.append(f"PASS: Quest > Random at top-25% (χ²={m['chi2']:.2f}, p={m['p']:.4f})")
+            verdicts.append(f"PASS: Quest > Random at top-25% accuracy (χ²={m['chi2']:.2f}, p={m['p']:.4f})")
         elif m["chi2"] >= 3.84 and m["favored"] == "A":  # p < 0.05
-            verdicts.append(f"TREND: Quest > Random at top-25% (χ²={m['chi2']:.2f}, p={m['p']:.4f})")
+            verdicts.append(f"TREND: Quest > Random at top-25% accuracy (χ²={m['chi2']:.2f}, p={m['p']:.4f})")
         else:
-            verdicts.append(f"NEUTRAL: Quest ≈ Random at top-25% (χ²={m['chi2']:.2f}, p={m['p']:.4f})")
+            verdicts.append(f"NEUTRAL: Quest ≈ Random at top-25% accuracy (χ²={m['chi2']:.2f}, p={m['p']:.4f})")
 
-    if "P3" in by_cond:
-        nh = [r.get("needle_in_active_layer_mean") for r in by_cond["P3"]
-              if r.get("needle_in_active_layer_mean") is not None]
-        if nh:
-            mean_hit = float(np.mean(nh))
-            # Random at top-25% on routable pages → expected ≈ 0.25
-            verdicts.append(
-                f"Quest needle-hit (P3, layer-avg): {mean_hit:.3f} (random baseline ≈ 0.25)"
-            )
+        # Needle-hit head-to-head (the primary signal the plan calls for).
+        nh = paired_needle_hit_p3_vs_p4(rows_by_item["P3"], rows_by_item["P4"])
+        verdicts.append(
+            f"Quest vs Random needle-hit (n_nontrivial={nh['n_nontrivial']}): "
+            f"mean ΔP3−P4 = {nh['mean_delta']:+.3f}; majority-vote wins "
+            f"P3={nh['p3_majority_wins']} P4={nh['p4_majority_wins']} ties={nh['ties']} "
+            f"(McNemar χ²={nh['chi2']:.2f}, p={nh['p']:.4f})"
+        )
 
     if "P6" in rows_by_item and "P2" in rows_by_item:
         m = paired_mcnemar(rows_by_item["P6"], rows_by_item["P2"])
@@ -265,7 +320,7 @@ def write_verdict(rows: list[dict], out_md: Path) -> None:
     lines.append("## Per-condition status")
     lines.append("| condition | n | acc | status |")
     lines.append("|---|---|---|---|")
-    cond_order = ["P0", "P1", "P2", "P3", "P3b", "P4", "P4b", "P5", "P6"]
+    cond_order = ["P0", "P1", "P2", "P2b", "P3", "P3b", "P4", "P4b", "P5", "P6"]
     for c in cond_order:
         if c not in by_cond:
             continue

@@ -138,7 +138,8 @@ def forward_with_resolved(model, processor, item: MMNiahItem, cond_name: str,
                 needle_idx_in_images=item.needle_idx_in_images,
             )
             cache = PageAwareFakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
-            cache.set_page_layout(layout)
+            rng_seed = (abs(hash(item.id)) % (2**31)) ^ 0xCAFEBABE
+            cache.set_page_layout(layout, rng_seed=rng_seed)
         else:
             cache = FakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
 
@@ -438,7 +439,8 @@ def main():
                                    n_in_context_images=it.num_images,
                                    n_choice_images=4,
                                    needle_idx_in_images=it.needle_idx_in_images)
-        cache.set_page_layout(layout)
+        rng_seed = (abs(hash(it.id)) % (2**31)) ^ 0xCAFEBABE
+        cache.set_page_layout(layout, rng_seed=rng_seed)
         with page_routing_sdpa_context(cache, RoutePolicy("none")):
             out = model.generate(**inputs, past_key_values=cache, max_new_tokens=1,
                                  do_sample=False, return_dict_in_generate=True,

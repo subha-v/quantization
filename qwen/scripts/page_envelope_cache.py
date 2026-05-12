@@ -37,19 +37,29 @@ class PageAwareFakeQuantKVCache(FakeQuantKVCache):
 
     def __init__(self, controller: BitController, k_quantizer_config=None,
                  page_layout: Optional[PageLayout] = None,
-                 needle_page_idx: Optional[int] = None):
+                 needle_page_idx: Optional[int] = None,
+                 rng_seed: Optional[int] = None):
         super().__init__(controller, k_quantizer_config=k_quantizer_config)
         self.page_layout: Optional[PageLayout] = page_layout
         self.envelopes: dict[int, torch.Tensor] = {}  # layer_idx -> [H_kv, n_pages, D, 2]
         self.most_recent_envelope: Optional[torch.Tensor] = None
         self.most_recent_layer_idx: Optional[int] = None
         self.needle_page_idx: Optional[int] = needle_page_idx
+        # Per-cache torch.Generator for reproducible random_sparse routing.
+        # Seeded fresh on each item via set_page_layout(rng_seed=...).
+        self.rng: Optional[torch.Generator] = None
+        if rng_seed is not None:
+            self.rng = torch.Generator()
+            self.rng.manual_seed(int(rng_seed))
         # Filled by the SDPA wrapper after a routing decision; the driver reads
         # this to write per-item diagnostics.
         self.routing_log: dict[int, dict] = {}  # layer_idx -> {policy, active, cold, scores, ...}
 
-    def set_page_layout(self, layout: PageLayout, needle_page_idx: Optional[int] = None) -> None:
-        """Plumb a fresh PageLayout for the next item. Resets envelopes and routing logs."""
+    def set_page_layout(self, layout: PageLayout,
+                        needle_page_idx: Optional[int] = None,
+                        rng_seed: Optional[int] = None) -> None:
+        """Plumb a fresh PageLayout for the next item. Resets envelopes,
+        routing logs, and (if supplied) reseeds the random_sparse RNG."""
         self.page_layout = layout
         self.needle_page_idx = (
             needle_page_idx if needle_page_idx is not None else layout.needle_page_idx
@@ -58,6 +68,9 @@ class PageAwareFakeQuantKVCache(FakeQuantKVCache):
         self.routing_log = {}
         self.most_recent_envelope = None
         self.most_recent_layer_idx = None
+        if rng_seed is not None:
+            self.rng = torch.Generator()
+            self.rng.manual_seed(int(rng_seed))
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         # 1) Quantize K via the configured K-quantizer (e.g. J12).

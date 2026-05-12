@@ -97,13 +97,24 @@ class RoutePolicy:
 
 def _compute_last_row_attention(query: torch.Tensor, key: torch.Tensor,
                                 value: torch.Tensor, cold_token_mask: torch.Tensor,
-                                scale: Optional[float]) -> torch.Tensor:
+                                scale: Optional[float],
+                                attn_mask: Optional[torch.Tensor] = None,
+                                is_causal: bool = False) -> torch.Tensor:
     """Compute attention output for the last query row, with -inf added at
     `cold_token_mask` positions on the keys.
 
     query: [B, H, T_q, D]
     key/value: [B, H, T_k, D]
     cold_token_mask: [T_k] bool — True at positions inside cold pages
+    attn_mask: optional explicit attention mask supplied to the original SDPA
+               call. Shape may be 2D [T_q, T_k], 3D [B, T_q, T_k], or 4D
+               [B, H, T_q, T_k]. We extract the last-query-row slice and add
+               it before softmax. For single-item unpadded prefill this is a
+               no-op (None or all-zero); the code is here for robustness when
+               padding masks ever land.
+    is_causal: ignored — the last query row attends to all prior keys under
+               causality, so we don't need to materialize the causal mask
+               for row T_q-1 specifically.
     Returns: [B, H, 1, D]
     """
     B, H, T_q, D = query.shape
@@ -111,6 +122,23 @@ def _compute_last_row_attention(query: torch.Tensor, key: torch.Tensor,
     q_last = query[:, :, -1:, :]                           # [B, H, 1, D]
     s = scale if scale is not None else 1.0 / math.sqrt(D)
     scores = torch.matmul(q_last, key.transpose(-1, -2)) * s  # [B, H, 1, T_k]
+    # Defensive: apply the last-row slice of an explicit attention mask.
+    if attn_mask is not None:
+        if attn_mask.dim() == 4:
+            last_attn = attn_mask[..., -1:, :]                  # [B, H, 1, T_k]
+        elif attn_mask.dim() == 3:
+            last_attn = attn_mask[:, -1:, :].unsqueeze(1)       # [B, 1, 1, T_k]
+        elif attn_mask.dim() == 2:
+            last_attn = attn_mask[-1:, :].unsqueeze(0).unsqueeze(0)  # [1, 1, 1, T_k]
+        else:
+            last_attn = None
+        if last_attn is not None:
+            if last_attn.dtype == torch.bool:
+                # True = keep; SDPA convention: pre-softmax additive 0 / -inf.
+                last_attn = torch.where(last_attn,
+                                        torch.zeros_like(scores),
+                                        torch.full_like(scores, float("-inf")))
+            scores = scores + last_attn.to(scores.dtype).to(scores.device)
     if cold_token_mask is not None:
         # Broadcast over (B, H); the mask is over keys (last dim).
         m = cold_token_mask.to(scores.device, non_blocking=True)
@@ -172,10 +200,6 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
 
         T_q = query.shape[-2]
         T_k = key.shape[-2]
-
-        # Only fire routing on the prefill forward (T_q > 1) — at the last query
-        # row. For pure decode steps (T_q == 1) we don't have a "non-last row to
-        # preserve"; we just apply the mask directly.
         if T_q <= 0:
             return original_sdpa(query, key, value, attn_mask=attn_mask,
                                  dropout_p=dropout_p, is_causal=is_causal,
@@ -185,20 +209,21 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
         H_kv = env.shape[0]
         gqa_group = H_q // H_kv
 
-        # 1) Quest score (or skip for random/oracle that don't need scores).
-        if policy.name.startswith("quest") or policy.is_formatbook():
-            q_last = query[:, :, -1:, :].detach()
-            scores = quest_scores_for_layer(q_last, env,
-                                            gqa_group=gqa_group,
-                                            aggregate=policy.gqa_aggregate)
-        else:
-            scores = None
+        # 1) Always compute Quest scores when we have an envelope and a non-"none"
+        # policy. Oracle needs them for top-(K-1) fill; random doesn't strictly
+        # need them but we log them for free diagnostics anyway.
+        q_last = query[:, :, -1:, :].detach()
+        scores = quest_scores_for_layer(q_last, env,
+                                        gqa_group=gqa_group,
+                                        aggregate=policy.gqa_aggregate)
 
-        # 2) Selection.
+        # 2) Selection (with reproducible RNG for random_top).
         selection_policy = policy.selection_policy()
+        rng = getattr(cache, "rng", None)
         decision = select_active_pages(
             layout, scores, selection_policy,
             budget_fraction=policy.budget_fraction,
+            rng=rng,
         )
 
         if record_routing and layer_idx is not None:
@@ -241,7 +266,9 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
                              scale=scale, **kwargs)
         if not cold_token_mask.any():
             return full
-        last_row = _compute_last_row_attention(query, key, value, cold_token_mask, scale)
+        last_row = _compute_last_row_attention(query, key, value, cold_token_mask,
+                                                scale=scale, attn_mask=attn_mask,
+                                                is_causal=is_causal)
         full = full.clone()
         full[:, :, -1:, :] = last_row
         return full

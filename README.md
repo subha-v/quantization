@@ -399,13 +399,15 @@ After the static-KV story for Qwen2.5-VL × LongVideoBench MCQ was effectively e
 |---|---|---|---|---|---|
 | P0 | BF16 baseline | BF16 | BF16 | dense | — |
 | P1 | Full F4 KIVI | F4 | F4 | dense | — (MM-NIAH F4 anchor) |
-| P2 | Full J12 (F9 + INT8 sidecode) | J12 | J12 | dense | — (dense anchor) |
-| P3 | **Quest sparse** | J12 | masked (-inf) | sparse, last-Q row only | **top-25% visual + all text** |
-| P4 | **Random sparse** | J12 | masked (-inf) | sparse, last-Q row only | top-25% visual + all text |
-| P5 | **Oracle sparse** | J12 | masked (-inf) | sparse, last-Q row only | needle page + text only |
-| P6 | **FormatBook** | J12 | F4 (per-page) | dense | top-50% visual = J12 |
+| P2 | Full F9 (F4 + top-16 BF16 outliers) | F9 | F9 | dense | — (dense anchor, clean: BF16 sidecode) |
+| P3 | **Quest sparse** | F9 | masked (-inf) | sparse, last-Q row only | **top-25% visual + all text** |
+| P4 | **Random sparse** (seeded per item) | F9 | masked (-inf) | sparse, last-Q row only | top-25% visual + all text |
+| P5 | **Oracle sparse** (budget-matched: needle + top-(K-1) Quest) | F9 | masked (-inf) | sparse, last-Q row only | top-25% (= P3 budget, but needle forced into active) |
+| P6 | **FormatBook** (Quest-routed F9, cold F4) | F9 | F4 (per-page) | dense | top-50% visual = F9 |
 
-Stretch: P3b/P4b at top-50% budget.
+Stretch: P3b/P4b at top-50% budget; **P2b** = F9+INT8 sidecode (J12) dense, characterizes the INT8-sidecode confound separately so primary P2-P6 stay clean on F9/BF16-sidecode.
+
+**Note on absolute accuracy.** F9 calibration is reused from the LongVideoBench seed=0 NPZ (out-of-distribution on MM-NIAH); a follow-up should recalibrate F9 on MM-NIAH before claiming absolute accuracy numbers. Paired routing comparisons (P3 vs P4, P5 vs P3, P6 vs P2) remain valid since they share the same calibration and quantizer family. `logical_page_read_fraction` is the *implied* sparsity per the routing decision, not measured bandwidth — both sparse and FormatBook routes still run dense SDPA underneath, with cold pages masked/downgraded only at the last query row.
 
 ### Key implementation details
 

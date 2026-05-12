@@ -129,11 +129,14 @@ def select_active_pages(layout: PageLayout,
     layout, scores: from compute_page_envelope + quest_scores_for_layer.
     policy:
       - "quest_top": top-(budget_fraction * n_routable) by Quest score, ceil
-      - "random_top": random sample of the same budget
-      - "oracle_needle": include only the needle page in the active set
+      - "random_top": random sample of the same budget (rng MUST be supplied
+                      for reproducibility)
+      - "oracle_needle": needle forced into active set, remaining (K-1) slots
+                        filled by top-Quest at the same budget_fraction. This
+                        gives a budget-matched oracle upper bound for Quest.
       - "none": keep all routable pages active (no masking)
-    budget_fraction: e.g. 0.25 (top-25%) or 0.5 (top-50%). Required for quest_top
-                     and random_top; ignored for oracle_needle and none.
+    budget_fraction: e.g. 0.25 (top-25%) or 0.5 (top-50%). Required for all
+                     policies except "none".
     """
     routable = layout.routable_pages()
     routable_idx = [p.page_idx for p in routable]
@@ -147,15 +150,6 @@ def select_active_pages(layout: PageLayout,
             needle_in_active=(layout.needle_page_idx in routable_idx),
         )
 
-    if policy == "oracle_needle":
-        active = [layout.needle_page_idx] if layout.needle_page_idx is not None else []
-        cold = [i for i in routable_idx if i not in active]
-        return RoutingDecision(
-            active_routable_pages=active, cold_routable_pages=cold,
-            scores=scores, policy=policy,
-            needle_in_active=(layout.needle_page_idx in active),
-        )
-
     if budget_fraction is None:
         raise ValueError(f"policy={policy} requires budget_fraction")
     import math
@@ -166,13 +160,40 @@ def select_active_pages(layout: PageLayout,
         if scores is None:
             raise ValueError("quest_top requires scores")
         routable_scores = scores[torch.tensor(routable_idx, dtype=torch.long, device=scores.device)]
-        # top-k indices into the routable list
         topk = torch.topk(routable_scores, k=k, largest=True).indices.tolist()
         active = sorted(routable_idx[i] for i in topk)
     elif policy == "random_top":
-        gen = rng if rng is not None else None
-        perm = torch.randperm(n, generator=gen).tolist()
+        # Reproducibility requires an explicit generator; default-RNG sampling
+        # has bitten paired comparisons before.
+        if rng is None:
+            raise ValueError(
+                "random_top requires an explicit torch.Generator for reproducibility"
+            )
+        perm = torch.randperm(n, generator=rng).tolist()
         active = sorted(routable_idx[i] for i in perm[:k])
+    elif policy == "oracle_needle":
+        # Budget-matched oracle: force the needle into the active set, then
+        # fill the remaining (k - 1) slots with the top Quest scorers among
+        # the OTHER routable pages.
+        needle_idx = layout.needle_page_idx
+        other_idx = [i for i in routable_idx if i != needle_idx]
+        n_fill = max(0, k - 1) if needle_idx is not None else k
+        if n_fill > 0 and other_idx:
+            if scores is None:
+                # No Quest scores → fall back to first-K-1 in declared order
+                # (deterministic; we never hit this with the wrapper plumbing).
+                fill = other_idx[:n_fill]
+            else:
+                other_scores = scores[
+                    torch.tensor(other_idx, dtype=torch.long, device=scores.device)
+                ]
+                topk = torch.topk(
+                    other_scores, k=min(n_fill, len(other_idx)), largest=True
+                ).indices.tolist()
+                fill = [other_idx[i] for i in topk]
+        else:
+            fill = []
+        active = sorted(([needle_idx] if needle_idx is not None else []) + fill)
     else:
         raise ValueError(f"unknown policy={policy!r}")
 
