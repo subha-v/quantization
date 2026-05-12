@@ -1030,4 +1030,39 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         KQuantizerConfig(name="K11_Pivot8_BF16side", kind="kivi_outlier8", bits=4,
                          n_outliers=8, outlier_idx_key="outlier_idx_PIVOT_top16",
                          calib=calib, outlier_storage_bits=16),
+        # ============================================================
+        # Exp M: matched-budget sidecode controls
+        # Tests whether K9 (Balanced top-3/block, 12 BF16 outliers, 4.56 KV
+        # bits) wins because of cross-modal balance, or just because it
+        # protects more channels than F8/J7. All M5-M7 and M9-M12 are at
+        # 12 channels (4.56 KV bits) for direct matched-budget paired McNemar.
+        # ============================================================
+        # M5: generic top-12 BF16 — uses default outlier_channel_idx_top16,
+        # sliced to first 12 channels. Direct matched-budget control vs K9.
+        KQuantizerConfig(name="M5_Generic12_BF16side", kind="kivi_outlier16", bits=4,
+                         n_outliers=12, calib=calib, outlier_storage_bits=16),
+        # M6: random top-12 BF16 — uses outlier_idx_RANDOM_top16 (driver-injected
+        # with seed=42), sliced to first 12. Strong control for "any 12 channels
+        # work at this budget".
+        KQuantizerConfig(name="M6_Random12_BF16side", kind="kivi_outlier16", bits=4,
+                         n_outliers=12, outlier_idx_key="outlier_idx_RANDOM_top16",
+                         calib=calib, outlier_storage_bits=16),
+        # M7: balanced-random by channel-position, 3/block. Reads driver-injected
+        # outlier_idx_BAL_RANDOM_POS_3pb_top16. Tests "balance structure without
+        # cross-modal scoring".
+        KQuantizerConfig(name="M7_BalRandomPos3pb_BF16side", kind="kivi_outlier16", bits=4,
+                         n_outliers=12,
+                         outlier_idx_key="outlier_idx_BAL_RANDOM_POS_3pb_top16",
+                         calib=calib, outlier_storage_bits=16),
+        # M10: balanced TT/TV/VT/VV top-3 INT8 sidecode (cheaper K9).
+        KQuantizerConfig(name="M10_Bal3pb_INT8side", kind="kivi_outlier16", bits=4,
+                         n_outliers=12,
+                         outlier_idx_key="outlier_idx_BAL_top3_per_block_top16",
+                         calib=calib, outlier_storage_bits=8),
+        # M12: pivot top-12 BF16 — matched-budget pivot control. Same
+        # outlier_idx_PIVOT_top16 as K11/J8 but with 12 channels protected
+        # instead of 8.
+        KQuantizerConfig(name="M12_Pivot12_BF16side", kind="kivi_outlier16", bits=4,
+                         n_outliers=12, outlier_idx_key="outlier_idx_PIVOT_top16",
+                         calib=calib, outlier_storage_bits=16),
     ]
