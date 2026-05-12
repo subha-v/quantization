@@ -130,7 +130,8 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
                k_cfg_obj, num_layers: int, num_kv_heads: int,
                answer_ids: list[int],
                max_pixels_context: int = 144 * 144,
-               max_pixels_choices: int = 224 * 224) -> dict:
+               max_pixels_choices: int = 224 * 224,
+               record_layout_warnings: bool = True) -> dict:
     """One forward, one condition, one item. Returns a JSONL-ready dict."""
     from qwen_vl_utils import process_vision_info  # type: ignore
 
@@ -305,7 +306,9 @@ def run_condition_on_items(model, processor, items: list[MMNiahItem],
                            out_jsonl: Path, progress_log: Path,
                            progress_every: int = 10, summary_every: int = 25,
                            summary_callback=None,
-                           skip_ids: Optional[set] = None) -> None:
+                           skip_ids: Optional[set] = None,
+                           max_pixels_context: int = 144 * 144,
+                           max_pixels_choices: int = 224 * 224) -> None:
     skip_ids = skip_ids or set()
     n = len(items)
     n_done = 0
@@ -319,7 +322,9 @@ def run_condition_on_items(model, processor, items: list[MMNiahItem],
             try:
                 row = score_item(model, processor, it, cond, k_cfg_obj,
                                  num_layers=num_layers, num_kv_heads=num_kv_heads,
-                                 answer_ids=answer_ids)
+                                 answer_ids=answer_ids,
+                                 max_pixels_context=max_pixels_context,
+                                 max_pixels_choices=max_pixels_choices)
             except torch.cuda.OutOfMemoryError as e:
                 _append_progress(progress_log,
                                  f"WARN [{cond.name}] OOM on item {it.id} seq_len_est={it.context_length} -- skipping")
@@ -403,6 +408,17 @@ def main():
     ap.add_argument("--no-resume", action="store_true",
                     help="Re-run items already in the JSONL")
     ap.add_argument("--split-path", type=Path, default=DEFAULT_SPLIT_FILE)
+    ap.add_argument("--min-num-images", type=int, default=0,
+                    help="Filter eval items to those with num_images >= N "
+                         "(sharpens routing budget; 0 = no filter)")
+    ap.add_argument("--use-full-pool", action="store_true",
+                    help="Ignore eval split; use all items (minus cal) matching "
+                         "--min-num-images. Used for the multi-image follow-up where "
+                         "the original n=190 eval has only ~47 items with ≥8 images.")
+    ap.add_argument("--max-pixels-context", type=int, default=144 * 144,
+                    help="max_pixels cap for in-context (haystack) images")
+    ap.add_argument("--max-pixels-choices", type=int, default=224 * 224,
+                    help="max_pixels cap for the 4 A/B/C/D choice images")
     args = ap.parse_args()
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
@@ -418,10 +434,25 @@ def main():
     else:
         split = make_split(items, seed=args.seed)
         save_split(split, args.split_path)
-    eval_items = filter_items(items, split["eval"])[:args.n_items]
+    if args.use_full_pool:
+        cal_ids = set(split.get("cal", []))
+        eval_items = [it for it in items if it.id not in cal_ids]
+        print(f"use_full_pool: {len(eval_items)} items (full pool minus {len(cal_ids)} cal)",
+              flush=True)
+    else:
+        eval_items = filter_items(items, split["eval"])
+    if args.min_num_images > 0:
+        before = len(eval_items)
+        eval_items = [it for it in eval_items if it.num_images >= args.min_num_images]
+        print(f"min_num_images filter: {before} -> {len(eval_items)} items "
+              f"(num_images >= {args.min_num_images})", flush=True)
+    eval_items = eval_items[:args.n_items]
     print(f"loaded {len(items)} items; eval split {len(eval_items)} of {len(split['eval'])}", flush=True)
     _append_progress(progress_log,
-                     f"items: total={len(items)} eval={len(eval_items)} buckets="
+                     f"items: total={len(items)} eval={len(eval_items)} "
+                     f"min_num_images={args.min_num_images} "
+                     f"max_pixels=(ctx={args.max_pixels_context}, choices={args.max_pixels_choices}) "
+                     f"buckets="
                      f"{ {b: sum(1 for it in eval_items if it.context_length_bucket == b) for b in ['short','mid','long']} }")
 
     # Calibration
@@ -470,6 +501,8 @@ def main():
             answer_ids=answer_ids,
             out_jsonl=args.out_jsonl, progress_log=progress_log,
             summary_callback=summary_cb, skip_ids=skip,
+            max_pixels_context=args.max_pixels_context,
+            max_pixels_choices=args.max_pixels_choices,
         )
     total_wall = time.perf_counter() - t_overall
     _append_progress(progress_log, f"=== overall wall={timedelta(seconds=int(total_wall))} ===")
