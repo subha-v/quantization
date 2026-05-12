@@ -447,6 +447,80 @@ python3 qwen/scripts/expP_analyze.py  # no GPU
 
 Plan: `/Users/subha/.claude/plans/look-through-the-qwen-crispy-curry.md`.
 
+## Qwen2.5-VL × MM-NIAH — Experiment Q: FormatBook v2 (staged 2026-05-12)
+
+Exp P established that Quest envelope scoring finds the needle (McNemar χ²≈36) but the win doesn't translate to accuracy under sparse masking. The one place Quest helps is **FormatBook** — when cold pages stay resident at lower precision rather than being masked. P6 FormatBook Quest (0.337) beat P6R Random (0.305) by +3.2 pp at top-50%. Two limits capped P:
+
+1. **The budget rarely binds.** Only 47/190 P eval items had `num_images ≥ 8`; for the rest, "top-25%" forces at least 1 page active out of 1–4 routable.
+2. **The image budget was too low.** `max_pixels=144²` capped P0 BF16 at 0.353; raising to 336² lifted P0 to 0.719.
+
+Exp Q answers a different question:
+> **Can FormatBook match full F9 accuracy while assigning F9 only to query-relevant visual pages, at lower effective KV bits?**
+
+### Slice A — retrieval-image multi-image (primary)
+
+Filter: `task=retrieval-image`, `num_images ≥ 8`, `context_length ≤ 32K`. Full pool (≈100–130 items). Equal-resolution context vs choices at **336² = 112,896 px** (Exp P had unequal resolutions that biased the answer signal through choice pages). Hot format = **F9 with BF16 sidecode** (not J12 — J12 was −3.1 pp on MM-NIAH).
+
+| Code | Description | Hot K | Cold K | Page budget |
+|---|---|---|---|---|
+| Q0 | BF16 dense | BF16 | BF16 | — |
+| Q1 | F4 dense | F4 | F4 | — |
+| Q2 | F9 dense (clean anchor) | F9 | F9 | — |
+| Q3 | **RoleOnly FormatBook** (new — tests if in-context routing matters at all) | F9 (text/choice only) | F4 (all in-context) | 0% in-context hot |
+| Q4 | Quest FormatBook | F9 | F4 | top-50% in-context |
+| Q5 | Random FormatBook (seed 0) | F9 | F4 | top-50% in-context |
+| Q6 | Oracle FormatBook (needle + Quest fill) | F9 | F4 | top-50% in-context |
+| Q7 | Quest FormatBook | F9 | F4 | top-25% in-context |
+| Q8 | Random FormatBook (seed 0) | F9 | F4 | top-25% in-context |
+| Q9 | Oracle FormatBook | F9 | F4 | top-25% in-context |
+| Q10 | INT2-cold Quest (stretch) | F9 | cold-K INT2 / V INT4 | top-25% in-context |
+| Q11 | INT2-cold Random (stretch, seed 0) | F9 | cold-K INT2 / V INT4 | top-25% in-context |
+
+Branch-conditional reseeds (Q5_s1/s2, Q8_s1/s2, Q11_s1/s2) launch only if a Quest-vs-Random gap fires: `acc gap ≥ 0.02` OR `paired_net ≥ 5`. Top-25 reseed has priority over top-50 (lower bits Pareto). Also a 448² mini-check on Q0/Q2/Q4 at n=32 (`max_pixels=200704`, matches official MM-NIAH InternVL eval).
+
+### Slice B — reasoning-image (deferred, not auto-launched)
+
+If Slice A still looks choice-dominated (Q3 ≈ Q2 AND Q4 ≤ Q5), the analyzer writes `slice_b_recommendation: RUN` into `expQ_branch_sliceA.json`. The orchestrator only launches Slice B (R0..R8 + fresh F9 calibration NPZ) when invoked with `--slice-b`. Reasoning-image is the cleaner page-precision-routing target because the needle's content matters, not just its location.
+
+### Metrics (load-bearing, requested explicitly)
+
+- **`effective_kv_bits` / `effective_k_bits`** — token-weighted average from the per-page format assignment. F9 = K-bits 5.50; F4 = 4.00; cold-K INT2 = 2.00; V uniformly INT4 = 4.00. `effective_kv_bits = (effective_k_bits + 4) / 2`. **Do not confuse the KV-average (4.75 for F9) with K-bits-alone.**
+- **`f9_sidecode_token_fraction`** — fraction of tokens stored at F9 precision. FormatBook reduces this; F9 dense = 1.0.
+- **`logical_page_read`** — fraction of routable pages kept active (sparse-route read reduction; = 1.0 for FormatBook).
+- **`needle_hit`** — layer-averaged fraction of layers where the needle is in the active set.
+- **Per-num_images breakdown** (8–11 / 12–19 / 20+) — tests whether Quest helps only in the long-context regime where the budget binds.
+
+Latency is logged but is **diagnostic-only** (dense attention runs throughout in this fake-quant implementation).
+
+### What's new in `qwen/scripts/`
+
+- `expQ_driver.py` — Slice A/B driver. `--task retrieval-image|reasoning-image`, `--include-int2-stretch`, `--include-reseed`. Per-page bits accounting in `score_item` via `_compute_bit_metrics`.
+- `expQ_smoke.py` — n=3 smoke. New assertions: **F.role_only_zero_hot**, **G.allhot_matches_F9_dense** (FormatBook with budget=1.0 must match Q2 logits within 1e-4), **H.int2_cold_smaller**, **I.effective_bits_math**.
+- `expQ_analyze.py` — summary + paired McNemar (13 load-bearing pairs for Slice A, 9 for Slice B) + verdict matrix + branch-check JSON. New columns: `effective_kv_bits`, `effective_k_bits`, `f9_sidecode_token_fraction`. New section: per-num_images breakdown.
+- `expQ_calibrate_reasoning.py` — fresh F9 outlier calibration on reasoning-image cal-100 (Slice B only).
+- `run_expQ_overnight.sh` — tmux orchestrator with branching: smoke → Slice A main → analyze → conditional reseed → 448² mini-check → final analyze → Slice B (only on explicit `--slice-b`).
+- Shared-module edits (additive):
+  - `attention_router.py`: `_int2_per_channel_seq` cold quantizer + `RoutePolicy.cold_quantizer` field + `formatbook_role_only` / `formatbook_all_hot` policies.
+  - `mm_niah_loader.py`: `--task reasoning-image` support via `_find_needle_idx_reasoning` (uses `meta["needles"]` filenames) + per-task split files.
+  - `quest_scorer.py`: `role_only` and `all_hot` selection policies.
+
+### Running on tambe-server-1
+
+```bash
+ssh subha2@tambe-server-1
+cd /data/subha2/quantization && git pull
+nvidia-smi --query-compute-apps=pid,process_name,used_memory,gpu_uuid --format=csv
+CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expQ_overnight.sh
+# After Slice A completes, check the recommendation:
+#   cat qwen/results/expQ_branch_sliceA.json
+# If slice_b_recommendation == "RUN", launch Slice B explicitly:
+#   CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expQ_overnight.sh --slice-b
+```
+
+**Wall estimate:** 6–8 h core (Slice A + 448² mini-check); up to ~12 h if reseed triggers. Slice B adds ~4–6 h on top.
+
+Plan: `/Users/subha/.claude/plans/read-through-qwen-and-golden-nebula.md`.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment G: Frame-scaling under fixed KV memory budget (staged 2026-05-09)
 
 After Exp F (KIVI per-channel-along-seq) closed 94.4% of the KV-quantization collapse at TRUE 4.00 KV bits, the open research question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget*. The theoretical math at fixed `max_pixels=360×420`:

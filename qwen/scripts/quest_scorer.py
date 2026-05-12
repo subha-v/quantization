@@ -142,12 +142,23 @@ def select_active_pages(layout: PageLayout,
     routable_idx = [p.page_idx for p in routable]
     n = len(routable)
 
-    if policy == "none" or n == 0:
+    if policy in ("none", "all_hot") or n == 0:
         return RoutingDecision(
             active_routable_pages=routable_idx[:],
             cold_routable_pages=[],
             scores=scores, policy=policy,
             needle_in_active=(layout.needle_page_idx in routable_idx),
+        )
+
+    if policy == "role_only":
+        # FormatBook RoleOnly: zero in-context pages hot, all cold.
+        # (Text + choice pages are always-on and stay at hot precision via
+        # the cache; only in-context routable pages downgrade.)
+        return RoutingDecision(
+            active_routable_pages=[],
+            cold_routable_pages=routable_idx[:],
+            scores=scores, policy=policy,
+            needle_in_active=False,
         )
 
     # oracle_needle_only ignores budget_fraction (always returns just the needle);

@@ -44,20 +44,36 @@ from quest_scorer import (
 )
 
 
-# ---------------- F4 re-quantization (for FormatBook cold downgrade) ----------------
+# ---------------- F4 / INT2 re-quantization (for FormatBook cold downgrade) ----------------
 
-def _f4_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
-    """KIVI per-channel-seq INT4: per-(B, H, channel) scale from seq-dim max-abs.
+def _per_channel_seq_quant(K: torch.Tensor, qmax: float) -> torch.Tensor:
+    """KIVI per-channel-seq symmetric INT-N: per-(B, H, channel) scale from
+    seq-dim max-abs, then round-to-nearest with symmetric clamp.
 
-    Applied per-page during FormatBook to "downgrade" already-J12-quantized K
-    for cold pages. The result is BF16 values on F4's coarser grid; this
-    approximates the effect of having stored that page at F4 from the start.
+    Used by FormatBook to downgrade cold-page K to a coarser grid in place.
+    The result is BF16-typed values on the coarser INT-N grid.
     """
-    qmax = 7.0  # 2^(4-1) - 1
     Kf = K.float()
     amax = Kf.abs().amax(dim=-2, keepdim=True)  # over seq dim
     s = amax.clamp_min(1e-8) / qmax
     return ((Kf / s).round().clamp(-qmax, qmax) * s).to(K.dtype)
+
+
+def _f4_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
+    """INT4 cold downgrade: qmax = 2^3 - 1 = 7.0. K bits/token = 4."""
+    return _per_channel_seq_quant(K, qmax=7.0)
+
+
+def _int2_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
+    """INT2 ternary cold downgrade: qmax = 2^1 - 1 = 1.0 → {-s, 0, +s}.
+    K bits/token = 2. Exp Q Q10/Q11 stretch path."""
+    return _per_channel_seq_quant(K, qmax=1.0)
+
+
+_COLD_QUANTIZERS = {
+    "f4": _f4_per_channel_seq,
+    "int2": _int2_per_channel_seq,
+}
 
 
 # ---------------- routing policy parsing ----------------
@@ -73,18 +89,28 @@ class RoutePolicy:
       "oracle_sparse"      -> needle + Quest top-(K-1) fill at matched budget (P5)
       "oracle_needle_only" -> needle ONLY, no fill (P5_only; strict)
 
-    name (formatbook: cold pages stay but downgrade to F4):
-      "formatbook_quest"   -> Quest top-K hot pages get J12, others F4 (P6)
-      "formatbook_random"  -> Random top-K hot pages get J12, others F4 (P6R)
-      "formatbook_oracle"  -> Oracle (needle + Quest fill) hot, others F4 (P6O)
+    name (formatbook: cold pages stay but downgrade per cold_quantizer):
+      "formatbook_quest"     -> Quest top-K hot pages stay at hot K-cfg, rest downgrade
+      "formatbook_random"    -> Random top-K hot, rest downgrade
+      "formatbook_oracle"    -> Oracle (needle + Quest fill) hot, rest downgrade
+      "formatbook_role_only" -> Zero in-context pages hot (text+choice stay hot via
+                                always-on; every routable in-context page downgrades).
+                                Exp Q Q3.
+      "formatbook_all_hot"   -> All routable pages hot (smoke-only sanity; must match
+                                dense hot-cfg logits within 1e-4).
 
-    budget_fraction: required for everything except "none" and
-                     "oracle_needle_only".
+    budget_fraction: required for sparse/formatbook_{quest,random,oracle}; ignored
+                     for "none", "oracle_needle_only", "formatbook_role_only",
+                     "formatbook_all_hot".
     gqa_aggregate:   "sum" or "max" — Q-head aggregation for Quest scoring.
+    cold_quantizer:  "f4" (default; Exp P/Q4-Q9) or "int2" (Exp Q Q10/Q11 stretch).
+                     Selects which downgrade kernel runs on cold pages for
+                     FormatBook routes.
     """
     name: str
     budget_fraction: Optional[float] = None
     gqa_aggregate: str = "sum"
+    cold_quantizer: str = "f4"
 
     def is_sparse(self) -> bool:
         return self.name in (
@@ -94,6 +120,7 @@ class RoutePolicy:
     def is_formatbook(self) -> bool:
         return self.name in (
             "formatbook_quest", "formatbook_random", "formatbook_oracle",
+            "formatbook_role_only", "formatbook_all_hot",
         )
 
     def selection_policy(self) -> str:
@@ -105,6 +132,8 @@ class RoutePolicy:
             "formatbook_quest": "quest_top",
             "formatbook_random": "random_top",
             "formatbook_oracle": "oracle_needle",
+            "formatbook_role_only": "role_only",
+            "formatbook_all_hot": "all_hot",
         }[self.name]
 
 
@@ -236,18 +265,24 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
         cold_token_mask = build_cold_token_mask(layout, decision.cold_routable_pages, T_k)
 
         if policy.is_formatbook():
-            # Downgrade cold pages' K in place (F4 re-quantization). All pages
-            # still participate in attention; cold pages just have noisier K.
+            # Downgrade cold pages' K in place. All pages still participate in
+            # attention; cold pages just have noisier K. cold_quantizer dispatches
+            # between F4 (Exp P, Exp Q Q4-Q9) and INT2 (Exp Q Q10/Q11 stretch).
+            cold_fn = _COLD_QUANTIZERS.get(policy.cold_quantizer)
+            if cold_fn is None:
+                raise ValueError(
+                    f"unknown cold_quantizer={policy.cold_quantizer!r}; "
+                    f"expected one of {sorted(_COLD_QUANTIZERS)}"
+                )
             if cold_token_mask.any():
                 key = key.clone()
-                # Apply F4 per page slice (per-page-seq scale).
                 cold_set = set(decision.cold_routable_pages)
                 for p in layout.pages:
                     if p.page_idx in cold_set:
                         s = max(0, p.start)
                         e = min(T_k, p.end)
                         if s < e:
-                            key[:, :, s:e, :] = _f4_per_channel_seq(key[:, :, s:e, :])
+                            key[:, :, s:e, :] = cold_fn(key[:, :, s:e, :])
             return original_sdpa(query, key, value, attn_mask=attn_mask,
                                  dropout_p=dropout_p, is_causal=is_causal,
                                  scale=scale, **kwargs)

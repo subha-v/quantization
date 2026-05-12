@@ -38,9 +38,19 @@ from typing import Optional
 DEFAULT_ROOT = Path(os.environ.get("MM_NIAH_ROOT", "/data/subha2/mm_niah"))
 DEFAULT_SUBSET = "mm_niah_val"
 DEFAULT_TASK = "retrieval-image"
+SUPPORTED_TASKS = ("retrieval-image", "reasoning-image")
 DEFAULT_SPLIT_FILE = (
     Path(__file__).resolve().parents[1] / "calibration" / "mm_niah_split_seed0.json"
 )
+
+
+def split_file_for_task(task: str) -> Path:
+    """Per-task split file. retrieval-image uses the legacy DEFAULT_SPLIT_FILE
+    for back-compat with Exp P; reasoning-image gets its own seed-0 split.
+    """
+    if task == "retrieval-image":
+        return DEFAULT_SPLIT_FILE
+    return DEFAULT_SPLIT_FILE.parent / f"mm_niah_{task}_split_seed0.json"
 
 
 @dataclass
@@ -84,8 +94,8 @@ def context_bucket(ctx_len: int) -> Optional[str]:
 _NEEDLE_PATH_TOKENS = ("find-image", "abnormal_pic")
 
 
-def _find_needle_idx(images_list: list[str]) -> int:
-    """Return the index of the needle image within images_list.
+def _find_needle_idx_retrieval(images_list: list[str]) -> int:
+    """Return the index of the needle image within images_list (retrieval-image).
 
     Heuristic: needles are inserted from `obelics_paste/find-image/` or
     `abnormal_pic*/`; all other images come from the surrounding Obelics article
@@ -95,6 +105,40 @@ def _find_needle_idx(images_list: list[str]) -> int:
         if any(tok in p for tok in _NEEDLE_PATH_TOKENS):
             return i
     return -1
+
+
+def _find_needle_idx_reasoning(images_list: list[str], meta: dict) -> int:
+    """Return the index of the needle image for reasoning-image.
+
+    Reasoning-image's annotation puts the needle filename(s) in `meta["needles"]`.
+    Match by basename against each image in images_list.
+    """
+    needles = meta.get("needles") or []
+    if not needles:
+        return -1
+    needle_basenames = {os.path.basename(str(n)) for n in needles}
+    for i, p in enumerate(images_list):
+        if os.path.basename(p) in needle_basenames:
+            return i
+    # Fallback: substring match on full path (some annotations use sub-paths).
+    for i, p in enumerate(images_list):
+        for n in needles:
+            if str(n) and str(n) in p:
+                return i
+    return -1
+
+
+def _find_needle_idx_by_task(images_list: list[str], meta: dict, task: str) -> int:
+    if task == "retrieval-image":
+        return _find_needle_idx_retrieval(images_list)
+    if task == "reasoning-image":
+        return _find_needle_idx_reasoning(images_list, meta)
+    raise ValueError(f"unsupported task={task!r}")
+
+
+# Back-compat alias.
+def _find_needle_idx(images_list: list[str]) -> int:
+    return _find_needle_idx_retrieval(images_list)
 
 
 # ---------------- raw dataset reading ----------------
@@ -129,7 +173,7 @@ def _resolve_image_paths(paths: list[str], images_root: Path) -> list[str]:
     return [str(images_root / p) for p in paths]
 
 
-def _normalize(rec: dict, images_root: Path) -> Optional[MMNiahItem]:
+def _normalize(rec: dict, images_root: Path, task: str = DEFAULT_TASK) -> Optional[MMNiahItem]:
     rid = str(rec.get("id"))
     context = rec.get("context", "")
     question = rec.get("question", "")
@@ -143,7 +187,9 @@ def _normalize(rec: dict, images_root: Path) -> Optional[MMNiahItem]:
 
     if answer is None or not isinstance(answer, int):
         return None
-    if not (0 <= answer < 4):  # retrieval-image is always 4-way
+    # retrieval-image and reasoning-image are both 4-way single-choice MCQ over
+    # candidate images.
+    if not (0 <= answer < 4):
         return None
     if len(choices_raw) != 4:
         return None
@@ -154,7 +200,7 @@ def _normalize(rec: dict, images_root: Path) -> Optional[MMNiahItem]:
     bucket = context_bucket(ctx_len)
     if bucket is None:
         return None
-    needle_idx = _find_needle_idx(images_list_raw)
+    needle_idx = _find_needle_idx_by_task(images_list_raw, meta, task)
     if needle_idx < 0:
         return None
     return MMNiahItem(
@@ -178,7 +224,7 @@ def load_all_items(root: Path = DEFAULT_ROOT,
                    task: str = DEFAULT_TASK) -> list[MMNiahItem]:
     raw = load_raw_records(root, subset, task)
     images_root = _images_root(root, subset)
-    items = [it for it in (_normalize(r, images_root) for r in raw) if it is not None]
+    items = [it for it in (_normalize(r, images_root, task=task) for r in raw) if it is not None]
     return items
 
 
