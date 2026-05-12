@@ -239,7 +239,7 @@ def main():
                     help="MM-NIAH context-length bucket: short / mid / long. Use short for smoke "
                          "to keep KV cache small on a contended GPU.")
     ap.add_argument("--calib-npz", type=Path,
-                    default=CALIBRATION_DIR / "expJ_kcalib_Qwen2.5-VL-7B-Instruct_frames128.npz")
+                    default=CALIBRATION_DIR / "expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz")
     ap.add_argument("--out", type=Path, default=RESULTS_DIR / "expP_smoke.md")
     ap.add_argument("--out-jsonl", type=Path, default=RESULTS_DIR / "expP_smoke.jsonl")
     ap.add_argument("--gpu", type=int, default=0)

@@ -391,7 +391,9 @@ def main():
     ap.add_argument("--n-items", type=int, default=200)
     ap.add_argument("--gpu", type=int, default=0)
     ap.add_argument("--calib-npz", type=Path,
-                    default=CALIBRATION_DIR / "expJ_kcalib_Qwen2.5-VL-7B-Instruct_frames128.npz")
+                    default=CALIBRATION_DIR / "expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz",
+                    help="MM-NIAH-calibrated F9 outlier indices. Recomputed by "
+                         "expP_calibrate.py on cal-100, not reused from LVB.")
     ap.add_argument("--out-jsonl", type=Path, default=RESULTS_DIR / "expP_rollouts.jsonl")
     ap.add_argument("--out-summary", type=Path, default=RESULTS_DIR / "expP_summary.md")
     ap.add_argument("--include-stretch", action="store_true",

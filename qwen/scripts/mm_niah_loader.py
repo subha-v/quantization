@@ -184,27 +184,39 @@ def load_all_items(root: Path = DEFAULT_ROOT,
 
 # ---------------- stratified split ----------------
 
-def make_split(items: list[MMNiahItem], seed: int = 0,
-               targets: Optional[dict[str, int]] = None) -> dict[str, list[str]]:
-    """Return {'eval': [ids]} stratified by context-length bucket.
+CAL_TARGETS = {"short": 34, "mid": 33, "long": 33}  # 100 total
 
-    By default 200 items: 67 short, 67 mid, 66 long. P0 does not use a separate
-    cal split (J12 calibration is reused from the LVB seed=0 NPZ).
+
+def make_split(items: list[MMNiahItem], seed: int = 0,
+               eval_targets: Optional[dict[str, int]] = None,
+               cal_targets: Optional[dict[str, int]] = None) -> dict[str, list[str]]:
+    """Return {'cal': [ids], 'eval': [ids]} stratified by context-length bucket.
+
+    Default: 100 cal (34/33/33) + 200 eval (67/67/66). Cal and eval are
+    disjoint within each bucket. Items not picked go in neither set.
     """
-    targets = targets or STRATA_TARGETS
+    eval_targets = eval_targets or STRATA_TARGETS
+    cal_targets = cal_targets or CAL_TARGETS
     rng = random.Random(seed)
     by_bucket: dict[str, list[MMNiahItem]] = {}
     for it in items:
         by_bucket.setdefault(it.context_length_bucket, []).append(it)
+    cal_ids: list[str] = []
     eval_ids: list[str] = []
-    for bucket, total in targets.items():
+    for bucket in sorted(set(eval_targets) | set(cal_targets)):
         pool = by_bucket.get(bucket, [])
-        if len(pool) < total:
-            print(f"[warn] mm_niah bucket={bucket} has only {len(pool)} items (need {total})")
-            total = len(pool)
+        n_eval = eval_targets.get(bucket, 0)
+        n_cal = cal_targets.get(bucket, 0)
+        need = n_eval + n_cal
+        if len(pool) < need:
+            print(f"[warn] mm_niah bucket={bucket} has only {len(pool)} items "
+                  f"(need {need} = {n_eval} eval + {n_cal} cal)")
         rng.shuffle(pool)
-        eval_ids.extend(it.id for it in pool[:total])
-    return {"eval": eval_ids}
+        chosen = pool[:min(need, len(pool))]
+        # First n_cal go to cal, next n_eval go to eval (disjoint within bucket).
+        cal_ids.extend(it.id for it in chosen[:n_cal])
+        eval_ids.extend(it.id for it in chosen[n_cal:n_cal + n_eval])
+    return {"cal": cal_ids, "eval": eval_ids}
 
 
 def save_split(split: dict[str, list[str]], path: Path = DEFAULT_SPLIT_FILE) -> None:
