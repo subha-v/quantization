@@ -1065,4 +1065,17 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         KQuantizerConfig(name="M12_Pivot12_BF16side", kind="kivi_outlier16", bits=4,
                          n_outliers=12, outlier_idx_key="outlier_idx_PIVOT_top16",
                          calib=calib, outlier_storage_bits=16),
+        # ============================================================
+        # Exp R: static matched-budget baselines for the AllVisual claim.
+        # Defends against the reviewer question "why not just use a uniform
+        # sidecode at this bit count?" S8/SJ already exist as F8/J12.
+        # ============================================================
+        # S4: top-4 BF16 outlier channels everywhere.
+        #     K-bits = (16·4 + 124·4)/128 = 4.375 → KV avg 4.1875
+        KQuantizerConfig(name="S4_Outlier4_BF16side", kind="kivi_outlier8", bits=4,
+                         n_outliers=4, calib=calib, outlier_storage_bits=16),
+        # S12: top-12 BF16 outlier channels everywhere.
+        #      K-bits = (16·12 + 116·4)/128 = 5.125 → KV avg 4.5625
+        KQuantizerConfig(name="S12_Outlier12_BF16side", kind="kivi_outlier16", bits=4,
+                         n_outliers=12, calib=calib, outlier_storage_bits=16),
     ]

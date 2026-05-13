@@ -181,7 +181,17 @@ def slice_cond_order(slice_tag: str) -> list[str]:
             "Q10", "Q11", "Q11_s1", "Q11_s2",
             "Q_allhot",
         ]
-    return ["R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8"]
+    if slice_tag == "B":
+        return ["R0", "R1", "R2", "R3", "R4", "R5", "R6", "R7", "R8"]
+    if slice_tag == "C":
+        # Exp R Sub-experiment C ordering.
+        return [
+            "C0", "C1", "C2", "C3", "C3b",
+            "C4", "C5", "C6",
+            "C7", "C8",
+            "S4", "S8", "S12", "SJ",
+        ]
+    return []
 
 
 def write_summary(rows: list[dict], out_md: Path, slice_tag: str) -> None:
@@ -263,10 +273,67 @@ def write_summary(rows: list[dict], out_md: Path, slice_tag: str) -> None:
 
         lines.append(f"| {c} | {cell(by_nimg['8-11'])} | {cell(by_nimg['12-19'])} | {cell(by_nimg['20+'])} |")
 
+    # ---------------- Pareto frontier (Exp R section) ----------------
+    lines.append("")
+    lines.append("## Pareto frontier (accuracy vs effective_kv_bits)")
+    lines.append("")
+    lines.append("Pareto-optimal: no other condition has BOTH higher accuracy AND lower KV-bits.")
+    lines.append("")
+    lines.append("| condition | n | acc | eff_kv_bits | eff_k_bits | on Pareto front? |")
+    lines.append("|---|---|---|---|---|---|")
+    # Build the (cond, acc, kv_bits) list across all conditions for which we have valid metrics.
+    cond_points: list[tuple[str, int, float, float, float]] = []
+    for c in cond_order + sorted(set(by_cond) - set(cond_order)):
+        if c not in by_cond:
+            continue
+        m = cond_metrics(by_cond[c])
+        if m["acc_mean"] is None or m["effective_kv_bits_mean"] is None:
+            continue
+        if math.isnan(m["acc_mean"]) or math.isnan(m["effective_kv_bits_mean"]):
+            continue
+        cond_points.append((
+            c, m["n"], float(m["acc_mean"]),
+            float(m["effective_kv_bits_mean"]),
+            float(m["effective_k_bits_mean"]) if m["effective_k_bits_mean"] is not None else float("nan"),
+        ))
+    # Pareto: a point (acc, kvb) is on the frontier if no other point has
+    # acc' >= acc AND kvb' <= kvb (with at least one strict inequality).
+    pareto_set = set()
+    for i, (ci, _, acci, kvbi, _) in enumerate(cond_points):
+        dominated = False
+        for j, (cj, _, accj, kvbj, _) in enumerate(cond_points):
+            if i == j:
+                continue
+            if accj >= acci and kvbj <= kvbi and (accj > acci or kvbj < kvbi):
+                dominated = True
+                break
+        if not dominated:
+            pareto_set.add(ci)
+    for c, n, acc, kvb, kb in cond_points:
+        on_front = "**YES**" if c in pareto_set else "no"
+        lines.append(f"| {c} | {n} | {acc:.3f} | {kvb:.3f} | {kb:.3f} | {on_front} |")
+
     out_md.write_text("\n".join(lines) + "\n")
 
 
 # ---------------- paired McNemar ----------------
+
+def pairs_slice_c() -> list[tuple[str, str, str]]:
+    """Exp R Sub-experiment C load-bearing paired-McNemar tests."""
+    return [
+        ("C4", "C2", "AllVisual-Quest vs F9 dense — PARETO TIE TEST"),
+        ("C4", "C3", "AllVisual-Quest vs TextOnly — does visual routing matter?"),
+        ("C4", "C3b", "AllVisual-Quest vs ChoiceOnly — CRITICAL: not choice-mediated"),
+        ("C4", "C5", "AllVisual-Quest vs AllVisual-Random — Quest selection matters?"),
+        ("C6", "C4", "AllVisual-Oracle headroom over Quest"),
+        ("C7", "C4", "Split-Quest vs global Quest"),
+        ("C7", "C8", "Split-Quest vs Split-Random"),
+        ("C7", "C3b", "Split-Quest vs ChoiceOnly (parallel diagnostic)"),
+        ("C4", "S8", "AllVisual-Quest vs static F8 (matched budget)"),
+        ("C4", "S4", "AllVisual-Quest vs static S4 (4.19 KV bits)"),
+        ("C4", "SJ", "AllVisual-Quest vs J12 (F9 INT8 sidecode)"),
+    ]
+
 
 def pairs_slice_a() -> list[tuple[str, str, str]]:
     return [
@@ -303,8 +370,15 @@ def pairs_slice_b() -> list[tuple[str, str, str]]:
 def write_paired(rows: list[dict], out_md: Path, slice_tag: str) -> None:
     by_cond = group_by_condition(rows)
     rows_by_item = {c: map_by_item(rs) for c, rs in by_cond.items()}
-    pairs = pairs_slice_a() if slice_tag == "A" else pairs_slice_b()
-    lines = [f"# Exp Q paired McNemar slice {slice_tag} — "
+    if slice_tag == "A":
+        pairs = pairs_slice_a()
+    elif slice_tag == "B":
+        pairs = pairs_slice_b()
+    elif slice_tag == "C":
+        pairs = pairs_slice_c()
+    else:
+        pairs = []
+    lines = [f"# Exp Q/R paired McNemar slice {slice_tag} — "
              f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}", ""]
     lines.append("| pair | description | n_paired | A_only | B_only | χ² | p | favored |")
     lines.append("|---|---|---|---|---|---|---|---|")
@@ -366,6 +440,67 @@ def write_branch_json(rows: list[dict], out_json: Path, slice_tag: str) -> dict:
         out["accuracy"] = {c: _acc(rs) for c, rs in by_cond.items()}
         out["paired_net"] = {}
         for a, b in (("Q4", "Q5"), ("Q7", "Q8"), ("Q10", "Q11"), ("Q4", "Q3"), ("Q7", "Q3")):
+            if a in rows_by_item and b in rows_by_item:
+                out["paired_net"][f"{a}_vs_{b}"] = _paired_net(rows_by_item[a], rows_by_item[b])
+    elif slice_tag == "C":
+        # Exp R Sub-experiment C gate.
+        c2 = _acc(by_cond.get("C2", []))
+        c3b = _acc(by_cond.get("C3b", []))
+        s8 = _acc(by_cond.get("S8", []))
+
+        winners: list[dict] = []
+        for cand in ("C4", "C7"):
+            if cand not in rows_by_item or "C2" not in rows_by_item:
+                continue
+            tie_with_f9 = paired_mcnemar(rows_by_item[cand], rows_by_item["C2"])
+            ekvb_vals = [r.get("effective_kv_bits") for r in by_cond.get(cand, [])
+                         if r.get("effective_kv_bits") is not None]
+            ekvb_mean = float(np.mean(ekvb_vals)) if ekvb_vals else float("nan")
+            paired_tie = tie_with_f9["chi2"] < 3.84
+            beats_choice_only = (
+                "C3b" in rows_by_item
+                and _paired_net(rows_by_item[cand], rows_by_item["C3b"]) >= 5
+            )
+            beats_static_s8 = (
+                "S8" in rows_by_item
+                and _paired_net(rows_by_item[cand], rows_by_item["S8"]) >= 3
+            )
+            under_4_35 = (not math.isnan(ekvb_mean)) and ekvb_mean <= 4.35
+            passes = paired_tie and beats_choice_only and beats_static_s8 and under_4_35
+            winners.append({
+                "cond": cand,
+                "acc": _acc(by_cond.get(cand, [])),
+                "effective_kv_bits": ekvb_mean,
+                "paired_tie_with_F9": paired_tie,
+                "beats_choice_only": beats_choice_only,
+                "beats_static_S8": beats_static_s8,
+                "under_4_35_kv_bits": under_4_35,
+                "passes_c_gate": passes,
+            })
+
+        # Pick the winner: any condition that passes; prefer C7 over C4 if both pass.
+        passing = [w for w in winners if w["passes_c_gate"]]
+        if passing:
+            # Prefer SplitQuest (C7) over global Quest (C4) — it explicitly
+            # balances across in-context and choice, which the brief flags as
+            # the "right routing object" if it wins.
+            chosen = next((w for w in passing if w["cond"] == "C7"), passing[0])
+            out["c_gate_passed"] = True
+            out["winning_allvisual_cond"] = chosen["cond"]
+            out["winner_route_name"] = (
+                "formatbook_split_quest" if chosen["cond"] == "C7"
+                else "formatbook_quest_allvisual"
+            )
+        else:
+            out["c_gate_passed"] = False
+            out["winning_allvisual_cond"] = None
+            out["winner_route_name"] = None
+
+        out["candidates"] = winners
+        out["accuracy"] = {c: _acc(rs) for c, rs in by_cond.items()}
+        out["paired_net"] = {}
+        for a, b in (("C4", "C5"), ("C7", "C8"), ("C4", "C3b"), ("C7", "C3b"),
+                     ("C4", "S8"), ("C7", "S8"), ("C4", "C2"), ("C7", "C2")):
             if a in rows_by_item and b in rows_by_item:
                 out["paired_net"][f"{a}_vs_{b}"] = _paired_net(rows_by_item[a], rows_by_item[b])
     else:
@@ -513,7 +648,9 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slice", choices=("A", "B"), default="A")
+    ap.add_argument("--slice", choices=("A", "B", "C"), default="A",
+                    help="A=Slice A retrieval-image (Exp Q), B=Slice B reasoning-image (Exp Q), "
+                         "C=Exp R Sub-experiment C (AllVisual + static baselines).")
     ap.add_argument("--in-jsonl", type=Path, default=None,
                     help="Default: results/expQ_rollouts_slice{A|B}.jsonl")
     ap.add_argument("--out-summary", type=Path, default=None)

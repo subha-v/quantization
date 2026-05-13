@@ -125,12 +125,17 @@ def build_page_layout(input_ids: torch.Tensor,
                       processor,
                       n_in_context_images: int,
                       n_choice_images: int,
-                      needle_idx_in_images: int) -> PageLayout:
+                      needle_idx_in_images: int,
+                      include_choice_routing: bool = False) -> PageLayout:
     """Build a PageLayout for an MM-NIAH retrieval-image item.
 
     n_in_context_images: number of in-context (haystack) images
     n_choice_images: typically 4 (A..D)
     needle_idx_in_images: which of the n_in_context_images is the needle
+    include_choice_routing: when True (Exp R AllVisual), choice-image pages
+        are flagged is_routable=True alongside in-context-image pages so they
+        participate in Quest/Random/Oracle FormatBook routing. Default False
+        preserves Exp Q (in-context-only) behavior.
 
     The first n_in_context_images visual spans are tagged in_context_image;
     the last n_choice_images visual spans are tagged choice_image. The text
@@ -184,7 +189,10 @@ def build_page_layout(input_ids: torch.Tensor,
             kind = "choice_image"
             image_idx = span_i - k_in_context
             is_needle = False
-            is_routable = False  # choice images are always-on
+            # Exp Q (default): choice images are always-on (is_routable=False).
+            # Exp R AllVisual: include_choice_routing=True flags them as routable
+            # so Quest/Random/Oracle FormatBook can route them too.
+            is_routable = include_choice_routing
         pages.append(Page(
             start=v_start, end=v_end, kind=kind,
             page_idx=page_idx, image_idx=image_idx,

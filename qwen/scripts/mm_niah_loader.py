@@ -359,8 +359,19 @@ def _cli():
     ap.add_argument("--subset", default=DEFAULT_SUBSET)
     ap.add_argument("--task", default=DEFAULT_TASK)
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--out", type=Path, default=DEFAULT_SPLIT_FILE)
+    ap.add_argument("--out", type=Path, default=None,
+                    help="Output split JSON path. Defaults to per-(task, seed) "
+                         "via split_file_for_task() with seed suffix.")
     args = ap.parse_args()
+    if args.out is None:
+        base = split_file_for_task(args.task)
+        if args.seed == 0 and args.task == "retrieval-image":
+            # Preserve legacy DEFAULT_SPLIT_FILE name for backward compat.
+            args.out = base
+        else:
+            args.out = base.with_name(
+                f"mm_niah_{args.task}_split_seed{args.seed}.json"
+            )
     items = load_all_items(args.root, args.subset, args.task)
     print(f"loaded {len(items)} {args.task} items from {args.root}")
     bcounts: dict[str, int] = {}
@@ -369,7 +380,7 @@ def _cli():
     print(f"by bucket: {bcounts}")
     split = make_split(items, seed=args.seed)
     save_split(split, args.out)
-    print(f"wrote split: eval={len(split['eval'])} -> {args.out}")
+    print(f"wrote split: cal={len(split['cal'])} eval={len(split['eval'])} -> {args.out}")
 
 
 if __name__ == "__main__":

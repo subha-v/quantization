@@ -91,9 +91,20 @@ class CondSpec:
 HOT = "F9_KIVI_Outlier16"        # F9 with BF16 outlier sidecode — clean MM-NIAH hot anchor.
 F4 = "F4_KIVI_PerChannelSeq"      # F4 dense anchor.
 
-# Per-token K bits per page format. V is uniformly INT4 in this setup (= 4.0).
-PAGE_K_BITS = {"F9": 5.50, "F4": 4.00, "INT2": 2.00}
-V_BITS = 4.00
+# Per-token K bits per page format (Exp R extends Exp Q with INT3 and FP8).
+PAGE_K_BITS = {"F9": 5.50, "F4": 4.00, "INT3": 3.00, "INT2": 2.00, "FP8": 8.00}
+# Per-token V bits. Default V is uniformly INT4 from FakeQuantKVCache.
+# Cold-V INT2 is per-page (only when policy.cold_v_quantizer="int2").
+V_BITS_DEFAULT = 4.00
+V_BITS_COLD_INT2 = 2.00
+V_BITS_BF16_DENSE = 16.00   # Q0/A0/B0/C0/D0: V is BF16 (cache bypassed entirely)
+
+# Static matched-budget baselines for Exp R. Bits are computed in
+# _page_k_bits_dense via S-name lookup since these are dense conditions.
+S4_K_BITS = (16 * 4 + 124 * 4) / 128.0   # = 4.375
+S8_K_BITS = (16 * 8 + 120 * 4) / 128.0   # = 4.750 (= F8)
+S12_K_BITS = (16 * 12 + 116 * 4) / 128.0 # = 5.125
+SJ_K_BITS = (8 * 16 + 4 * 112) / 128.0   # = 4.500 (J12 — INT8 sidecode)
 
 
 def q_conditions_slice_a(include_int2: bool = True) -> list[CondSpec]:
@@ -155,6 +166,80 @@ def r_conditions_slice_b() -> list[CondSpec]:
     ]
 
 
+# ============================================================
+# Exp R condition builders
+# ============================================================
+
+def c_conditions_allvisual() -> list[CondSpec]:
+    """Exp R Sub-experiment C — AllVisual routing.
+
+    All FormatBook routes here use token_budgeted=True so the 25% budget
+    applies to *tokens*, not page-count. Requires
+    --include-choice-routing in the driver so build_page_layout marks
+    choice pages as routable too.
+    """
+    return [
+        CondSpec("C0",  None, RoutePolicy("none"),                        False),
+        CondSpec("C1",  F4,   RoutePolicy("none"),                        False),
+        CondSpec("C2",  HOT,  RoutePolicy("none"),                        True),
+        CondSpec("C3",  HOT,  RoutePolicy("formatbook_role_only"),        True),
+        CondSpec("C3b", HOT,  RoutePolicy("formatbook_choice_only"),      True),
+        CondSpec("C4",  HOT,  RoutePolicy("formatbook_quest_allvisual",  0.25, token_budgeted=True), True),
+        CondSpec("C5",  HOT,  RoutePolicy("formatbook_random_allvisual", 0.25, token_budgeted=True), True),
+        CondSpec("C6",  HOT,  RoutePolicy("formatbook_oracle_allvisual", 0.25, token_budgeted=True), True),
+        CondSpec("C7",  HOT,  RoutePolicy("formatbook_split_quest",      0.25, token_budgeted=True), True),
+        CondSpec("C8",  HOT,  RoutePolicy("formatbook_split_random",     0.25, token_budgeted=True), True),
+    ]
+
+
+def s_conditions_static_baselines() -> list[CondSpec]:
+    """Exp R static matched-budget baselines for C.
+    SJ alias = J12_F9_INT8side.
+    """
+    return [
+        CondSpec("S4",  "S4_Outlier4_BF16side",  RoutePolicy("none"), True),
+        CondSpec("S8",  "F8_KIVI_Outlier8",      RoutePolicy("none"), True),
+        CondSpec("S12", "S12_Outlier12_BF16side", RoutePolicy("none"), True),
+        CondSpec("SJ",  "J12_F9_INT8side",        RoutePolicy("none"), True),
+    ]
+
+
+def e_conditions_cold_ladder(best_route_name: str,
+                             budget_fraction: float = 0.25) -> list[CondSpec]:
+    """Exp R Sub-experiment E — cold-format ladder on the best AllVisual policy.
+
+    best_route_name should be one of the AllVisual policy names, e.g.
+    "formatbook_quest_allvisual" or "formatbook_split_quest" — whichever
+    won Overnight 1's Sub-experiment C.
+
+    For each cold-format variant, runs both Quest (best_route_name) and
+    a Random control (random_allvisual / split_random variant).
+    """
+    is_split = "split" in best_route_name
+    random_name = "formatbook_split_random" if is_split else "formatbook_random_allvisual"
+    variants = [
+        # (suffix, cold_quantizer, cold_v_quantizer)
+        ("F4",     "f4",   "none"),   # E0 baseline
+        ("K3_V4",  "int3", "none"),   # E1
+        ("K4_V2",  "f4",   "int2"),   # E2
+        ("K3_V2",  "int3", "int2"),   # E3
+        ("FP8_V4", "fp8",  "none"),   # E4 diagnostic
+    ]
+    conds = []
+    for i, (suffix, cq, cv) in enumerate(variants):
+        for tag, route in (("Q", best_route_name), ("R", random_name)):
+            conds.append(
+                CondSpec(
+                    f"E{i}_{suffix}_{tag}", HOT,
+                    RoutePolicy(route, budget_fraction,
+                                cold_quantizer=cq, cold_v_quantizer=cv,
+                                token_budgeted=True),
+                    True,
+                )
+            )
+    return conds
+
+
 def resolve_k_cfg(name: str, calib: Optional[dict]):
     for cfg in build_f_conditions(calib=calib):
         if cfg.name == name:
@@ -184,18 +269,46 @@ def _page_format_dense(k_cfg_name: Optional[str]) -> str:
         return "F9"
     if k_cfg_name == F4:
         return "F4"
-    # Unknown / new K-cfg — best-effort.
+    if k_cfg_name.startswith("S4_") or k_cfg_name.startswith("S8_") \
+       or k_cfg_name.startswith("S12_") or k_cfg_name == "F8_KIVI_Outlier8":
+        return k_cfg_name  # static baseline labels carry their bit budget
+    if k_cfg_name.startswith("J12_") or k_cfg_name.startswith("SJ"):
+        return "SJ"
     return k_cfg_name
 
 
+_STATIC_K_BITS = {
+    "S4_Outlier4_BF16side": S4_K_BITS,
+    "S8_Outlier8_BF16side": S8_K_BITS,
+    "F8_KIVI_Outlier8":     S8_K_BITS,   # alias used by S8 = F8
+    "S12_Outlier12_BF16side": S12_K_BITS,
+    "J12_F9_INT8side":       SJ_K_BITS,
+}
+
+
 def _page_k_bits_dense(k_cfg_name: Optional[str]) -> float:
+    """K-bits/token for a dense (non-FormatBook) condition. Used for the
+    storage metric only; the cache-side path is what actually quantizes."""
     if k_cfg_name is None:
         return 16.0
     if k_cfg_name == HOT:
         return PAGE_K_BITS["F9"]
     if k_cfg_name == F4:
         return PAGE_K_BITS["F4"]
-    return PAGE_K_BITS["F9"]  # default to F9 for unrecognized hot-style configs
+    if k_cfg_name in _STATIC_K_BITS:
+        return _STATIC_K_BITS[k_cfg_name]
+    return PAGE_K_BITS["F9"]
+
+
+def _v_bits_dense(k_cfg_name: Optional[str]) -> float:
+    """V-bits/token for a dense condition. BF16 dense (k_cfg_name=None) leaves
+    V at BF16 because FakeQuantKVCache is bypassed entirely. All other dense
+    K-cfgs use FakeQuantKVCache which quantizes V to INT4.
+    Fixes the Q0 V_BITS=4 bug from Exp Q.
+    """
+    if k_cfg_name is None:
+        return V_BITS_BF16_DENSE   # BF16 dense → V is BF16, not INT4
+    return V_BITS_DEFAULT
 
 
 def _accumulate_format_counts(layout, layer_log, policy: RoutePolicy,
@@ -254,11 +367,12 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
     is_dense = (not cond.use_page_cache) or cond.route.name == "none"
     if is_dense:
         k_bits = _page_k_bits_dense(cond.k_cfg_name)
+        v_bits = _v_bits_dense(cond.k_cfg_name)
         label = _page_format_dense(cond.k_cfg_name)
         return {
             "effective_k_bits": float(k_bits),
-            "effective_v_bits": float(V_BITS),
-            "effective_kv_bits": float((k_bits + V_BITS) / 2.0),
+            "effective_v_bits": float(v_bits),
+            "effective_kv_bits": float((k_bits + v_bits) / 2.0),
             "f9_sidecode_token_fraction": (1.0 if label == "F9" else 0.0),
             "f9_sidecode_page_fraction": (1.0 if label == "F9" else 0.0),
             "tokens_per_format": {label: int(total_tokens)},
@@ -267,15 +381,18 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
 
     # Routed path: read cache.routing_log per layer.
     rl = getattr(cache, "routing_log", {}) or {}
-    cold_label = "INT2" if cond.route.cold_quantizer == "int2" else "F4"
+    # Cold-K label
+    cq = cond.route.cold_quantizer
+    cold_label = {"f4": "F4", "int3": "INT3", "int2": "INT2", "fp8": "FP8"}.get(cq, "F4")
+    # Cold-V handling (Exp R cold-format ladder).
+    cold_v_int2 = (cond.route.cold_v_quantizer == "int2")
     if not rl:
-        # No layers fired (shouldn't happen for use_page_cache=True). Fall back
-        # to assuming everything is F9.
         k_bits = PAGE_K_BITS["F9"]
+        v_bits = V_BITS_DEFAULT
         return {
             "effective_k_bits": float(k_bits),
-            "effective_v_bits": float(V_BITS),
-            "effective_kv_bits": float((k_bits + V_BITS) / 2.0),
+            "effective_v_bits": float(v_bits),
+            "effective_kv_bits": float((k_bits + v_bits) / 2.0),
             "f9_sidecode_token_fraction": 1.0,
             "f9_sidecode_page_fraction": 1.0,
             "tokens_per_format": {"F9": int(total_tokens)},
@@ -283,14 +400,11 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
         }
 
     per_layer_k_bits: list[float] = []
+    per_layer_v_bits: list[float] = []
     f9_token_frac_layers: list[float] = []
     f9_page_frac_layers: list[float] = []
-    # Average page and token counts across layers (policy is layer-agnostic in
-    # this setup; all layers see the same routing decision because the SDPA
-    # wrapper picks per-Q query). But sum-per-layer-mean is robust to future
-    # per-layer routing.
-    tot_token_counts: dict[str, float] = {"F9": 0.0, "F4": 0.0, "INT2": 0.0}
-    tot_page_counts: dict[str, float] = {"F9": 0.0, "F4": 0.0, "INT2": 0.0}
+    tot_token_counts: dict[str, float] = {}
+    tot_page_counts: dict[str, float] = {}
     n_layers = 0
     for L, log in rl.items():
         _, page_counts, token_counts = _accumulate_format_counts(
@@ -300,6 +414,16 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
             PAGE_K_BITS[fmt] * cnt for fmt, cnt in token_counts.items()
         ) / max(1, total_tokens)
         per_layer_k_bits.append(k_bits_per_token)
+        # V-bits: default V_BITS_DEFAULT everywhere; if cold-V INT2 is on,
+        # cold-page tokens get V_BITS_COLD_INT2.
+        if cold_v_int2:
+            cold_tokens = sum(cnt for fmt, cnt in token_counts.items() if fmt == cold_label)
+            v_bits_per_token = (cold_tokens * V_BITS_COLD_INT2
+                                + (total_tokens - cold_tokens) * V_BITS_DEFAULT
+                                ) / max(1, total_tokens)
+        else:
+            v_bits_per_token = V_BITS_DEFAULT
+        per_layer_v_bits.append(v_bits_per_token)
         f9_token_frac_layers.append(token_counts.get("F9", 0) / max(1, total_tokens))
         f9_page_frac_layers.append(page_counts.get("F9", 0) / max(1, total_pages))
         for k, v in token_counts.items():
@@ -309,14 +433,13 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
         n_layers += 1
 
     k_bits = float(np.mean(per_layer_k_bits)) if per_layer_k_bits else PAGE_K_BITS["F9"]
+    v_bits = float(np.mean(per_layer_v_bits)) if per_layer_v_bits else V_BITS_DEFAULT
     f9_tok_frac = float(np.mean(f9_token_frac_layers)) if f9_token_frac_layers else 1.0
     f9_page_frac = float(np.mean(f9_page_frac_layers)) if f9_page_frac_layers else 1.0
-    # Average per-layer (token/page) format counts so a row's bookkeeping
-    # matches per-layer means.
     return {
         "effective_k_bits": k_bits,
-        "effective_v_bits": float(V_BITS),
-        "effective_kv_bits": float((k_bits + V_BITS) / 2.0),
+        "effective_v_bits": float(v_bits),
+        "effective_kv_bits": float((k_bits + v_bits) / 2.0),
         "f9_sidecode_token_fraction": f9_tok_frac,
         "f9_sidecode_page_fraction": f9_page_frac,
         "tokens_per_format": {k: float(v / max(1, n_layers)) for k, v in tot_token_counts.items()
@@ -333,8 +456,14 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
                k_cfg_obj, num_layers: int, num_kv_heads: int,
                answer_ids: list[int],
                max_pixels_context: int,
-               max_pixels_choices: int) -> dict:
-    """One forward, one condition, one item. Returns a JSONL-ready dict."""
+               max_pixels_choices: int,
+               include_choice_routing: bool = False) -> dict:
+    """One forward, one condition, one item. Returns a JSONL-ready dict.
+
+    include_choice_routing (Exp R AllVisual): when True, choice-image pages
+    are flagged is_routable=True in the layout so Quest/Random/Oracle
+    FormatBook can route them. Default False preserves Exp Q behavior.
+    """
     from qwen_vl_utils import process_vision_info  # type: ignore
 
     messages = format_mcq_messages(item, max_pixels_context=max_pixels_context,
@@ -357,10 +486,14 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
                 n_in_context_images=item.num_images,
                 n_choice_images=4,
                 needle_idx_in_images=item.needle_idx_in_images,
+                include_choice_routing=include_choice_routing,
             )
             cache = PageAwareFakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
             rng_seed = (abs(hash(f"{item.id}:{cond.name}")) % (2**31)) ^ 0xCAFEBABE
             cache.set_page_layout(layout, rng_seed=rng_seed)
+            # Plumb item.correct_choice so AllVisual-Oracle can find the
+            # correct-choice page from the routing wrapper.
+            cache.correct_choice_idx = int(item.correct_choice)
         else:
             cache = FakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
 
@@ -402,6 +535,9 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
         "route_policy": cond.route.name,
         "route_budget": cond.route.budget_fraction,
         "cold_quantizer": cond.route.cold_quantizer,
+        "cold_v_quantizer": cond.route.cold_v_quantizer,
+        "token_budgeted": cond.route.token_budgeted,
+        "include_choice_routing": include_choice_routing,
         "k_cfg": cond.k_cfg_name,
     }
 
@@ -442,11 +578,12 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
     else:
         # Dense BF16 (Q0) or dense F4 (Q1) with no PageLayout — single static bit value.
         k_bits = _page_k_bits_dense(cond.k_cfg_name)
+        v_bits = _v_bits_dense(cond.k_cfg_name)
         label = _page_format_dense(cond.k_cfg_name)
         row.update({
             "effective_k_bits": float(k_bits),
-            "effective_v_bits": float(V_BITS),
-            "effective_kv_bits": float((k_bits + V_BITS) / 2.0),
+            "effective_v_bits": float(v_bits),
+            "effective_kv_bits": float((k_bits + v_bits) / 2.0),
             "f9_sidecode_token_fraction": (1.0 if label == "F9" else 0.0),
             "f9_sidecode_page_fraction": (1.0 if label == "F9" else 0.0),
         })
@@ -518,7 +655,8 @@ def run_condition_on_items(model, processor, items: list[MMNiahItem],
                            max_pixels_choices: int,
                            progress_every: int = 10, summary_every: int = 25,
                            summary_callback=None,
-                           skip_ids: Optional[set] = None) -> None:
+                           skip_ids: Optional[set] = None,
+                           include_choice_routing: bool = False) -> None:
     skip_ids = skip_ids or set()
     n = len(items)
     n_done = 0
@@ -534,7 +672,8 @@ def run_condition_on_items(model, processor, items: list[MMNiahItem],
                                  num_layers=num_layers, num_kv_heads=num_kv_heads,
                                  answer_ids=answer_ids,
                                  max_pixels_context=max_pixels_context,
-                                 max_pixels_choices=max_pixels_choices)
+                                 max_pixels_choices=max_pixels_choices,
+                                 include_choice_routing=include_choice_routing)
             except torch.cuda.OutOfMemoryError:
                 _append_progress(progress_log,
                                  f"WARN [{cond.name}] OOM on item {it.id} "
@@ -602,10 +741,20 @@ def existing_completion_ids(jsonl_path: Path, cond_name: str) -> set:
 
 # ---------------- main ----------------
 
-def _default_calib_npz(task: str) -> Path:
+def _default_calib_npz(task: str, seed: int = 0) -> Path:
     if task == "retrieval-image":
-        return CALIBRATION_DIR / "expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz"
-    return CALIBRATION_DIR / f"expQ_mmniah_{task}_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz"
+        if seed == 0:
+            return CALIBRATION_DIR / "expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz"
+        # Exp R seed=1 calibration on the new seed=1 cal split.
+        return CALIBRATION_DIR / f"expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed{seed}.npz"
+    return CALIBRATION_DIR / f"expQ_mmniah_{task}_kcalib_Qwen2.5-VL-7B-Instruct_seed{seed}.npz"
+
+
+def _default_split_path(task: str, seed: int = 0) -> Path:
+    base = split_file_for_task(task)
+    if seed == 0 and task == "retrieval-image":
+        return base
+    return base.with_name(f"mm_niah_{task}_split_seed{seed}.json")
 
 
 def main():
@@ -630,6 +779,18 @@ def main():
                     help="Add Q5_s1/s2, Q8_s1/s2, Q11_s1/s2 reseed conditions.")
     ap.add_argument("--include-smoke-only", action="store_true",
                     help="Add Q_allhot smoke-only sanity condition. Not for main pool.")
+    # Exp R flags
+    ap.add_argument("--exp-r-c", action="store_true",
+                    help="Exp R Sub-experiment C: AllVisual routing + static "
+                         "matched-budget baselines (C0..C8 + S4/S8/S12/SJ).")
+    ap.add_argument("--exp-r-e-best-route", default=None,
+                    help="Exp R Sub-experiment E cold-format ladder. Pass the "
+                         "name of the AllVisual policy that won C (e.g. "
+                         "'formatbook_quest_allvisual' or 'formatbook_split_quest').")
+    ap.add_argument("--include-choice-routing", action="store_true",
+                    help="Exp R: build_page_layout flags choice-image pages as "
+                         "routable so AllVisual policies can route them. "
+                         "Required for C and E conditions.")
     ap.add_argument("--no-resume", action="store_true",
                     help="Re-run items already in the JSONL.")
     ap.add_argument("--split-path", type=Path, default=None,
@@ -653,9 +814,9 @@ def main():
     if args.out_summary is None:
         args.out_summary = RESULTS_DIR / f"expQ_summary_slice{slice_tag}.md"
     if args.calib_npz is None:
-        args.calib_npz = _default_calib_npz(args.task)
+        args.calib_npz = _default_calib_npz(args.task, seed=args.seed)
     if args.split_path is None:
-        args.split_path = split_file_for_task(args.task)
+        args.split_path = _default_split_path(args.task, seed=args.seed)
 
     args.out_jsonl.parent.mkdir(parents=True, exist_ok=True)
     progress_log = args.out_jsonl.with_name(args.out_jsonl.stem + ".progress.log")
@@ -701,7 +862,13 @@ def main():
               flush=True)
 
     # Build conditions
-    if args.task == "retrieval-image":
+    if args.exp_r_c:
+        # Exp R Sub-exp C: AllVisual + static matched-budget baselines.
+        primary = c_conditions_allvisual() + s_conditions_static_baselines()
+    elif args.exp_r_e_best_route:
+        # Exp R Sub-exp E: cold-format ladder on the chosen AllVisual policy.
+        primary = e_conditions_cold_ladder(args.exp_r_e_best_route)
+    elif args.task == "retrieval-image":
         primary = q_conditions_slice_a(include_int2=args.include_int2_stretch)
     else:
         primary = r_conditions_slice_b()
@@ -731,6 +898,14 @@ def main():
     def summary_cb(jsonl_path: Path):
         write_summary_md(jsonl_path, args.out_summary)
 
+    # Exp R: auto-enable include_choice_routing for AllVisual conditions
+    # (C0..C8 + E*) unless the user explicitly disabled it.
+    auto_choice_routing = args.include_choice_routing or args.exp_r_c \
+        or args.exp_r_e_best_route is not None
+    if auto_choice_routing and not args.include_choice_routing:
+        print("[exp R] auto-enabling --include-choice-routing for AllVisual / E conditions", flush=True)
+        args.include_choice_routing = True
+
     t_overall = time.perf_counter()
     for cond in all_conds:
         skip = existing_completion_ids(args.out_jsonl, cond.name) if not args.no_resume else set()
@@ -743,6 +918,7 @@ def main():
             max_pixels_context=args.max_pixels_context,
             max_pixels_choices=args.max_pixels_choices,
             summary_callback=summary_cb, skip_ids=skip,
+            include_choice_routing=args.include_choice_routing,
         )
     total_wall = time.perf_counter() - t_overall
     _append_progress(progress_log, f"=== overall wall={timedelta(seconds=int(total_wall))} ===")

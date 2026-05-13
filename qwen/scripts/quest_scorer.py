@@ -119,12 +119,43 @@ class RoutingDecision:
     needle_in_active: bool             # True if the routing decision keeps the needle
 
 
+def _token_budgeted_topk(routable_pages: list,
+                         routable_scores: torch.Tensor,
+                         budget_fraction: float) -> list[int]:
+    """Sort routable pages by score descending; accumulate Page.n_tokens until
+    running total exceeds budget_fraction * total_routable_tokens. Returns the
+    page_idx list (sorted ascending for stable comparison).
+
+    Used by Exp R AllVisual variants where pages can have unequal token counts
+    (in-context image ~100-150 tokens, choice image ~100-150 tokens at 336²,
+    but if max_pixels varies they diverge). The Exp Q page-count fallback is
+    still used by quest_top (the default 'top-K by count' behavior).
+    """
+    if not routable_pages:
+        return []
+    total_tokens = sum(p.n_tokens for p in routable_pages)
+    if total_tokens == 0:
+        return []
+    target = max(1.0, budget_fraction * total_tokens)
+    order = torch.argsort(routable_scores, descending=True).tolist()
+    hot: list[int] = []
+    running = 0
+    for i in order:
+        if running >= target:
+            break
+        hot.append(routable_pages[i].page_idx)
+        running += routable_pages[i].n_tokens
+    return sorted(hot)
+
+
 def select_active_pages(layout: PageLayout,
                         scores: Optional[torch.Tensor],
                         policy: str,
                         budget_fraction: Optional[float],
-                        rng: Optional[torch.Generator] = None) -> RoutingDecision:
-    """Return which routable (in-context-image) pages to keep active.
+                        rng: Optional[torch.Generator] = None,
+                        correct_choice_idx: Optional[int] = None,
+                        token_budgeted: bool = False) -> RoutingDecision:
+    """Return which routable pages to keep active.
 
     layout, scores: from compute_page_envelope + quest_scores_for_layer.
     policy:
@@ -134,9 +165,30 @@ def select_active_pages(layout: PageLayout,
       - "oracle_needle": needle forced into active set, remaining (K-1) slots
                         filled by top-Quest at the same budget_fraction. This
                         gives a budget-matched oracle upper bound for Quest.
+      - "oracle_needle_only": needle ONLY in active set
       - "none": keep all routable pages active (no masking)
+      - "all_hot": same as "none" for FormatBook smoke (sanity that
+                   FormatBook-with-everything-hot matches dense F9)
+      - "role_only": no routable pages active (all in-context cold)
+      - "choice_only" (Exp R C3b): all choice_image routable pages hot,
+                                   all in_context_image routable pages cold
+      - "oracle_needle_and_choice" (Exp R C6): force needle page + the
+                                   choice_image page at image_idx ==
+                                   correct_choice_idx; fill remaining
+                                   budget via Quest top-K on others
+      - "split_quest" (Exp R C7): split budget across in_context vs choice
+                                  groups; top-(K/2) Quest from each
+      - "split_random" (Exp R C8): same split-by-group budget, random per group
     budget_fraction: e.g. 0.25 (top-25%) or 0.5 (top-50%). Required for all
-                     policies except "none".
+                     policies except "none", "all_hot", "oracle_needle_only",
+                     "role_only", "choice_only".
+    correct_choice_idx: 0..3 (from MMNiahItem.correct_choice). Required for
+                       "oracle_needle_and_choice".
+    token_budgeted: when True, top-K selection accumulates Page.n_tokens to
+                    `budget_fraction * total_routable_tokens` (deployable
+                    metric). When False (default), uses page-count
+                    `ceil(budget_fraction * n_pages)` for back-compat with
+                    Exp Q.
     """
     routable = layout.routable_pages()
     routable_idx = [p.page_idx for p in routable]
@@ -161,9 +213,23 @@ def select_active_pages(layout: PageLayout,
             needle_in_active=False,
         )
 
+    if policy == "choice_only":
+        # Exp R C3b: choice_image routable pages hot, in_context_image cold.
+        # Only meaningful when include_choice_routing=True (both are routable).
+        # If only in-context is routable (Exp Q default), this falls back to
+        # zero hot (everything is in-context, cold).
+        active = [p.page_idx for p in routable if p.kind == "choice_image"]
+        cold = [p.page_idx for p in routable if p.kind != "choice_image"]
+        return RoutingDecision(
+            active_routable_pages=sorted(active),
+            cold_routable_pages=sorted(cold),
+            scores=scores, policy=policy,
+            needle_in_active=(layout.needle_page_idx in active),
+        )
+
     # oracle_needle_only ignores budget_fraction (always returns just the needle);
     # other selection policies require a budget.
-    if policy != "oracle_needle_only" and budget_fraction is None:
+    if policy not in ("oracle_needle_only",) and budget_fraction is None:
         raise ValueError(f"policy={policy} requires budget_fraction")
     import math
     if budget_fraction is not None:
@@ -176,8 +242,11 @@ def select_active_pages(layout: PageLayout,
         if scores is None:
             raise ValueError("quest_top requires scores")
         routable_scores = scores[torch.tensor(routable_idx, dtype=torch.long, device=scores.device)]
-        topk = torch.topk(routable_scores, k=k, largest=True).indices.tolist()
-        active = sorted(routable_idx[i] for i in topk)
+        if token_budgeted:
+            active = _token_budgeted_topk(routable, routable_scores.cpu(), budget_fraction)
+        else:
+            topk = torch.topk(routable_scores, k=k, largest=True).indices.tolist()
+            active = sorted(routable_idx[i] for i in topk)
     elif policy == "random_top":
         # Reproducibility requires an explicit generator; default-RNG sampling
         # has bitten paired comparisons before.
@@ -216,6 +285,67 @@ def select_active_pages(layout: PageLayout,
         # are always-on) is enough to answer.
         needle_idx = layout.needle_page_idx
         active = [needle_idx] if needle_idx is not None else []
+    elif policy == "oracle_needle_and_choice":
+        # Exp R C6: force needle page + the choice-image page matching
+        # item.correct_choice; fill remaining budget via Quest top-K on
+        # the rest. Only meaningful with include_choice_routing=True.
+        if correct_choice_idx is None:
+            raise ValueError("oracle_needle_and_choice requires correct_choice_idx")
+        needle_idx = layout.needle_page_idx
+        forced: list[int] = []
+        if needle_idx is not None:
+            forced.append(needle_idx)
+        # Find the choice page matching correct_choice_idx
+        for p in routable:
+            if p.kind == "choice_image" and p.image_idx == correct_choice_idx:
+                if p.page_idx not in forced:
+                    forced.append(p.page_idx)
+                break
+        # Fill remaining
+        n_fill = max(0, k - len(forced))
+        other_idx = [i for i in routable_idx if i not in forced]
+        if n_fill > 0 and other_idx and scores is not None:
+            other_scores = scores[
+                torch.tensor(other_idx, dtype=torch.long, device=scores.device)
+            ]
+            topk = torch.topk(
+                other_scores, k=min(n_fill, len(other_idx)), largest=True
+            ).indices.tolist()
+            fill = [other_idx[i] for i in topk]
+        elif n_fill > 0 and other_idx:
+            fill = other_idx[:n_fill]
+        else:
+            fill = []
+        active = sorted(forced + fill)
+    elif policy in ("split_quest", "split_random"):
+        # Exp R C7/C8: split budget across in_context and choice groups.
+        # Each group gets top-(K_group) by Quest score (split_quest) or
+        # random (split_random) where K_group = ceil(budget_fraction * n_group).
+        in_ctx_pages = [p for p in routable if p.kind == "in_context_image"]
+        choice_pages = [p for p in routable if p.kind == "choice_image"]
+        def _group_topk(group_pages: list, is_quest: bool) -> list[int]:
+            if not group_pages:
+                return []
+            g_idx = [p.page_idx for p in group_pages]
+            n_g = len(group_pages)
+            k_g = max(1, math.ceil(budget_fraction * n_g))
+            k_g = min(k_g, n_g)
+            if is_quest:
+                if scores is None:
+                    raise ValueError("split_quest requires scores")
+                g_scores = scores[torch.tensor(g_idx, dtype=torch.long, device=scores.device)]
+                if token_budgeted:
+                    return _token_budgeted_topk(group_pages, g_scores.cpu(), budget_fraction)
+                topk = torch.topk(g_scores, k=k_g, largest=True).indices.tolist()
+                return sorted(g_idx[i] for i in topk)
+            else:
+                if rng is None:
+                    raise ValueError("split_random requires explicit rng")
+                perm = torch.randperm(n_g, generator=rng).tolist()
+                return sorted(g_idx[i] for i in perm[:k_g])
+        active_in = _group_topk(in_ctx_pages, is_quest=(policy == "split_quest"))
+        active_choice = _group_topk(choice_pages, is_quest=(policy == "split_quest"))
+        active = sorted(active_in + active_choice)
     else:
         raise ValueError(f"unknown policy={policy!r}")
 

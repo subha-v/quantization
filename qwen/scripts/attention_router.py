@@ -64,15 +64,55 @@ def _f4_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
     return _per_channel_seq_quant(K, qmax=7.0)
 
 
+def _int3_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
+    """INT3 cold downgrade: qmax = 2^2 - 1 = 3.0 → {-3s, ..., 0, ..., 3s}.
+    K bits/token = 3. Exp R cold-format ladder (between F4 and INT2)."""
+    return _per_channel_seq_quant(K, qmax=3.0)
+
+
 def _int2_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
     """INT2 ternary cold downgrade: qmax = 2^1 - 1 = 1.0 → {-s, 0, +s}.
     K bits/token = 2. Exp Q Q10/Q11 stretch path."""
     return _per_channel_seq_quant(K, qmax=1.0)
 
 
+def _fp8_per_channel_seq(K: torch.Tensor) -> torch.Tensor:
+    """FP8 E4M3 cold downgrade. K bits/token = 8 (HIGHER than F4 = 4).
+    Diagnostic only — tests whether GRID SHAPE (mantissa+exponent vs uniform)
+    matters as well as bit count. Not a memory-saving option.
+
+    Falls back to INT8 grid if FP8 isn't available in the running PyTorch.
+    Per-channel-seq scale is computed first (so the FP8 cast lands in the
+    appropriate range), then the cast is applied, then the scale is reapplied.
+    """
+    Kf = K.float()
+    amax = Kf.abs().amax(dim=-2, keepdim=True)
+    s = amax.clamp_min(1e-8) / 127.0  # FP8 E4M3 max repr value ~ 448; use 127 for INT8 fallback range
+    scaled = (Kf / s).clamp(-127.0, 127.0)
+    fp8_dtype = getattr(torch, "float8_e4m3fn", None)
+    if fp8_dtype is not None:
+        try:
+            cast = scaled.to(fp8_dtype).to(torch.float32)
+        except Exception:
+            cast = scaled.round().clamp(-127.0, 127.0)
+    else:
+        cast = scaled.round().clamp(-127.0, 127.0)
+    return (cast * s).to(K.dtype)
+
+
 _COLD_QUANTIZERS = {
     "f4": _f4_per_channel_seq,
+    "int3": _int3_per_channel_seq,
     "int2": _int2_per_channel_seq,
+    "fp8": _fp8_per_channel_seq,
+}
+
+# Cold-V quantizers — V-side cold downgrade for Exp R cold-format ladder.
+# Default V is uniformly INT4 from FakeQuantKVCache. "none" means no extra
+# V downgrade; "int2" applies INT2 ternary per-page on V.
+_COLD_V_QUANTIZERS = {
+    "none": None,                    # leave V at the cache's uniform INT4
+    "int2": _int2_per_channel_seq,   # cold-V INT2 per-page
 }
 
 
@@ -111,6 +151,12 @@ class RoutePolicy:
     budget_fraction: Optional[float] = None
     gqa_aggregate: str = "sum"
     cold_quantizer: str = "f4"
+    # Exp R: V-side cold downgrade. "none" = leave V at cache's uniform INT4;
+    # "int2" = INT2 ternary on V slices of cold pages.
+    cold_v_quantizer: str = "none"
+    # Exp R: token-budgeted top-K (accumulate page.n_tokens to budget*total)
+    # instead of page-count top-K (ceil(budget * n_pages)). Use for AllVisual.
+    token_budgeted: bool = False
 
     def is_sparse(self) -> bool:
         return self.name in (
@@ -121,6 +167,11 @@ class RoutePolicy:
         return self.name in (
             "formatbook_quest", "formatbook_random", "formatbook_oracle",
             "formatbook_role_only", "formatbook_all_hot",
+            # Exp R AllVisual variants
+            "formatbook_text_only", "formatbook_choice_only",
+            "formatbook_quest_allvisual", "formatbook_random_allvisual",
+            "formatbook_oracle_allvisual",
+            "formatbook_split_quest", "formatbook_split_random",
         )
 
     def selection_policy(self) -> str:
@@ -134,6 +185,15 @@ class RoutePolicy:
             "formatbook_oracle": "oracle_needle",
             "formatbook_role_only": "role_only",
             "formatbook_all_hot": "all_hot",
+            # Exp R AllVisual: same selection logic as the non-allvisual
+            # variants, but the layout has choice pages flagged routable too.
+            "formatbook_text_only": "role_only",
+            "formatbook_choice_only": "choice_only",
+            "formatbook_quest_allvisual": "quest_top",
+            "formatbook_random_allvisual": "random_top",
+            "formatbook_oracle_allvisual": "oracle_needle_and_choice",
+            "formatbook_split_quest": "split_quest",
+            "formatbook_split_random": "split_random",
         }[self.name]
 
 
@@ -243,10 +303,13 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
         # 2) Selection (with reproducible RNG for random_top).
         selection_policy = policy.selection_policy()
         rng = getattr(cache, "rng", None)
+        correct_choice_idx = getattr(cache, "correct_choice_idx", None)
         decision = select_active_pages(
             layout, scores, selection_policy,
             budget_fraction=policy.budget_fraction,
             rng=rng,
+            correct_choice_idx=correct_choice_idx,
+            token_budgeted=policy.token_budgeted,
         )
 
         if record_routing and layer_idx is not None:
@@ -265,24 +328,35 @@ def page_routing_sdpa_context(cache: PageAwareFakeQuantKVCache,
         cold_token_mask = build_cold_token_mask(layout, decision.cold_routable_pages, T_k)
 
         if policy.is_formatbook():
-            # Downgrade cold pages' K in place. All pages still participate in
-            # attention; cold pages just have noisier K. cold_quantizer dispatches
-            # between F4 (Exp P, Exp Q Q4-Q9) and INT2 (Exp Q Q10/Q11 stretch).
-            cold_fn = _COLD_QUANTIZERS.get(policy.cold_quantizer)
-            if cold_fn is None:
+            # Downgrade cold pages' K (and optionally V) in place. All pages
+            # still participate in attention; cold pages just have noisier
+            # K/V. cold_quantizer dispatches between F4/INT3/INT2/FP8 on K;
+            # cold_v_quantizer optionally adds INT2 on V slices of cold pages.
+            cold_k_fn = _COLD_QUANTIZERS.get(policy.cold_quantizer)
+            if cold_k_fn is None:
                 raise ValueError(
                     f"unknown cold_quantizer={policy.cold_quantizer!r}; "
                     f"expected one of {sorted(_COLD_QUANTIZERS)}"
                 )
+            cold_v_fn = _COLD_V_QUANTIZERS.get(policy.cold_v_quantizer)
+            if policy.cold_v_quantizer not in _COLD_V_QUANTIZERS:
+                raise ValueError(
+                    f"unknown cold_v_quantizer={policy.cold_v_quantizer!r}; "
+                    f"expected one of {sorted(_COLD_V_QUANTIZERS)}"
+                )
             if cold_token_mask.any():
                 key = key.clone()
+                if cold_v_fn is not None:
+                    value = value.clone()
                 cold_set = set(decision.cold_routable_pages)
                 for p in layout.pages:
                     if p.page_idx in cold_set:
                         s = max(0, p.start)
                         e = min(T_k, p.end)
                         if s < e:
-                            key[:, :, s:e, :] = cold_fn(key[:, :, s:e, :])
+                            key[:, :, s:e, :] = cold_k_fn(key[:, :, s:e, :])
+                            if cold_v_fn is not None:
+                                value[:, :, s:e, :] = cold_v_fn(value[:, :, s:e, :])
             return original_sdpa(query, key, value, attn_mask=attn_mask,
                                  dropout_p=dropout_p, is_causal=is_causal,
                                  scale=scale, **kwargs)
