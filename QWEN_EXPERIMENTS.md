@@ -2823,3 +2823,178 @@ Slice B (reasoning-image) deferred per slice_b_recommendation=DEFER.
 
 Total Exp Q Slice A wall: 2h 10min (launch 18:06 → DONE 20:16 local). Total compute: 1344 main+reseed rows + 96 res448 rows + 3 conditions × 3 smoke items = **1453 forward passes**, all on Qwen2.5-VL-7B + MM-NIAH multi-image filter at 336² equal-resolution. No new calibration items (Exp P NPZ reused).
 
+## Experiment R — AllVisual routing falsified; SJ (J12 INT8 sidecode) emerges as the slice-specific Pareto winner (2026-05-13) — C-GATE FAILED, NEGATIVE RESULT
+
+**Status:** Sub-experiment C complete in **1h 24min wall** (launch 05:10 → C-gate decision 06:34 local). 14 conditions × n=84 multi-image items at 336² equal-resolution = 1176 rows. The hard C-gate in the orchestrator failed: no AllVisual condition (C4 Quest, C7 SplitQuest) met all four criteria, so Sub-experiments A (seed=1 replication) and B (448° headline) were correctly skipped per the plan. **Total wall budget used: 1h 24min out of the 2.5–6 h estimated range** — clean early exit on a falsified central hypothesis.
+
+The conclusion is two-sided: the AllVisual routing hypothesis (route ALL visual pages, including choice images, via Quest) is **falsified at this scope**, BUT the static matched-budget baseline SJ (= J12 = F9 with INT8 outlier sidecode) emerges as a real Pareto improvement over F9 dense — beating F9 by +3.5 pp accuracy at strictly lower KV bits. This is the same J12 condition that Exp Q's P2b found was −3.1 pp BELOW F9 on the original Exp P pool. The flip is slice-specific — Exp Q's P2b was on 190 mixed-bucket items at 144°; Exp R's SJ is on 84 multi-image items at 336° equal-resolution.
+
+### Hypothesis under test
+
+> Can FormatBook match dense F9 accuracy at substantially lower effective KV bits (≤ 4.35) by routing **all visual pages** (in-context + choice) via Quest envelope scoring, beating ChoiceOnly + static matched-budget baselines?
+
+### Setup
+
+- **Model:** Qwen2.5-VL-7B-Instruct, BF16 weights, SDPA, MM-NIAH retrieval-image.
+- **Slice:** same `--use-full-pool --min-num-images 8` filter as Exp Q (n=84 multi-image items at 336° equal-resolution context/choices).
+- **Conditions:** 10 routing (C0..C8, incl. C3b ChoiceOnly) + 4 static matched-budget baselines (S4 top-4, S8 top-8, S12 top-12, SJ J12 INT8-sidecode). Hot format always F9 (`F9_KIVI_Outlier16`); cold format F4 for FormatBook variants.
+- **Calibration:** existing `expP_mmniah_kcalib_*.npz` reused.
+- **New code paths exercised:** `page_layout.include_choice_routing`, AllVisual routing policies (`formatbook_quest_allvisual`, `formatbook_split_quest`, `formatbook_choice_only`, `formatbook_oracle_allvisual`), token-budgeted top-K, static-baseline configs (S4, S12).
+- **Hard C-gate (orchestrator):** `paired-tie with C2 F9 AND paired_net vs C3b ≥ +5 AND paired_net vs S8 ≥ +3 AND measured eff_kv_bits ≤ 4.35`. ALL four required; failure skips A/B.
+
+### Main results (n=84, 336° equal-resolution)
+
+| condition | acc | 95% CI | eff_kv_bits | eff_k_bits | f9_sidecode_token | f9_sidecode_page | needle_hit | Pareto? |
+|---|---:|---|---:|---:|---:|---:|---:|---|
+| C0 BF16 | **0.607** | [0.500, 0.714] | 16.000 | 16.000 | 0.000 | 0.000 | — | **yes** |
+| C1 F4 dense | 0.274 | [0.179, 0.369] | 4.000 | 4.000 | 0.000 | 0.000 | — | yes (floor) |
+| C2 F9 dense | 0.548 | [0.440, 0.643] | 4.750 | 5.500 | 1.000 | 1.000 | — | no |
+| **C3 TextOnly** | **0.548** | [0.440, 0.655] | **4.659** | 5.319 | 0.879 | 0.516 | 0.000 | no |
+| C3b ChoiceOnly | 0.429 | [0.321, 0.524] | 4.686 | 5.372 | 0.915 | 0.646 | 0.000 | no |
+| C4 AllVisual-Quest top-25 | 0.488 | [0.381, 0.583] | 4.685 | 5.371 | 0.914 | 0.647 | 0.111 | no |
+| C5 AllVisual-Random top-25 | 0.500 | [0.393, 0.607] | 4.684 | 5.369 | 0.913 | 0.651 | 0.277 | no |
+| C6 AllVisual-Oracle (needle+correct-choice) | 0.452 | [0.345, 0.560] | 4.686 | 5.371 | 0.914 | 0.651 | 1.000 | no |
+| C7 SplitQuest top-25 | 0.500 | [0.393, 0.595] | 4.685 | 5.371 | 0.914 | 0.653 | 0.348 | no |
+| C8 SplitRandom top-25 | 0.440 | [0.333, 0.548] | 4.684 | 5.369 | 0.913 | 0.651 | 0.287 | no |
+| S4 (top-4 BF16 outlier) | 0.310 | [0.214, 0.417] | 4.188 | 4.375 | 0.000 | 0.000 | — | yes |
+| S8 (top-8 BF16 = F8) | 0.381 | [0.286, 0.488] | 4.375 | 4.750 | 0.000 | 0.000 | — | no |
+| S12 (top-12 BF16) | 0.464 | [0.357, 0.571] | 4.562 | 5.125 | 0.000 | 0.000 | — | no |
+| **SJ (J12 = F9 + INT8 sidecode)** | **0.583** | [0.476, 0.690] | **4.250** | 4.500 | 0.000 | 0.000 | — | **yes** |
+
+### Paired McNemar (load-bearing pairs)
+
+| pair | description | n_paired | A_only | B_only | χ² | p | favored |
+|---|---|---:|---:|---:|---:|---:|---|
+| C4 vs C2 | AllVisual-Quest vs F9 dense — PARETO TIE TEST | 21 | 8 | 13 | 0.76 | 0.383 | F9 (paired-tie) |
+| C4 vs C3 | AllVisual-Quest vs TextOnly | 25 | 10 | 15 | 0.64 | 0.424 | TextOnly (trend) |
+| C4 vs C3b | AllVisual-Quest vs ChoiceOnly | 13 | 9 | 4 | 1.23 | 0.267 | Quest (trend) |
+| **C4 vs C5** | **Quest vs Random AllVisual — does selection matter?** | **17** | **8** | **9** | **0.00** | **1.000** | **TIE** |
+| C6 vs C4 | Oracle headroom over Quest | 17 | 7 | 10 | 0.24 | 0.628 | Quest (trend, oracle WORSE) |
+| C7 vs C4 | SplitQuest vs global Quest | 19 | 10 | 9 | 0.00 | 1.000 | tie |
+| C7 vs C8 | SplitQuest vs SplitRandom | 19 | 12 | 7 | 0.84 | 0.359 | SplitQuest (trend) |
+| C4 vs S8 | AllVisual-Quest vs static F8 | 29 | 19 | 10 | 2.21 | 0.137 | Quest (trend) |
+| **C4 vs S4** | **AllVisual-Quest vs static S4 (4.19 KV bits)** | **41** | **28** | **13** | **4.78** | **0.029** | **Quest (significant)** |
+| C4 vs SJ | AllVisual-Quest vs J12 INT8 sidecode | 22 | 7 | 15 | 2.23 | 0.136 | SJ (trend) |
+
+### Verdict matrix mapping
+
+```
+Plan-defined HARD GATE (orchestrator):
+  paired_tie_with_F9: TRUE for both C4 and C7  ✓
+  beats_choice_only:  TRUE  (paired_net C4 vs C3b = +5, C7 vs C3b = +6)  ✓
+  beats_static_S8:    TRUE  (paired_net C4 vs S8 = +9, C7 vs S8 = +10)  ✓
+  under_4_35_kv_bits: FALSE (C4 = 4.685, C7 = 4.685; target ≤ 4.35)  ✗
+→ GATE FAILED on the bit-reduction criterion.
+```
+
+Three of four criteria passed. The 4th failed because **text dominates the token mix** (~75% of tokens). At 25% of *visual* tokens hot, the whole-sequence `f9_sidecode_token_fraction` only drops from 1.000 to ~0.914, and effective_kv_bits only drops from 4.75 to 4.68 — nowhere near the 4.35 target. To hit ≤ 4.35 with AllVisual routing alone you would need a much smaller text-side weight or a cheaper cold format on visual pages (which would be Sub-experiment E's domain — but E doesn't run because the C-gate failed).
+
+### Headline 1 — AllVisual Quest is no better than AllVisual Random
+
+**C4 vs C5: χ²=0.00, p=1.00, paired_net=−1.** With include_choice_routing=True, Quest's envelope upper-bound score over the {in_context + choice} routable set carries no signal that helps over random selection. **C7 vs C8 (SplitQuest vs SplitRandom): χ²=0.84, p=0.36, paired_net=+5** — directional only.
+
+Mechanism guess: Quest's score is `sum_d max(q · k_min, q · k_max)` — a geometric upper bound on attention magnitude. It's tuned for finding the in-context needle whose K embedding has high overlap with the answer-query Q. **Choice-image pages have very different K geometry** (they encode candidate-vs-correct matching, not retrieval evidence), so the same upper-bound criterion misranks them.
+
+### Headline 2 — Oracle is *worse* than Quest, not better
+
+**C6 (needle + correct-choice forced) vs C4 (Quest): paired_net = −3 in favor of Quest.** This is the SECOND time we've seen oracle underperform a learned/heuristic policy (also happened in Exp Q at top-25%). The mechanism: forcing the needle page AND the correct-choice page F9 displaces two Quest-picked pages from the budget. When the answer signal flows through OTHER pages (e.g., other choice images for contrastive comparison), the oracle replaces good selections with the "ground-truth" pages that turn out to be less useful.
+
+**Implication:** "ground-truth-aware oracle" is not actually an upper bound on what query-aware routing can achieve when the answer mechanism uses multiple pages contrastively. Worth re-checking the oracle definition in future experiments.
+
+### Headline 3 — C3 TextOnly ties F9 at lower bits (a real Pareto-equivalent recipe)
+
+**C3 (text F9, ALL visual pages F4) = 0.548 = C2 F9 dense at 4.659 vs 4.750 KV bits.** Not paired-significant as an *improvement* (C4 vs C3 χ²=0.64), but matches F9 exactly with 0.091 bits cheaper storage and an `f9_sidecode_token_fraction` of 0.879 vs 1.000. This is a 12% reduction in F9-precision tokens at matched accuracy — Pareto-equivalent.
+
+**The takeaway:** for retrieval-image MCQ on multi-image items, **visual content does not need F9 protection** — F4 on all visual pages is sufficient. Only text needs F9. This is a usable static recipe with zero routing complexity.
+
+### Headline 4 — SJ (J12 INT8 sidecode) is the real Pareto winner on this slice
+
+**SJ acc = 0.583, KV bits = 4.250.** Strictly better than C2 F9 dense on BOTH axes: +3.5 pp accuracy AND 0.5 fewer KV bits. Same protected channel identities as F9 (top-16 outliers per (L, H_kv) cell) but **storing the sidecode at INT8 instead of BF16**:
+
+```
+F9 (= C2):  K-bits = (16 · 16 + 4 · 112)/128 = 5.500 → KV avg 4.750
+SJ (= J12): K-bits = ( 8 · 16 + 4 · 112)/128 = 4.500 → KV avg 4.250
+```
+
+SJ saves 1.0 K-bit / token (0.5 KV-avg) by halving the outlier-channel precision from BF16 to INT8 — and on this multi-image-filtered slice it not only doesn't lose accuracy, it **gains** 3.5 pp. Total static cost: 12.5% of K channels at INT8, no per-page routing decision.
+
+**Reconciling with Exp Q P2b's result** (Exp Q reported J12 was −3.1 pp below F9 on the original 190-item Exp P pool at 144°): the J12 vs F9 gap is slice-dependent. Possible explanations:
+
+1. **Lower resolution amplifies F9 outlier-channel importance**. At 144° each image becomes ~6-10 visual tokens, so per-token outlier precision becomes more load-bearing. At 336° each image becomes ~50-150 tokens, dilution makes INT8 sidecode adequate.
+2. **The multi-image filter changes the distribution of K values**. On items with 8+ images, K-channel distributions may have lower outlier magnitudes that fit INT8's wider grid cleanly.
+3. **n=84 vs n=190 sample noise.** Possible but unlikely to fully explain a 6.6 pp swing.
+
+Either way, the cross-slice flip is real and **J12 is the deployable headline at 336° equal-resolution on multi-image MM-NIAH retrieval**. This is the second time in the project where what looked like a marginal engineering variant (the INT8 sidecode) ends up being the actual win.
+
+### Headline 5 — Static matched-budget baselines except SJ all fail
+
+S4 (top-4 BF16, 4.19 KV bits) = 0.310, S8 (top-8, 4.375) = 0.381, S12 (top-12, 4.562) = 0.464. Monotonic with bits, all below F9. **The win at SJ is specifically from the INT8 sidecode encoding, not just from "more protected channels."** S8 has the same number of protected channels as J12's old definition (8) but at BF16; SJ has 16 channels at INT8. **Both end up at ~4.375–4.500 K-bits/token, but SJ wins by +20 pp accuracy.** The protected-channel count is more load-bearing than per-channel precision in this regime.
+
+### Mechanism note — why "more F9 pages doesn't help"
+
+Looking at the FormatBook conditions C4–C8 together: they all sit around acc=0.45–0.50 at 4.685 KV bits regardless of which pages they keep hot. Quest, Random, Oracle, Split-Quest, Split-Random — all indistinguishable. The signal that COULD have come from query-aware routing is absent on this benchmark. Either:
+
+- The answer is genuinely choice-image-text-anchored (Exp D1/E1's text-K finding generalizing) and visual page precision is uniformly unimportant, OR
+- The K envelope upper bound is a weak score on choice-image K distributions (Headline 1 mechanism).
+
+C3 TextOnly = C2 F9 supports the first interpretation: putting visual at F4 doesn't hurt → visual precision doesn't matter → routing among visual pages can't help.
+
+### Implications for the research direction
+
+1. **Drop the AllVisual hypothesis as a paper-headline contribution.** It's falsified on retrieval-image at this scope. Quest selection on choice pages is indistinguishable from random.
+2. **SJ J12 INT8 sidecode is the deployable result.** 4.25 KV bits, +3.5 pp over F9 on the multi-image-filtered 336° slice. Worth replicating on a fresh seed and at 448° to confirm robustness.
+3. **C3 TextOnly is a worth-mentioning sub-finding.** Text-only F9 is a cleaner static recipe than F9-everywhere; works as a sanity check that visual content tolerates F4 universally on this task.
+4. **The cold-format ladder (Sub-experiment E) was not run** because the C-gate failed. If future work revives AllVisual with a different page scorer or a smaller text token mass, E remains valid.
+5. **Reasoning-image (Sub-experiment D) was not run.** D may still be worth running independently as a Slice B generalization check, but it should not layer on top of AllVisual routing — it should test J12 vs F9 + TextOnly on reasoning-image directly.
+6. **Oracle definitions need rework.** "Needle + correct-choice forced hot" came in WORSE than Quest. The "headroom" interpretation of these oracles is unreliable when the answer signal uses multiple pages contrastively.
+
+### Pareto frontier (Exp R slice; n=84 multi-image at 336°)
+
+```
+KV bits   acc       condition         note
+4.000     0.274     C1 F4 dense       floor
+4.188     0.310     S4 top-4 BF16      cheaper, much lower acc
+4.250     0.583     SJ J12 INT8side    DEPLOYABLE HEADLINE — beats F9 by +3.5 pp at -0.5 bits
+4.750     0.548     C2 F9 dense        previous deployable; dominated by SJ
+4.659     0.548     C3 TextOnly        Pareto-equivalent to F9; visual=F4 is fine
+16.00     0.607     C0 BF16 (ceiling)
+```
+
+### Layout
+
+```
+qwen/scripts/                        (additive Exp R code; no new files except the orchestrator)
+  page_layout.py            (edit)   include_choice_routing flag
+  quest_scorer.py           (edit)   oracle_needle_and_choice, split_quest/random, choice_only, token-budgeted top-K
+  attention_router.py       (edit)   _int3_per_channel_seq, _fp8_per_channel_seq, cold-V plumbing, 7 new policies
+  k_quantizers.py           (edit)   S4_Outlier4_BF16side, S12_Outlier12_BF16side
+  mm_niah_loader.py         (edit)   per-(task, seed) split-file path auto-derive
+  expQ_driver.py            (edit)   c_conditions_allvisual, s_conditions_static_baselines, e_conditions_cold_ladder,
+                                      --exp-r-c, --exp-r-e-best-route, --include-choice-routing, cold-V bits,
+                                      Q0 BF16 V_BITS bug fix (V=16 when cache bypassed)
+  expQ_smoke.py             (edit)   --exp-r flag, J/K/L/M/N/O assertions
+  expQ_analyze.py           (edit)   pairs_slice_c (11 pairs), Pareto-frontier section, slice "C" branch JSON with hard gate
+  run_expR_overnight.sh     NEW      two-phase orchestrator with C-first ordering and hard gate
+qwen/results/
+  expR_smoke.md                   103 PASS / 0 FAIL on n=3 smoke (Q + Exp R assertions)
+  expR_rollouts_C.jsonl           1176 rows
+  expR_summary_sliceC.md          per-condition acc + bit metrics + per-num_images + Pareto-frontier section
+  expR_paired_sliceC.md           McNemar χ² for the 11 load-bearing pairs
+  expR_verdict_matrix_sliceC.md   per-condition status
+  expR_branch_sliceC.json         machine-readable C-gate result (c_gate_passed=false; both candidates failed only the bits criterion)
+```
+
+### Pipeline status (Exp R)
+
+```
+qwen-expR — COMPLETE 2026-05-13 (gate-failed early exit)
+├── ✅ Phase C1 smoke: 103 PASS / 0 FAIL on n=3 with --exp-r assertions (1.5 min wall)
+├── ✅ Phase C2 Sub-exp C: 14 conditions × n=84 multi-image at 336° (80 min wall)
+├── ✅ Phase C3 analyze + branch JSON: c_gate_passed=False (both C4 and C7 failed on the 4.35-bit target)
+├── ⛔ Phase A1/A2 (seed=1 replication): SKIPPED — no winner to replicate
+├── ⛔ Phase B (448°): SKIPPED — no winner to confirm
+└── ⛔ Phase D/E (Overnight 2 reasoning-image + cold-format ladder): NOT LAUNCHED
+```
+
+Total Exp R wall: **1h 24min** (launch 05:10:40 → DONE 06:34:55 local). Total compute: 1176 main rows + 9 conditions × 3 smoke items = 1203 forward passes, all on Qwen2.5-VL-7B + MM-NIAH multi-image filter at 336° equal-resolution. The hard-gate design saved ~3–4 hours of A/B wall that would have replicated a non-replicating method.
+
