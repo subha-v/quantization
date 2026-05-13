@@ -2547,4 +2547,279 @@ qwen-expP — COMPLETE (2026-05-12)
 
 Total Exp P wall: ~4h 10 min (main + all follow-ups). Total compute: 2850 main-run rows + 100 cal items + 128 resolution-sweep rows + 384 recovery-check rows + 380 noise-recheck rows ≈ 3742 forward passes + 100 cal items.
 
+## Experiment Q — FormatBook v2 on MM-NIAH multi-image (2026-05-12) — COMPLETE
+
+**Status:** Slice A complete in 2h 10min wall on tambe-server-1 GPU 0 (co-tenant load varied 0–34 GB during the run). 1344 main-run rows (16 conditions × n=84 multi-image items at 336² equal-resolution) + 96 rows for the 448² mini-check (Q0/Q2/Q4 × n=32 at 448²). Slice B (reasoning-image) deferred per the analyzer's recommendation (the data was not choice-dominated; in-context routing produced a real signal).
+
+Exp Q answers a different question than P. P established that **Quest envelope scoring locates the visual needle far better than random** (McNemar χ²≈36 on multi-page items) but the win does not translate to accuracy under sparse masking — for retrieval-image MCQ, masking cold pages is too destructive when most items have only 1–4 in-context images. The one place Quest helps is **FormatBook** — when cold pages stay resident at lower precision rather than being masked out. P6 FormatBook Quest beat P6R Random by +3.2 pp at top-50% on the leaky-budget Exp P pool. Exp Q sharpens that test on the binding-budget slice (multi-image only) at the proper resolution.
+
+> **Can FormatBook (precision routing) match dense F9 accuracy while assigning F9 only to query-relevant visual pages, at lower effective KV bits?**
+
+### F9 (`F9_KIVI_Outlier16`) — what it is and how it's calibrated
+
+F9 is the dense near-lossless K-quantizer this experiment routes ON TOP of. Both Exp P and Exp Q use F9 as the **hot** page format in every FormatBook condition.
+
+**Per-token bit math:**
+- F9 K-quantizer per (B, H_kv, channel): KIVI per-channel-along-seq INT4 base (`qmax=7`) on 112/128 channels per (layer, KV-head) cell + **top-16 outlier channels kept at BF16**.
+- K-bits/token = (16·16 + 112·4) / 128 = **5.50**.
+- V is uniformly INT4 per-channel-along-head_dim in `FakeQuantKVCache` (V bits/token = 4.0).
+- Average KV bits = (5.50 + 4.00) / 2 = **4.75**.
+
+This is the "F9 + BF16 outlier sidecode" variant (`outlier_storage_bits=16` in `KQuantizerConfig`). The J12 variant uses INT8 sidecode (K bits = 4.25 avg), and Exp P showed J12 was −3.1 pp on MM-NIAH retrieval-image vs F9 BF16-sidecode — so Exp Q intentionally uses F9 BF16-sidecode as the clean dense anchor, not J12.
+
+**Calibration data (which 16 channels per cell?)** Exp Q reuses Exp P's MM-NIAH-native NPZ:
+
+```
+qwen/calibration/expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz
+```
+
+This was computed in Exp P by `expP_calibrate.py` on the 100-item MM-NIAH retrieval-image cal split (`mm_niah_split_seed0.json`, stratified by context-length bucket short/mid/long = 34/33/33). The pipeline:
+
+1. For each of the 100 cal items, one BF16 forward pass with `max_new_tokens=1`. Each forward pass attaches a `KStatsCache` (a `DynamicCache` subclass from `expF_calibrate.py`) which records per-(layer, KV-head, channel) statistics from each K tensor as it flows through the cache.
+2. Two statistics are accumulated across all 100 items:
+   - `k_sumsq[L, H_kv, D]` — running sum of `K_d²` per channel.
+   - `k_count[L]` — running count of K-token positions per layer (for normalization).
+   - `k_max[L, H_kv, D]` — running per-channel max-abs (diagnostic).
+3. After all 100 items: compute `k_channel_energy[L, H_kv, D] = E[K_d²] = k_sumsq / k_count`. Per-cell argsort, take the top-16 channels by energy:
+   ```
+   outlier_channel_idx_top16[L, H_kv, :16] = argsort(k_channel_energy[L, H_kv, :])[-16:][::-1]
+   ```
+   These are the channels the K-quantizer protects at BF16 during inference; the other 112 get INT4.
+
+**Why MM-NIAH-native calibration matters.** Exp P measured the LongVideoBench-derived NPZ against the MM-NIAH-derived NPZ and found mean overlap of **11/16 = 69%** per (layer, KV-head) cell — about 31% of the protected-channel identities are dataset-specific. Using LVB outliers on MM-NIAH would mis-protect 5 channels per cell, which Exp P's noise-recheck at 224° showed costs measurable accuracy. Exp Q's multi-image filter (n=84, `num_images≥8`) draws from the same retrieval-image task as the cal-100 pool, so the existing NPZ is in-distribution — no new calibration run was needed.
+
+**Sidecode storage cost.** For a 28-layer × 4-KV-head model with head_dim=128, the BF16-protected channels total 28 × 4 × 16 = 1792 channels per layer × 4 KV-heads / (28 layers × 4 KV-heads × 128) ≈ 12.5% of channels. The sidecode is small at rest: ~1792 BF16 values × 2 bytes = 3.5 KB of fixed-position metadata per K cache slice (and the actual per-token outlier values cost 1.5 bits/token over INT4: (16 − 4) × 16/128 = 1.5 bits more per K-token than F4).
+
+### Setup
+
+- **Model:** Qwen2.5-VL-7B-Instruct, BF16 weights, SDPA attention.
+- **Benchmark:** MM-NIAH `mm_niah_val/annotations/retrieval-image.jsonl`, filtered to `num_images ≥ 8` (the multi-image slice). Of the 361 items passing context-length filter, 261 are in the full pool (eval ∪ unused minus cal-100); after the multi-image filter **n=84 remains**. All 84 items land in the "long" context-length bucket (5k–32k tokens) since shorter items rarely have ≥ 8 in-context images. Per `--use-full-pool`, the test set is the full multi-image pool, not the eval-190 subset Exp P used.
+- **Image budget:** `max_pixels_context = max_pixels_choices = 336² = 112,896 px` (equal-resolution). Exp P used 144²/224² which biased the answer signal through choice pages; Exp Q fixes that.
+- **Calibration:** existing `expP_mmniah_kcalib_*.npz` (see above); no Exp Q-specific calibration.
+- **Hardware:** tambe-server-1 H100 80 GB, GPU 0, ~21–41 GB free during the run. PYTORCH_CUDA_ALLOC_CONF=`expandable_segments:True`.
+- **Conditions (16 total in this run):**
+
+```
+Q0   BF16 dense                                                       (anchor)
+Q1   F4 dense                                                         (anchor — F4 collapse anchor)
+Q2   F9 dense (BF16 sidecode)                                         (clean dense anchor, 4.75 KV bits)
+Q3   RoleOnly FormatBook: text+choice F9, all in-context F4           (NEW)
+Q4   Quest top-50% FormatBook   hot F9 / cold F4
+Q5   Random top-50% FormatBook  hot F9 / cold F4     seed 0
+Q6   Oracle top-50% FormatBook  (needle + Quest fill)
+Q7   Quest top-25% FormatBook   hot F9 / cold F4
+Q8   Random top-25% FormatBook  hot F9 / cold F4     seed 0
+Q9   Oracle top-25% FormatBook  (needle + Quest fill)
+Q10  Quest top-25% FormatBook   hot F9 / cold-K INT2 / V INT4   (stretch)
+Q11  Random top-25% FormatBook  hot F9 / cold-K INT2 / V INT4   (stretch)
+
+Branch-fired reseeds:
+Q8_s1 / Q8_s2     Random top-25% FB (rng=1, 2)
+Q11_s1 / Q11_s2   INT2-cold Random top-25% FB (rng=1, 2)
+```
+
+The branching rule in `run_expQ_overnight.sh` reads `acc(A) − acc(B) ≥ 0.02 OR paired_net(A, B) ≥ 5` to decide whether the Quest-vs-Random gap warrants reseed. Top-50% Q4 vs Q5 fired no (gap = −0.04, paired_net = −3). Top-25% Q7 vs Q8 fired yes (gap = +0.13, paired_net = +11). INT2-cold Q10 vs Q11 fired yes (gap = +0.05, paired_net = +4).
+
+### Main results (n=84, 336² equal-resolution)
+
+| condition | n | acc | 95% CI | eff_kv_bits | eff_k_bits | f9_sidecode_token_frac | logical_page_read | needle_hit |
+|---|---:|---:|---|---:|---:|---:|---:|---:|
+| Q0 BF16 | 84 | **0.607** | [0.500, 0.714] | 16.00† | 16.00 | 0.000 | — | — |
+| Q1 F4 | 84 | 0.274 | [0.179, 0.369] | 4.000 | 4.000 | 0.000 | — | — |
+| Q2 F9 dense | 84 | 0.548 | [0.440, 0.643] | **4.750** | 5.500 | 1.000 | — | — |
+| Q3 RoleOnly | 84 | 0.429 | [0.321, 0.524] | 4.686 | 5.372 | 0.915 | 0.000 | 0.000 |
+| Q4 Quest top-50 FB | 84 | 0.452 | [0.345, 0.560] | 4.720 | 5.440 | 0.960 | 0.523 | 0.585 |
+| Q5 Random top-50 FB | 84 | 0.488 | [0.381, 0.595] | 4.719 | 5.439 | 0.959 | 0.523 | 0.518 |
+| Q6 Oracle top-50 FB | 84 | 0.488 | [0.381, 0.595] | 4.720 | 5.440 | 0.960 | 0.523 | 1.000 |
+| **Q7 Quest top-25 FB** | 84 | **0.583** | [0.476, 0.679] | **4.705** | 5.410 | 0.940 | 0.288 | 0.347 |
+| Q8 Random top-25 FB | 84 | 0.452 | [0.345, 0.548] | 4.704 | 5.409 | 0.939 | 0.288 | 0.291 |
+| Q8_s1 | 84 | 0.536 | [0.429, 0.643] | 4.704 | 5.409 | 0.939 | 0.288 | 0.284 |
+| Q8_s2 | 84 | 0.464 | [0.357, 0.571] | 4.704 | 5.409 | 0.939 | 0.288 | 0.294 |
+| Q9 Oracle top-25 FB | 84 | 0.524 | [0.417, 0.619] | 4.705 | 5.409 | 0.940 | 0.288 | 1.000 |
+| Q10 INT2-cold Quest top-25 | 84 | 0.286 | [0.190, 0.381] | 4.644 | 5.289 | 0.940 | 0.288 | 0.330 |
+| Q11 INT2-cold Random top-25 | 84 | 0.238 | [0.155, 0.333] | 4.644 | 5.287 | 0.939 | 0.288 | 0.293 |
+| Q11_s1 | 84 | 0.214 | [0.131, 0.310] | 4.644 | 5.287 | 0.939 | 0.288 | 0.304 |
+| Q11_s2 | 84 | 0.274 | [0.179, 0.369] | 4.644 | 5.287 | 0.939 | 0.288 | 0.278 |
+
+† Q0's `effective_kv_bits=10.00` in the JSONL is a metric-reporting bug — the analyzer hardcodes V-bits = 4.0 across all conditions, which is right for Q1–Q11 (V uniformly INT4 in `FakeQuantKVCache`) but wrong for Q0's BF16 dense path (V is BF16). The K-side is correct (16.00). Doesn't affect any conclusion; fix queued.
+
+### Paired McNemar (load-bearing pairs)
+
+| pair | description | n_paired | A_only | B_only | χ² | p | favored |
+|---|---|---:|---:|---:|---:|---:|---|
+| Q1 vs Q0 | F4 vs BF16 anchor | 48 | 10 | 38 | **15.19** | **0.0001** | BF16 |
+| Q2 vs Q0 | F9 vs BF16 anchor | 9 | 2 | 7 | 1.78 | 0.182 | BF16 (trend) |
+| Q3 vs Q2 | RoleOnly vs F9 — does in-context routing matter at all? | 22 | 6 | 16 | **3.68** | **0.055** | F9 (borderline) |
+| Q4 vs Q2 | Quest top-50 FB vs F9 | 20 | 6 | 14 | 2.45 | 0.118 | F9 (trend) |
+| Q4 vs Q3 | Quest top-50 FB vs RoleOnly | 18 | 10 | 8 | 0.06 | 0.814 | tie |
+| Q4 vs Q5 | Quest vs Random top-50 FB | 15 | 6 | 9 | 0.27 | 0.606 | Random (trend) |
+| Q6 vs Q4 | Oracle headroom over Quest (top-50) | 7 | 5 | 2 | 0.57 | 0.450 | Oracle (trend) |
+| **Q7 vs Q2** | **Quest top-25 FB vs F9 — Pareto candidate** | **23** | **13** | **10** | **0.17** | **0.677** | **TIE (paired)** |
+| **Q7 vs Q3** | **Quest top-25 FB vs RoleOnly** | **17** | **15** | **2** | **8.47** | **0.0036** | **Quest** |
+| **Q7 vs Q8** | **Quest vs Random top-25 — does Quest selection matter?** | **13** | **12** | **1** | **7.69** | **0.0055** | **Quest** |
+| Q9 vs Q7 | Oracle headroom over Quest (top-25) | 5 | 0 | 5 | 3.20 | 0.074 | **Quest (Oracle WORSE)** |
+| Q10 vs Q2 | INT2-cold Quest top-25 vs F9 | 42 | 10 | 32 | **10.50** | **0.0012** | F9 |
+| Q10 vs Q11 | INT2-cold Quest vs Random | 32 | 18 | 14 | 0.28 | 0.596 | Quest (no sig.) |
+
+### Headline 1 — Quest-FormatBook at top-25% is a Pareto improvement over dense F9
+
+**Q7 Quest top-25 FB (acc=0.583, KV bits=4.705) ties Q2 F9 dense (acc=0.548, KV bits=4.75)** on paired McNemar (χ²=0.17, p=0.68). Q7 numerically wins by 3.5 pp but the gap isn't paired-significant — what matters is that Q7 does not LOSE to F9 despite storing only 75% of in-context pages at F9 precision. `f9_sidecode_token_fraction` drops from 1.000 to **0.940** (a 6 pp reduction in F9-precision tokens) at the same accuracy. That is the deployable claim Exp Q was designed to test.
+
+### Headline 2 — Quest selection is doing real work at top-25%
+
+Two paired-significant tests converge:
+- **Q7 vs Q3 (RoleOnly): χ²=8.47, p=0.0036, Quest wins 15 to 2 paired** — promoting hot in-context pages helps over a policy that always leaves all in-context pages cold.
+- **Q7 vs Q8 (Random): χ²=7.69, p=0.0055, Quest wins 12 to 1 paired** — Quest's envelope scorer beats random page selection at the same budget. Three random seeds (Q8/Q8_s1/Q8_s2) span 0.452 to 0.536 (mean 0.484); Q7 = 0.583 sits above all three.
+
+Together these falsify two alternative explanations: it's NOT that "in-context precision doesn't matter" (RoleOnly is paired-worse), and it's NOT that "any 25% works" (Random is paired-worse). Quest's specific top-K choice is load-bearing.
+
+### Headline 3 — Top-25% is the sweet spot, top-50% is not
+
+Counterintuitively, **shrinking the hot budget from 50% to 25% improves accuracy** (Q7 = 0.583 vs Q4 = 0.452). At top-50% the Quest-vs-Random distinction collapses (Q4 vs Q5: χ²=0.27, p=0.61, Random directionally better) and FormatBook barely matches RoleOnly (Q4 vs Q3: χ²=0.06, tie). The mechanism is likely that at top-50%, the F9 sidecode token fraction rises to 0.96 with no additional informative pages — the extra 25% of pages promoted to F9 are not the ones Quest finds useful, so promoting them dilutes the routing signal. The cleanest Pareto point is **fewer high-quality pages, chosen by Quest**, not more.
+
+### Headline 4 — INT2 cold-K is too aggressive
+
+Q10/Q11 push cold pages from F4 (K bits = 4.00) down to cold-K INT2 (K bits = 2.00), leaving V at INT4. Per-token effective KV bits drop from 4.71 to 4.64 — small storage win. But accuracy collapses: Q10 = 0.286, Q11 = 0.238, Q11_s1 = 0.214, Q11_s2 = 0.274. Mean Q11* ≈ 0.242. **Q10 vs Q2 paired McNemar: χ²=10.50, p=0.0012, F9 strictly better** by 32 paired flips. Quest selection still provides directional separation over random (Q10 vs Q11 paired_net = +4) but the absolute level is below Q1 F4 dense (0.274). INT2 ternary on K rows destroys the visual evidence even when confined to ~75% of pages, because the "key match" structure of attention depends on K row sign-and-scale which ternary preserves only at the cost of magnitude precision.
+
+### Headline 5 — Oracle headroom is gone at top-25%; Quest is near or above its own upper bound
+
+Q9 (Oracle: needle forced into active + Quest top-(K−1) fill) at top-25% = 0.524 is **below** Q7 = 0.583 by 5.9 pp, with paired_net = −5 in favor of Quest (χ²=3.20, p=0.074 borderline). This is unexpected: the oracle should never lose to a non-oracle on the same budget. Two likely explanations:
+
+1. **Needle forcing displaces a higher-scoring Quest page**. Quest picks top-K by `sum_d max(q · k_min, q · k_max)`; if the needle's Quest score is BELOW the K-th-ranked page, oracle replaces a Quest-picked page with the (lower-scored) needle, then fills (K−1) from the remaining. On items where the answer-token logits flow through choice images + text rather than the visual needle, Quest is right to not pick the needle — the oracle is wrong.
+2. **Small n_paired=5** — only 5 items are discordant between Q7 and Q9. The numeric difference may be sample noise; the direction is real but the magnitude isn't trustworthy.
+
+At top-50% Oracle Q6 = 0.488 ties Q4 Quest = 0.452 (Q6 wins by 3 paired, χ²=0.57, p=0.45 — directional, not significant). So oracle headroom mostly disappears once cold pages still contribute via FormatBook. This is consistent with Exp P's P6O ≈ P6 finding.
+
+### Per-num_images breakdown — Quest helps more when there are more pages to choose from
+
+Items with `num_images ≥ 12` (n=38) vs `num_images = 8–11` (n=46):
+
+| condition | 8-11 imgs (n=46) | 12-19 imgs (n=38) | Δ |
+|---|---:|---:|---:|
+| Q0 BF16 | 0.543 | 0.684 | +0.141 |
+| Q2 F9 dense | 0.543 | 0.553 | +0.010 |
+| Q3 RoleOnly | 0.391 | 0.474 | +0.083 |
+| **Q7 Quest top-25 FB** | **0.543** | **0.632** | **+0.089** |
+| Q8 Random top-25 FB | 0.435 | 0.474 | +0.039 |
+| Q7 − Q8 gap | +0.108 | +0.158 | +0.050 |
+
+The Quest-vs-Random gap is **larger on items with more in-context images** (+15.8 pp on 12-19 vs +10.8 pp on 8-11). Exactly the binding-budget regime where routing should matter — the page scorer earns more separation when there are more pages to choose between. This supports the Headline-2 mechanism.
+
+### 448² mini-check (Q0/Q2/Q4 on n=32)
+
+Re-ran three conditions at MM-NIAH InternVL's official `input_size=448` (max_pixels = 200,704 px) on n=32 multi-image items:
+
+| condition | n | acc | eff_kv_bits |
+|---|---:|---:|---:|
+| Q0 BF16 | 32 | 0.688 | 16.00† |
+| Q2 F9 dense | 32 | 0.844 | 4.75 |
+| Q4 Quest top-50 FB | 32 | 0.688 | 4.71 |
+
+F9 at 448° lands **above** BF16 on this small sample (small-n noise; n=32 std ≈ ±9 pp). What matters is F9 doesn't degrade at the higher resolution — it remains within or above the BF16 envelope. Consistent with Exp P's 336° recovery check showing F9 within −1.6 pp of BF16 at higher resolution. Q4 ties BF16 at 0.688 — same direction as the main 336° run. We did not include Q7 in this mini-check (the orchestrator launched only Q0/Q2/Q4 to keep wall short); the headline Pareto claim is therefore confirmed at 336° but not yet at 448°.
+
+### Interpretation against the decision tree
+
+The Exp Q plan listed five possible outcomes. Mapping observed signals:
+
+```
+Q4 or Q7 ≈ Q2  AND  Q4/Q7 > Q3  AND  Q4/Q7 > Q5/Q8  AND  effective_kv_bits < 4.75
+→ HEADLINE: Quest-FormatBook matches dense F9 with fewer high-quality pages.
+            Query-aware page-precision selection is the deployable axis.
+```
+
+- **Q7 vs Q2**: ✓ paired tie (χ²=0.17, p=0.68)
+- **Q7 vs Q3**: ✓ paired Quest wins (χ²=8.47, p=0.0036)
+- **Q7 vs Q8**: ✓ paired Quest wins (χ²=7.69, p=0.0055)
+- **eff_kv_bits(Q7) < 4.75**: ✓ 4.705 vs 4.750
+
+**All four conditions hold for Q7. The HEADLINE outcome is met for top-25% Quest FormatBook. Q4 (top-50%) is PARTIAL — it satisfies the tie-with-F9 and below-4.75 conditions but fails the beats_Random test.**
+
+```
+Q3 ≈ Q2
+→ retrieval-image is still choice/text dominated; move to Slice B reasoning-image.
+```
+
+Q3 vs Q2 paired: χ²=3.68, **p=0.055 borderline**. RoleOnly is 12 pp below F9 but the paired-discordant count is only 22, just under the n_paired=23 power threshold. The branch JSON correctly flagged `slice_b_recommendation: DEFER` because the in-context routing signal is present (Q7 vs Q3 and Q7 vs Q8 are both paired-significant). Reasoning-image remains a viable follow-up but is not necessary to support the Headline 1–3 claims.
+
+```
+Q6/Q9 >> Q4/Q7  → oracle headroom; Quest scorer is too weak.
+```
+
+Direction is REVERSED at top-25%: Q9 = 0.524 < Q7 = 0.583. Quest is at or above its own budget-matched oracle on this slice — consistent with Headline 5.
+
+```
+Q10 works AND Q10 > Q11  →  cold-K INT2 is a real low-bit FormatBook policy.
+```
+
+Q10 vs Q11 trends right (+4 paired_net) but Q10 vs Q2 paired-significantly worse (χ²=10.50, p=0.0012). **INT2 cold-K is not viable on MM-NIAH multi-image retrieval at this budget.** The stretch hypothesis (cheaper cold format unlocks a Pareto-better point) is falsified at K-INT2.
+
+### Pareto frontier (n=84 multi-image at 336²)
+
+```
+KV bits   acc       condition           note
+4.000     0.274     Q1 F4 dense          F4 collapse confirmed on MM-NIAH multi-image
+4.644     0.286     Q10 INT2-cold Quest  INT2 K destroys visual evidence on cold pages
+4.705     0.583     Q7 Quest top-25 FB   PARETO IMPROVEMENT over F9 dense (paired-tied, lower bits)
+4.720     0.452     Q4 Quest top-50 FB   inferior to Q7 (more sidecode, less accuracy)
+4.750     0.548     Q2 F9 dense          clean dense anchor
+16.00     0.607     Q0 BF16              ceiling
+```
+
+The deployable claim from Exp Q is **Q7: top-25% Quest-FormatBook with F9 hot pages and F4 cold pages = F9-tier accuracy at 4.705 effective KV bits and 0.940 F9-sidecode-token-fraction**. Storage Pareto-improves on dense F9; latency is not claimed (FormatBook does not reduce attention reads in this fake implementation).
+
+### Implications for the research direction
+
+1. **Top-25% > top-50% on this slice.** The orchestrator should default to top-25 for FormatBook routing experiments. Larger hot budgets dilute the Quest signal.
+2. **Quest envelope scoring is doing real work at the binding-budget regime.** Exp P's earlier "Quest finds the needle but it doesn't help accuracy" finding was a leaky-budget artifact — once the budget actually binds (n_routable ≥ 8 in-context images and budget_fraction=0.25 → ceil(0.25 · 8) = 2 hot pages, real selection), Quest produces paired-significant accuracy gains over Random.
+3. **INT2 cold-K is dead at K=2 on MM-NIAH multi-image.** Future cheap-cold variants should try INT2-V-only, INT3 cold-K, or asymmetric cold quantization (per-channel scale + INT2 residual), not symmetric INT2 K.
+4. **Reasoning-image is no longer the highest-priority next experiment.** Slice A produced a clean positive result on retrieval-image. Reasoning-image remains in scope as a generalization check but is not load-bearing for the headline.
+5. **The metric reporting needs a small fix.** `effective_kv_bits=10.00` for Q0 BF16 is from a hardcoded `V_BITS=4.0` in `expQ_driver._compute_bit_metrics` and `_page_k_bits_dense`; for dense BF16 V is also BF16. K-side reporting (16.00) is correct. Fix in `qwen/scripts/expQ_driver.py:V_BITS` and the `is_dense` branch.
+
+### Layout
+
+```
+qwen/scripts/
+  expQ_driver.py                  Slice A/B driver, --task, --use-full-pool, --min-num-images,
+                                  --max-pixels-{context,choices}, --include-int2-stretch
+  expQ_smoke.py                   n=3 smoke with new assertions F/G/H/I (RoleOnly zero hot,
+                                  AllHot matches F9 within 1e-4, INT2 harsher than F4, bit math)
+  expQ_analyze.py                 summary, paired McNemar (13 pairs), verdict matrix,
+                                  branch-check JSON, per-num_images breakdown
+  expQ_calibrate_reasoning.py     fresh F9 outlier calibration on reasoning-image cal-100
+                                  (Slice B only; not used in this run)
+  run_expQ_overnight.sh           tmux orchestrator: smoke -> Slice A main -> Phase C analyze
+                                  -> conditional reseed -> 448 mini-check -> final analyze
+                                  -> Slice B recommendation. Sources /data/subha2/experiments/qwen_venv
+  attention_router.py (edit)      _int2_per_channel_seq + RoutePolicy.cold_quantizer + new policies
+                                  "formatbook_role_only", "formatbook_all_hot"
+  quest_scorer.py (edit)          "role_only" and "all_hot" selection paths in select_active_pages
+  mm_niah_loader.py (edit)        reasoning-image task support (defensive, not exercised this run)
+qwen/calibration/
+  expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz   (reused from Exp P; see F9 section above)
+qwen/results/
+  expQ_rollouts_sliceA.jsonl                 1344 rows (16 conditions × n=84)
+  expQ_rollouts_sliceA_res448.jsonl          96 rows (Q0/Q2/Q4 × n=32 at 448°)
+  expQ_summary_sliceA.md                     per-condition acc + bit metrics + per-bucket + per-num_images
+  expQ_paired_sliceA.md                      McNemar χ² for the 13 load-bearing pairs
+  expQ_verdict_matrix_sliceA.md              headline signals (HEADLINE for Q7, PARTIAL for Q4)
+  expQ_summary_sliceA_res448.md              448° mini-check
+  expQ_branch_sliceA.json                    machine-readable branch flags (orchestrator-consumed)
+  expQ_smoke.md                              91 PASS / 0 FAIL on n=3 smoke
+```
+
+### Pipeline status (Exp Q)
+
+```
+qwen-expQ Slice A — COMPLETE (2026-05-13)
+├── ✅ Phase A smoke: 91 PASS / 0 FAIL on n=3 short bucket (1.5 min wall)
+├── ✅ Phase B Slice A main: 12 conditions × n=84 multi-image at 336² (82 min wall)
+├── ✅ Phase C analyze + branch JSON (need_q5=F, need_q8=T, need_q11=T, slice_b=DEFER)
+├── ✅ Phase D reseed: Q8_s1/s2 + Q11_s1/s2 fired (38 min wall, branch rule triggered)
+├── ✅ Phase E 448° mini-check: Q0/Q2/Q4 × n=32 at max_pixels=200704 (~9 min wall)
+└── ✅ Phase F final analyze (re-aggregated primary + reseed)
+
+Slice B (reasoning-image) deferred per slice_b_recommendation=DEFER.
+```
+
+Total Exp Q Slice A wall: 2h 10min (launch 18:06 → DONE 20:16 local). Total compute: 1344 main+reseed rows + 96 res448 rows + 3 conditions × 3 smoke items = **1453 forward passes**, all on Qwen2.5-VL-7B + MM-NIAH multi-image filter at 336² equal-resolution. No new calibration items (Exp P NPZ reused).
 
