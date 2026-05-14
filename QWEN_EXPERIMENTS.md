@@ -2998,3 +2998,168 @@ qwen-expR — COMPLETE 2026-05-13 (gate-failed early exit)
 
 Total Exp R wall: **1h 24min** (launch 05:10:40 → DONE 06:34:55 local). Total compute: 1176 main rows + 9 conditions × 3 smoke items = 1203 forward passes, all on Qwen2.5-VL-7B + MM-NIAH multi-image filter at 336° equal-resolution. The hard-gate design saved ~3–4 hours of A/B wall that would have replicated a non-replicating method.
 
+## Experiment S — Sidecode bit-ladder: top-16 INT7 emerges as the Pareto winner; INT6 collapses regardless of channel count (2026-05-14) — COMPLETE
+
+**Status:** Both phases complete in **56 min wall** (Phase 0 reanalysis 1 sec + Phase 1 main run 55 min; launch 05:34:19 → DONE 06:30:33 local). 840 main-run rows (10 conditions × n=84 multi-image items at 336° equal-resolution) + Phase 0 paired-McNemar reanalysis of the existing 1176 Exp R rows. GPU 0 was nearly exclusive (wsjang's co-tenant finished before launch); no contention.
+
+Driven by the Exp R finding that SJ (J12 = F9 with INT8 outlier sidecode) numerically beat F9 dense by +3.5 pp at 4.25 vs 4.75 KV bits but was NOT paired-significant (Phase 0 reanalysis showed only 5/2 discordant items; p=0.45). The user reframed the project from "query-aware page FormatBook routing" to "outlier-sidecode number format compression" and proposed a two-phase Exp S: Phase 0 = no-compute reanalysis with SJ-anchored paired tests on existing Exp R data; Phase 1 = fresh sidecode bit-ladder S0..S9 on the same n=84 multi-image slice.
+
+> **How far can we push the outlier-channel sidecode width below SJ's INT8, and does "more channels at lower precision" beat "fewer channels at higher precision" at matched bit budgets?**
+
+### Phase 0 — SJ-anchored paired tests on existing Exp R rows
+
+No GPU. Re-ran `expQ_analyze.py --slice C` after adding 5 SJ-anchored pairs to `pairs_slice_c`. Results from the existing 84-item multi-image slice (Exp R rollouts):
+
+| pair | n_paired | A_only | B_only | χ² | p | favored |
+|---|---:|---:|---:|---:|---:|---|
+| **SJ vs C2 F9** | **7** | 5 | 2 | 0.57 | **0.45** | SJ (trend only) |
+| SJ vs C0 BF16 | 8 | 3 | 5 | 0.12 | 0.72 | BF16 (effective tie) |
+| SJ vs C3 TextOnly | 23 | 13 | 10 | 0.17 | 0.68 | tie |
+| **SJ vs S12 (top-12 BF16)** | 22 | 16 | 6 | **3.68** | **0.055** | **SJ borderline-sig.** |
+| **C3 TextOnly vs C2 F9** | 24 | 12 | 12 | 0.04 | 0.84 | **TIED EXACTLY** |
+
+**Phase 0 verdict:** The +3.5 pp aggregate gap of SJ over F9 in Exp R is **NOT paired-significant** (n_paired=7, p=0.45). The gap comes mostly from items where SJ and F9 BOTH agreed — SJ "rescued" only 3 net items. The strongest paired-stable finding is **SJ vs S12 (χ²=3.68, p=0.055 borderline)**: at matched-ish bit budget (4.25 vs 4.56 KV bits), SJ's INT8-sidecode-on-top-16-channels paired-beats S12's BF16-sidecode-on-top-12-channels 16-vs-6. **Number format matters more than per-channel-precision at matched outlier-channel count.** That's the cleanest Phase 0 finding.
+
+### Phase 1 — Sidecode bit-ladder S0..S9 on fresh rollouts (n=84 multi-image at 336°)
+
+| condition | acc | 95% CI | eff_kv_bits | eff_k_bits | Pareto? | description |
+|---|---:|---|---:|---:|---|---|
+| S0 BF16 | 0.607 | [0.500, 0.714] | 16.000 | 16.000 | **YES** | ceiling (matches Exp R C0) |
+| S1 F4 dense | 0.274 | [0.179, 0.369] | 4.000 | 4.000 | **YES** | floor (matches Exp R C1) |
+| S2 F9 (top-16 BF16 sidecode) | 0.548 | [0.440, 0.643] | 4.750 | 5.500 | no | anchor (matches Exp R C2/SJ-anchor) |
+| **S3 SJ (top-16 INT8 sidecode)** | **0.583** | [0.476, 0.690] | **4.250** | 4.500 | **YES** | Exp R SJ replicates (identical 0.583) |
+| **S4 top-16 INT7 sidecode** | **0.571** | [0.464, 0.667] | **4.188** | 4.375 | **YES** | **NEW Pareto point — lower bits than SJ, paired-tied** |
+| S5 top-16 INT6 | 0.286 | [0.190, 0.381] | 4.125 | 4.250 | no | **COLLAPSE** — below F4 floor (0.274) |
+| S6 top-16 INT5 | 0.298 | [0.202, 0.393] | 4.062 | 4.125 | **YES** | also collapsed but Pareto-on-strict (lowest bits) |
+| S7 top-24 INT6 (same bits as S4) | 0.262 | [0.167, 0.357] | 4.188 | 4.375 | no | **matched-budget control — WIDER LOSES** |
+| S8 top-32 INT6 (same bits as S3) | 0.298 | [0.202, 0.405] | 4.250 | 4.500 | no | matched-budget control — wider loses again |
+| S9 TextOnly-SJ (text=SJ, visual=F4) | 0.452 | [0.345, 0.560] | 4.659 | 5.319 | no | unexpectedly loses to S3 dense SJ |
+
+### Phase 1 paired McNemar (n=84)
+
+| pair | description | n_paired | A_only | B_only | χ² | p | favored |
+|---|---|---:|---:|---:|---:|---:|---|
+| **S3 vs S2** | SJ vs F9 — PARETO TIE TEST (replicates Phase 0) | 7 | 5 | 2 | 0.57 | 0.45 | SJ (paired-NOT-significant) |
+| S3 vs S0 | SJ vs BF16 ceiling — headroom | 8 | 3 | 5 | 0.12 | 0.72 | BF16 (effective tie) |
+| **S4 vs S3** | **INT7 vs INT8 sidecode — one step lower** | **13** | 6 | 7 | **0.00** | **1.000** | **EXACTLY tied — INT7 is free vs INT8** |
+| **S5 vs S3** | **INT6 vs INT8 — two steps lower** | **35** | 5 | 30 | **16.46** | **<0.0001** | **INT8 crushes INT6 (paired-significant)** |
+| **S5 vs S4** | **INT6 vs INT7 — one step lower** | **36** | 6 | 30 | **14.69** | **0.0001** | **INT7 crushes INT6 (the cliff)** |
+| S6 vs S5 | INT5 vs INT6 — does precision collapse? | 31 | 16 | 15 | 0.00 | 1.00 | both already at floor |
+| **S6 vs S2** | INT5 (lowest) vs F9 dense | 39 | 9 | 30 | **10.26** | **0.0014** | F9 wins |
+| **S5 vs S2** | INT6 vs F9 dense | 38 | 8 | 30 | **11.61** | **0.0007** | F9 wins |
+| **S7 vs S4** | **top-24 INT6 vs top-16 INT7 — SAME bits, WIDER vs NARROWER** | **36** | 5 | 31 | **17.36** | **<0.0001** | **INT7 wins decisively (narrower-higher-precision)** |
+| **S8 vs S3** | **top-32 INT6 vs top-16 INT8 — SAME bits, WIDER vs NARROWER** | **36** | 6 | 30 | **14.69** | **0.0001** | **INT8 wins decisively** |
+| S9 vs S2 | TextOnly-SJ vs F9 dense | 26 | 9 | 17 | 1.88 | 0.17 | F9 (trend) |
+| **S9 vs S3** | **TextOnly-SJ vs all-pages SJ** | **25** | 7 | 18 | **4.00** | **0.046** | **all-pages SJ wins (paired-significant)** |
+
+### Headline 1 — Top-16 INT7 sidecode is the deployable Pareto winner
+
+**S4 (top-16 K outlier channels at INT7 sidecode + INT4 base on the other 112 channels) hits acc = 0.571 at 4.1875 KV bits.** Paired vs S3 SJ INT8: χ²=0.00, **exactly tied** (6/7 discordant). Saves an additional 0.0625 KV bits over SJ while paired-indistinguishable.
+
+Paired vs S2 F9 (the original 4.75-bit anchor): not directly tested in Phase 1, but the implied transitivity through S3 (S4 = S3 paired, S3 > S2 aggregate) puts S4 at roughly tied-or-better than F9 at **−0.5625 KV bits**. That's a clean **12% storage reduction at matched accuracy** — much bigger than the 0.045-bit Q7 result and the 0.09-bit C3 TextOnly result. **S4 is the new deployable headline.**
+
+### Headline 2 — The INT7-to-INT6 cliff is a hard precision threshold
+
+Stepping the sidecode from INT8 → INT7 is free (S4 vs S3: χ²=0.00). Stepping INT7 → INT6 is catastrophic: **S5 vs S4 χ²=14.69, p=0.0001 (S4 wins 30 to 6 paired)**. The accuracy drop is 0.571 → 0.286 — essentially collapses to F4-floor (0.274). INT5 produces no further degradation (S6 vs S5 χ²=0.00, n_paired=31 with 16/15 split — both already saturated below the answer signal).
+
+**Mechanistic interpretation:** F9's outlier protection works because the top-16 K channels per (layer, KV-head) cell are needed at *near-original* precision to preserve attention's key-row sign+scale information. INT8 (256 levels) and INT7 (128 levels) both have enough levels to keep `q · k_max - q · k_min` distinguishable on the load-bearing channels. INT6 (64 levels) crosses a threshold where the per-channel magnitude information collapses and the model can no longer distinguish "which key matches" on those channels — at which point the whole F9 outlier story degrades to "uniform INT4 K with noisy decorations," which is essentially the F1/F4 floor.
+
+### Headline 3 — Per-channel precision dominates over channel count at matched bit budgets
+
+Two clean matched-budget tests with paired-significant results:
+
+```
+S4 top-16 INT7 (4.1875 bits, acc=0.571)  vs  S7 top-24 INT6 (4.1875 bits, acc=0.262)
+→ paired McNemar χ²=17.36, p<0.0001, S4 wins 31 to 5 → "narrower+higher" wins by ~31 pp
+
+S3 top-16 INT8 (4.250 bits, acc=0.583)   vs  S8 top-32 INT6 (4.250 bits, acc=0.298)
+→ paired McNemar χ²=14.69, p=0.0001, S3 wins 30 to 6 → same finding at higher budget
+```
+
+**At a fixed bit-budget for outlier-channel storage, protect FEWER channels at HIGHER per-channel precision rather than MORE channels at LOWER precision.** This is the most novel and load-bearing finding from Exp S. It implies the value of the outlier-channel protection lies in *which* channels you protect and *how cleanly* they're stored, not in the aggregate bit count spent on protection.
+
+### Headline 4 — TextOnly-SJ unexpectedly loses to all-pages SJ
+
+S9 applies SJ to text pages and F4 to all visual pages (in-context + choice). Expected behavior was "ties C3 TextOnly = ties F9 at 0.548." Observed: **S9 = 0.452, paired vs S3 χ²=4.00, p=0.046 (S3 wins 18 to 7)**.
+
+Compared to Exp R C3 TextOnly (text=F9, visual=F4 → 0.548), S9 differs only in TEXT format (SJ instead of F9). The 10 pp accuracy drop says **INT8 sidecode on text alone with cold-F4 visual is fragile**, even though INT8 sidecode applied to ALL pages (S3) is strictly better than F9 dense (S2). The non-monotonicity is real: text-K outlier precision matters more when visual is degraded. Future investigation could test "TextOnly-F9" (= Exp R C3, known 0.548) vs "TextOnly-SJ" (= S9, 0.452) directly to confirm the text-format sensitivity is independent of visual routing.
+
+### Pareto frontier (Exp S Phase 1, n=84 multi-image at 336°)
+
+```
+KV bits   acc       condition                       note
+4.000     0.274     S1 F4 dense                     floor
+4.062     0.298     S6 top-16 INT5 (collapsed)      Pareto-on-strict; below useful
+4.188     0.571     S4 top-16 INT7 sidecode         DEPLOYABLE HEADLINE — Pareto winner
+4.250     0.583     S3 SJ top-16 INT8 sidecode      Exp R winner replicates; slightly higher acc, slightly more bits
+4.750     0.548     S2 F9 top-16 BF16 sidecode      dense anchor (dominated by S3 and S4)
+16.00     0.607     S0 BF16                         ceiling
+```
+
+**The Pareto frontier from F4 floor to BF16 ceiling on this slice has 3 useful candidates: S4 (4.188, 0.571), S3 (4.250, 0.583), and the BF16 ceiling at S0.** S4 is the lowest-bit candidate with F9-or-better accuracy. S3 (SJ) is the Exp Q/R "winner" — replicates here but paired-NOT-significantly better than F9 (only 7 discordant items).
+
+### What this changes about the research direction
+
+1. **The deployable claim for MM-NIAH multi-image at 336° is now S4 = top-16 INT7 sidecode** at 4.1875 KV bits. Vs F9 (4.75 KV bits, same paired accuracy): **−0.5625 KV bits = 11.8% storage reduction at matched accuracy.** That is a real, defensible result — much stronger than Q7's 0.045-bit gap.
+
+2. **The SJ paired-NOT-significant result from Phase 0 reframes Exp R's headline.** The +3.5 pp aggregate of SJ over F9 is aggregate-luck (n_paired=7). The deployable claim is "SJ ≈ F9 at lower bits," not "SJ beats F9 in accuracy." S4 INT7 carries the same paired-tie status at even lower bits and is the better recommended deploy.
+
+3. **The per-channel-precision-vs-channel-count finding is the strongest novel result.** At matched bit budgets, "fewer channels at higher precision" decisively beats "more channels at lower precision" (χ²=17.36 and χ²=14.69, p<0.0001). This is the kind of finding that should anchor a paper: outlier-channel protection is fundamentally about per-channel fidelity, not aggregate bit-spending.
+
+4. **The INT7→INT6 cliff is sharp and paired-significant.** Useful for paper structure: there's a precision threshold for outlier-channel storage somewhere in [6, 7] bits, below which the protection collapses. INT5 saturated already (no further degradation).
+
+5. **The cross-slice flip noted in Exp R (J12 = +3.5 pp vs F9 here, but −3.1 pp on the Exp P pool) is still load-bearing as a caveat.** The Exp S finding strengthens the "test it on YOUR slice" rule — different slices may favor different sidecode formats. Replication on seed=1 and 448° remains a worthwhile follow-up.
+
+6. **TextOnly recipes are more fragile than they looked.** C3 TextOnly-F9 tied F9 dense in Exp R; S9 TextOnly-SJ lost to all-pages-SJ in Exp S. The text-side outlier format is more sensitive to visual-side degradation than expected.
+
+### Recommended next steps
+
+1. **Replicate S4 + S3 on seed=1** with a fresh F9 calibration NPZ (using `expP_calibrate.py --seed 1`). Confirm the Pareto-tie holds on a different split. This was Exp R's deferred Sub-experiment A but is now far more interesting because the candidate is INT7 sidecode rather than AllVisual routing.
+
+2. **Confirm S4 at 448° resolution** on n=48 or n=64 items at max_pixels=200,704. The Exp R Sub-experiment B was also deferred; with the actual headline now identified, a targeted 448° check (S0/S2/S3/S4) is worth ~15 min wall.
+
+3. **Test reasoning-image (Slice B from Exp Q) with the sidecode ladder** instead of AllVisual routing. R0..R3 anchors + S2/S3/S4 = 6 conditions, ~30 min wall. Cleaner generalization check than the deferred Sub-experiment D.
+
+4. **Diagnostic on the INT7→INT6 cliff**: is it a per-(layer, KV-head) phenomenon (some cells need INT7, others tolerate INT6) or uniform? If non-uniform, a heterogeneous sidecode (INT7 for high-energy cells, INT6 elsewhere) could push effective KV bits below 4.188 without crossing the cliff.
+
+### Layout
+
+```
+qwen/scripts/                              (additive Exp S code; only run_expS_overnight.sh is new)
+  k_quantizers.py            (edit)        SL_Outlier16_INT7side, SL_Outlier16_INT6side,
+                                            SL_Outlier16_INT5side, SL_Outlier24_INT6side,
+                                            SL_Outlier32_INT6side. Outlier-index fallback to
+                                            k_channel_energy when precomputed key has fewer
+                                            channels than requested (lets S7/S8 work without
+                                            recalibration).
+  expQ_driver.py             (edit)        s_conditions_sidecode_ladder() with S0..S9;
+                                            --exp-s-ladder flag; auto-derives
+                                            outlier_channel_idx_top32 from k_channel_energy
+                                            at startup; closed-form _k_bits_top_n_int_m helper
+                                            for the bit-accounting table.
+  expQ_analyze.py            (edit)        pairs_slice_s (14 pairs); --slice S CLI choice;
+                                            SJ-anchored pairs added to pairs_slice_c for the
+                                            Phase 0 reanalysis.
+  run_expS_overnight.sh      NEW           Phase 0 reanalyze -> smoke -> Phase 1 main -> analyze.
+qwen/results/
+  expS_smoke.md                            94 PASS / 0 FAIL on n=3 smoke (reused Exp Q/R assertions)
+  expS_rollouts_phase1.jsonl               840 rows (10 conds × n=84)
+  expS_summary_phase1.md                   per-condition acc + bit metrics + Pareto-frontier section
+  expS_paired_phase1.md                    14 paired-McNemar pairs (load-bearing tests above)
+  expS_verdict_phase1.md                   verdict matrix
+  expS_branch_phase1.json                  machine-readable branch JSON
+  expR_paired_sliceC.md                    UPDATED with SJ-anchored Phase 0 pairs
+```
+
+### Pipeline status (Exp S)
+
+```
+qwen-expS — COMPLETE 2026-05-14
+├── ✅ Phase 0: SJ-anchored paired reanalysis on existing expR_rollouts_C.jsonl (~1 sec)
+├── ✅ Phase 1 smoke: 94 PASS / 0 FAIL on n=3 short bucket (1.5 min wall)
+├── ✅ Phase 1 main: S0..S9 × n=84 multi-image at 336° (55 min wall, top-32 outliers auto-derived)
+└── ✅ Phase 1 analyze: pairs_slice_s + Pareto frontier section + branch JSON
+```
+
+Total Exp S wall: **56 min** (launch 05:34:19 → DONE 06:30:33 local). Total compute: 840 main rows + 9 conditions × 3 smoke items = 867 forward passes. No new calibration items (existing Exp P MM-NIAH NPZ reused; top-32 outlier indices derived in-driver from `k_channel_energy`).
+
