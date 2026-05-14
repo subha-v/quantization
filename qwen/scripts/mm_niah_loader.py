@@ -202,9 +202,14 @@ def _normalize(rec: dict, images_root: Path, task: str = DEFAULT_TASK) -> Option
     n_imgs = int(meta.get("num_images", len(images_list_raw)))
 
     if task == "counting-image":
-        # Counting-image: answer is a list[int] of per-image needle counts.
-        # The first image in images_list is the needle pattern; the answer
-        # has length num_images - 1.
+        # Counting-image: answer is JSON-encoded as a string like "[1, 0, 2]".
+        # Parse it into a Python list[int]. The first image in images_list is
+        # the needle pattern; the parsed list has length num_images - 1.
+        if isinstance(answer, str):
+            try:
+                answer = json.loads(answer)
+            except (json.JSONDecodeError, ValueError):
+                return None
         if not isinstance(answer, list) or not all(isinstance(x, int) for x in answer):
             return None
         if len(answer) != max(0, n_imgs - 1):
