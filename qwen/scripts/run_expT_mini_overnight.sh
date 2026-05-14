@@ -192,7 +192,7 @@ if have_phase 3; then
         --max-pixels-context $((336*336)) \
         --max-pixels-choices $((336*336)) \
         --exp-t-mini-counting \
-        --max-new-tokens-counting 96 \
+        --max-new-tokens-counting 160 \
         --out-jsonl "$JSONL_T3" \
         --out-summary "$MD_T3" \
         2>&1 | tee -a "$LOG"

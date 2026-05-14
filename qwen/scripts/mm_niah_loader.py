@@ -75,6 +75,8 @@ class MMNiahItem:
     #   (MCQ scoring vs counting-image generation+list-parse).
     gold_counts: Optional[list[int]] = None
     task: str = DEFAULT_TASK
+    # num_choices: 4 for retrieval-image, 2 for reasoning-image, 0 for counting-image
+    num_choices: int = 4
     raw: Optional[dict] = field(default=None, repr=False)
 
 
@@ -233,16 +235,23 @@ def _normalize(rec: dict, images_root: Path, task: str = DEFAULT_TASK) -> Option
             num_images=n_imgs,
             gold_counts=list(answer),
             task=task,
+            num_choices=0,
             raw=rec,
         )
 
-    # retrieval-image and reasoning-image are both 4-way single-choice MCQ over
-    # candidate images.
+    # retrieval-image: 4-way MCQ. reasoning-image: 2-way (binary) MCQ.
     if answer is None or not isinstance(answer, int):
         return None
-    if not (0 <= answer < 4):
+    if task == "retrieval-image":
+        expected_choices = 4
+    elif task == "reasoning-image":
+        expected_choices = 2
+    else:
+        # Defensive: shouldn't reach here for counting-image (handled above).
         return None
-    if len(choices_raw) != 4:
+    if not (0 <= answer < expected_choices):
+        return None
+    if len(choices_raw) != expected_choices:
         return None
     if len(images_list_raw) != n_imgs:
         return None
@@ -267,6 +276,7 @@ def _normalize(rec: dict, images_root: Path, task: str = DEFAULT_TASK) -> Option
         context_length_bucket=bucket,
         num_images=n_imgs,
         task=task,
+        num_choices=expected_choices,
         raw=rec,
     )
 
@@ -369,7 +379,12 @@ def format_mcq_messages(item: MMNiahItem,
                 "image": "file://" + item.images_list[i],
                 "max_pixels": max_pixels_context,
             })
-    # MCQ tail
+    # MCQ tail — number of choices varies by task
+    # (retrieval-image: 4, reasoning-image: 2)
+    n_choices = len(item.choices_image_paths)
+    if n_choices == 0:
+        raise RuntimeError(f"MM-NIAH item {item.id}: no MCQ choices — use "
+                           f"format_counting_messages() for counting-image instead")
     content.append({"type": "text", "text": f"\n\n{item.question}\n\nChoices:\n"})
     for letter, img_path in zip(OPTION_LETTERS, item.choices_image_paths):
         content.append({"type": "text", "text": f"{letter}. "})
@@ -379,7 +394,8 @@ def format_mcq_messages(item: MMNiahItem,
             "max_pixels": max_pixels_choices,
         })
         content.append({"type": "text", "text": "\n"})
-    content.append({"type": "text", "text": "\nAnswer with a single letter from A, B, C, D."})
+    letters_str = ", ".join(OPTION_LETTERS[:n_choices])
+    content.append({"type": "text", "text": f"\nAnswer with a single letter from {letters_str}."})
     return [{"role": "user", "content": content}]
 
 

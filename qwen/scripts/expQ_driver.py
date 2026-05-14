@@ -922,8 +922,12 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
     latency_ms = (time.perf_counter() - t0) * 1000.0
 
     first_logits = out.scores[0]
-    logprobs = torch.log_softmax(first_logits.float(), dim=-1)[0, answer_ids].tolist()
-    pred = int(max(range(len(answer_ids)), key=lambda i: logprobs[i]))
+    # Reasoning-image is 2-way MCQ; retrieval-image is 4-way. Slice answer_ids
+    # to the per-item choice count so the argmax doesn't wander into invalid options.
+    n_ch = int(getattr(item, "num_choices", 0)) or len(answer_ids)
+    ans_ids_used = answer_ids[:n_ch]
+    logprobs = torch.log_softmax(first_logits.float(), dim=-1)[0, ans_ids_used].tolist()
+    pred = int(max(range(len(ans_ids_used)), key=lambda i: logprobs[i]))
 
     row: dict = {
         "condition": cond.name,
@@ -1213,8 +1217,9 @@ def main():
     ap.add_argument("--exp-t-mini-counting", action="store_true",
                     help="Exp T-mini Phase 3: C0..C12 page-aware K formats on "
                          "counting-image (multi-token generation + list-output parsing).")
-    ap.add_argument("--max-new-tokens-counting", type=int, default=96,
-                    help="max_new_tokens for counting-image generation (default 96).")
+    ap.add_argument("--max-new-tokens-counting", type=int, default=160,
+                    help="max_new_tokens for counting-image generation (default 160 to "
+                         "comfortably fit up to ~34-entry lists for num_images=35 items).")
     ap.add_argument("--no-resume", action="store_true",
                     help="Re-run items already in the JSONL.")
     ap.add_argument("--split-path", type=Path, default=None,
