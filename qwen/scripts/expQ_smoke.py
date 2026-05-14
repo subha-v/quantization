@@ -214,6 +214,11 @@ def main():
     ap.add_argument("--exp-r", action="store_true",
                     help="Exp R mode: append C3b/C4/C6/C7 AllVisual conditions "
                          "and run J/K/L/M/N/O assertions.")
+    ap.add_argument("--exp-t", action="store_true",
+                    help="Exp T mode: append S3/S4/S5 sidecode-ladder conditions "
+                         "and run P/Q/R/U assertions (logits-differ across "
+                         "INT7/INT8/INT6, bit-math extended, cold-V K-only, "
+                         "BF16 dense V correctly reported).")
     args = ap.parse_args()
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
@@ -277,6 +282,15 @@ def main():
             if c.name in ("C3b", "C4", "C6", "C7"):
                 primary.append(c)
         log("[exp-r] appended C3b/C4/C6/C7 to smoke pool")
+
+    # Exp T: append the S3 (INT8) / S4 (INT7) / S5 (INT6) ladder conditions so
+    # the logits-differ assertions have real data.
+    if args.exp_t:
+        from expQ_driver import s_conditions_sidecode_ladder
+        for c in s_conditions_sidecode_ladder():
+            if c.name in ("S3", "S4", "S5"):
+                primary.append(c)
+        log("[exp-t] appended S3 (INT8) / S4 (INT7) / S5 (INT6) to smoke pool")
 
     cond_to_kcfg = {c.name: resolve_k_cfg(c.k_cfg_name, calib) if c.k_cfg_name else None
                     for c in primary}
@@ -581,6 +595,68 @@ def main():
     check("O.fp8_not_memory_saving",
           PAGE_K_BITS["FP8"] > PAGE_K_BITS["F4"],
           f"FP8={PAGE_K_BITS['FP8']} F4={PAGE_K_BITS['F4']}")
+
+    # ===========================================================
+    # Exp T assertions (P/Q/R/U) — run only with --exp-t
+    # ===========================================================
+    if args.exp_t:
+        # P. Logits differ across INT8/INT7/INT6 on real rollouts.
+        log("\n## P. Sidecode logits differ across INT8/INT7/INT6")
+        for it in smoke_items:
+            s3 = by_cond.get("S3", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+            s4 = by_cond.get("S4", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+            s5 = by_cond.get("S5", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+            q1 = by_cond.get("Q1", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+            d_s4_s3 = _l2(s4, s3)
+            d_s5_s4 = _l2(s5, s4)
+            d_s3_q1 = _l2(s3, q1)
+            check(f"P.s4_vs_s3_int7_int8 item={it.id}", d_s4_s3 > 1e-4,
+                  f"||S4(INT7) - S3(INT8)||_2 = {d_s4_s3:.6e}")
+            check(f"P.s5_vs_s4_int6_int7 item={it.id}", d_s5_s4 > 1e-4,
+                  f"||S5(INT6) - S4(INT7)||_2 = {d_s5_s4:.6e}")
+            check(f"P.s3_vs_f4 item={it.id}", d_s3_q1 > 1e-3,
+                  f"||S3(INT8) - Q1(F4)||_2 = {d_s3_q1:.6e}")
+
+        # Q. Effective KV-bits per token match the analytical ladder.
+        #   SJ/S3 (top-16 INT8):  K=(8·16+4·112)/128 = 4.500 → KV 4.250
+        #   S4    (top-16 INT7):  K=(7·16+4·112)/128 = 4.375 → KV 4.1875
+        #   S5    (top-16 INT6):  K=(6·16+4·112)/128 = 4.250 → KV 4.125
+        log("\n## Q. Effective-bit math for sidecode ladder")
+        for it in smoke_items:
+            for cond, expected_k in (("S3", 4.500), ("S4", 4.375), ("S5", 4.250)):
+                r = by_cond.get(cond, {}).get(it.id, {})
+                k_bits = r.get("effective_k_bits")
+                kv_bits = r.get("effective_kv_bits")
+                expected_kv = (expected_k + 4.0) / 2.0
+                check(f"Q.bits_{cond}_k item={it.id}",
+                      k_bits is not None and abs(k_bits - expected_k) < 1e-3,
+                      f"k_bits={k_bits} (expected {expected_k})")
+                check(f"Q.bits_{cond}_kv item={it.id}",
+                      kv_bits is not None and abs(kv_bits - expected_kv) < 1e-3,
+                      f"kv_bits={kv_bits} (expected {expected_kv})")
+
+        # R. Sidecode is K-only — every dense sidecode condition reports V=4.
+        log("\n## R. Sidecode is K-only — V unaffected (effective_v_bits = 4)")
+        for cond_name in ("S3", "S4", "S5"):
+            for it in smoke_items:
+                r = by_cond.get(cond_name, {}).get(it.id, {})
+                v_bits = r.get("effective_v_bits")
+                check(f"R.v_unchanged_{cond_name} item={it.id}",
+                      v_bits is not None and abs(v_bits - 4.0) < 1e-6,
+                      f"v_bits={v_bits} (expected 4.0; sidecode must not touch V)")
+
+        # U. BF16 dense V correctly reported as 16, not 4 (the V_BITS regression).
+        log("\n## U. BF16 dense V is 16 bits (V_BITS bug regression check)")
+        for it in smoke_items:
+            q0 = by_cond.get("Q0", {}).get(it.id, {})
+            v_bits = q0.get("effective_v_bits")
+            kv_bits = q0.get("effective_kv_bits")
+            check(f"U.bf16_v_16 item={it.id}",
+                  v_bits is not None and abs(v_bits - 16.0) < 1e-6,
+                  f"Q0 BF16 v_bits={v_bits} (expected 16.0)")
+            check(f"U.bf16_kv_16 item={it.id}",
+                  kv_bits is not None and abs(kv_bits - 16.0) < 1e-6,
+                  f"Q0 BF16 kv_bits={kv_bits} (expected 16.0 = (16+16)/2)")
 
     log(f"\n## SUMMARY")
     log(f"PASS: {n_pass}")
