@@ -521,6 +521,35 @@ CUDA_VISIBLE_DEVICES=<idx> bash qwen/scripts/run_expQ_overnight.sh
 
 Plan: `/Users/subha/.claude/plans/read-through-qwen-and-golden-nebula.md`.
 
+## Qwen2.5-VL × MM-NIAH — Experiment T-mini: VLM page-aware KV formats (2026-05-14, COMPLETE)
+
+Tests the paper-worthy VLM-specific hypothesis (beyond Exp R/S's sidecode-width family): do multimodal **page boundaries** matter for K quantization? Two mechanisms — **PageLocal-F4** (one K scale per image / choice / text page) and **PageSentinel** (first N visual tokens of each image page kept at original BF16). 18 conditions T0–T16 + T5b on retrieval-image (n=84) and reasoning-image (n=47); 13 conditions C0–C12 on counting-image (n=64, multi-token generation). 5 new K-quantizer kinds in `k_quantizers.py`, full counting-image task path in `mm_niah_loader.py` + `counting_parser.py`, runtime audit script with real Qwen processor.
+
+**Headline (retrieval-image, n=84):** T8 PageLocal-F4 = 0.369 wins the page-aware family by +9.5 pp over Global-F4 and +4.7 pp over TokenBlock16. BUT paired McNemar T8 vs F4 net=+8, χ²=1.88 (not sig). F9 strictly dominates (T8 vs T2 F9: net=−15, χ²=5.49, p<0.05). Sentinel mechanism falsified: PageSentinel-4 ties RandomSentinel-4 EXACTLY (net=0). T16 combined PageLocal+Sentinel is worse than T8 alone. **Deployable Pareto winners remain Exp S's S4 (top-16 INT7, 4.1875 KV bits) and Exp R's SJ (top-16 INT8, 4.25 KV bits).**
+
+**Counting-image (n=64):** Two distinct failures — (1) BF16 itself emits broken-format outputs (nested lists, dicts), so exact_match=0 across all conditions; (2) multi-token generation under any non-outlier-protected K format completely destroys the model (`valid_format` drops from 78–81% with F9/SJ/S4 sidecode to 0% with F4 / PageLocal / sentinels). Counting-image needs prompt rewrite + page-aware-on-F9 composition to be testable as designed.
+
+### Files of record (Exp T-mini)
+
+| File | Role |
+|---|---|
+| `qwen/scripts/k_quantizers.py` | +6 new K kinds (PageLocal, RandomPageLocal, ImageOnly/TextOnly, Sentinel, TrueTextVisualSplit) |
+| `qwen/scripts/mm_niah_loader.py` | counting-image task, binary MCQ for reasoning-image, JSON-string answer parsing |
+| `qwen/scripts/counting_parser.py` | list-output parser + soft-accuracy scorer |
+| `qwen/scripts/expQ_driver.py` | T/C condition lists, multi-token gen path, sentinel bit accounting |
+| `qwen/scripts/expP_calibrate.py` | `--task` flag for reasoning/counting cal NPZ |
+| `qwen/scripts/expT_mini_smoke.py` | 14 CPU smoke checks |
+| `qwen/scripts/expT_mini_runtime_audit.py` | live audit with real Qwen processor (no GPU) |
+| `qwen/scripts/expT_mini_analyze.py` | bucketed analyzer + paired McNemar |
+| `qwen/scripts/run_expT_mini_overnight.sh` | Phase 0 → 4 launcher |
+| `qwen/results/expT_mini_summary_*.md` | bucketed headlines + paired McNemar for each slice |
+| `qwen/calibration/expP_mmniah_kcalib_*_reasoning-image_seed0.{json,npz}` | NEW |
+| `qwen/calibration/expP_mmniah_kcalib_*_counting-image_seed0.{json,npz}` | NEW |
+
+**Wall:** 4h57m main run + 3min T5b backfill = 5h00m end-to-end on shared GPU 0 with wsjang's cogvideo job. Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment T-mini".
+
+Plan: `/Users/subha/.claude/plans/read-through-qwen-and-velvet-ritchie.md`.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment G: Frame-scaling under fixed KV memory budget (staged 2026-05-09)
 
 After Exp F (KIVI per-channel-along-seq) closed 94.4% of the KV-quantization collapse at TRUE 4.00 KV bits, the open research question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget*. The theoretical math at fixed `max_pixels=360×420`:
