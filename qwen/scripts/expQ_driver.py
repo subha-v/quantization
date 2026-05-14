@@ -236,6 +236,9 @@ def t_conditions_main() -> list[CondSpec]:
         CondSpec("T3",  "J12_F9_INT8side",                 RoutePolicy("none"), True),
         CondSpec("T4",  "SL_Outlier16_INT7side",           RoutePolicy("none"), True),
         CondSpec("T5",  "F5_KIVI_TextVisualSplit",         RoutePolicy("none"), True),
+        # T5b: correct coarse modality-split (uses ALL text/visual positions,
+        # not the FIRST visual page span). Proper paired-control for T8.
+        CondSpec("T5b", "T5b_TrueTextVisualSplit_F4",      RoutePolicy("none"), True),
         CondSpec("T6",  "T6_TokenBlock16_F4",              RoutePolicy("none"), True),
         CondSpec("T7",  "T7_RandomPageLocal_F4",           RoutePolicy("none"), True),
         CondSpec("T8",  "T8_PageLocal_F4",                 RoutePolicy("none"), True),
@@ -471,6 +474,8 @@ _STATIC_K_BITS = {
     # F5 TextVisualLocal-F4 is also a true 4.00 K-bits format (text/visual
     # scales add only metadata overhead).
     "F5_KIVI_TextVisualSplit": 4.0,
+    # T5b TrueTextVisualSplit-F4 — same per-channel cost, two pooled scales.
+    "T5b_TrueTextVisualSplit_F4": 4.0,
     # T-mini: page-aware K formats. All page-local kinds keep TRUE 4.00 K-bits;
     # scale metadata is negligible vs cache size.
     "T6_TokenBlock16_F4":     4.0,

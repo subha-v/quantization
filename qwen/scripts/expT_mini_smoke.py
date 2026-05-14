@@ -155,6 +155,27 @@ def check_image_only_local(slice_info: dict) -> SmokeResult:
                        f"L2 diff = {diff:.4f}")
 
 
+def check_true_text_visual_split(slice_info: dict) -> SmokeResult:
+    """T5b TrueTextVisualSplit-F4 must differ from BOTH F5 (first-page-only)
+    AND PageLocal (per-page). Confirms it's a distinct condition.
+    """
+    K = _make_synthetic_K()
+    cfg_f5 = KQuantizerConfig(name="f5", kind="kivi_text_visual_split", bits=4)
+    cfg_t5b = KQuantizerConfig(name="t5b", kind="kivi_true_text_visual_split", bits=4)
+    cfg_pl = KQuantizerConfig(name="t8", kind="kivi_page_local", bits=4)
+    K_f5 = apply_k_quantizer(K, cfg_f5, layer_idx=0, slice_info=slice_info, cache_offset=0)
+    K_t5b = apply_k_quantizer(K, cfg_t5b, layer_idx=0, slice_info=slice_info, cache_offset=0)
+    K_pl = apply_k_quantizer(K, cfg_pl, layer_idx=0, slice_info=slice_info, cache_offset=0)
+    finite = not torch.isnan(K_t5b).any() and not torch.isinf(K_t5b).any()
+    diff_f5 = _l2(K_t5b, K_f5)
+    diff_pl = _l2(K_t5b, K_pl)
+    return SmokeResult(
+        "T5b TrueTextVisualSplit differs from both F5 and PageLocal",
+        bool(finite) and diff_f5 > 1e-3 and diff_pl > 1e-3,
+        f"L2(t5b,f5)={diff_f5:.4f} L2(t5b,pagelocal)={diff_pl:.4f} finite={bool(finite)}"
+    )
+
+
 def check_text_only_local(slice_info: dict) -> SmokeResult:
     """TextOnlyLocal-F4 must differ from PageLocal-F4 (visual uses one pooled scale)."""
     K = _make_synthetic_K()
@@ -349,6 +370,7 @@ def run_all_cpu_smoke() -> list[SmokeResult]:
         check_pagelocal_token_block_coexist(si),
         check_random_page_local_seed_determinism(si),
         check_image_only_local(si),
+        check_true_text_visual_split(si),
         check_text_only_local(si),
         check_page_sentinel_exact_protection(si),
         check_random_sentinel_count(si),

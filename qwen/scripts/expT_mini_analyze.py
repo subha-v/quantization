@@ -168,7 +168,8 @@ def pair_definitions(task: str) -> list[tuple[str, str, str]]:
         ("PageLocal vs F4",                    "T8", "T1"),
         ("PageLocal vs TokenBlock",            "T8", "T6"),
         ("PageLocal vs RandomPageLocal",       "T8", "T7"),
-        ("PageLocal vs TextVisualLocal",       "T8", "T5"),
+        ("PageLocal vs TextVisualLocal (F5)",  "T8", "T5"),
+        ("PageLocal vs TrueTextVisualSplit",   "T8", "T5b"),  # load-bearing modality-split control
         ("ImageOnlyLocal vs TextOnlyLocal",    "T9", "T10"),
         ("Combined (T16) vs PageLocal (T8)",   "T16", "T8"),
         ("PageSentinel-4 vs RandomSentinel-4", "T12", "T13"),

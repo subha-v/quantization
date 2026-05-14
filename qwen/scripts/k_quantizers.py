@@ -103,6 +103,12 @@ KQUANTIZER_KINDS = (
     # PageSentinel composite: base kind (F4 or PageLocal-F4) + sentinel positions kept at
     # original BF16 (keep-from-original, like F9 outlier sidecode but on POSITIONS).
     "kivi_page_sentinel",
+    # T5b TrueTextVisualSplit-F4: pool ALL text positions with one per-channel K scale
+    # and ALL visual positions with one per-channel K scale. Unlike F5 (kivi_text_visual_split)
+    # which uses v_start/v_end (the FIRST visual page span only), this kind reads
+    # slice_info["text_positions"] and slice_info["visual_positions"] directly — the
+    # correct coarse modality-split control on multi-image MM-NIAH.
+    "kivi_true_text_visual_split",
 )
 
 
@@ -350,6 +356,10 @@ def apply_k_quantizer(K: torch.Tensor, cfg: KQuantizerConfig,
     if kind == "kivi_page_sentinel":
         # T11-T16: base K format + sentinel positions restored to original BF16.
         return _kivi_page_sentinel(K, cfg, layer_idx, slice_info, cache_offset, qmax)
+
+    if kind == "kivi_true_text_visual_split":
+        # T5b: correct coarse modality-split using all text/visual positions.
+        return _kivi_true_text_visual_split(K, cfg, slice_info, cache_offset, qmax)
 
     raise ValueError(f"apply_k_quantizer: unhandled kind={kind!r}")
 
@@ -788,6 +798,56 @@ def _kivi_page_sentinel(K: torch.Tensor, cfg: KQuantizerConfig,
         return K_q
     idx = torch.tensor(sentinel_local, dtype=torch.long, device=K.device)
     K_q.index_copy_(dim=-2, index=idx, source=K.index_select(dim=-2, index=idx))
+    return K_q
+
+
+def _kivi_true_text_visual_split(K: torch.Tensor, cfg: KQuantizerConfig,
+                                 slice_info: Optional[dict], cache_offset: int,
+                                 qmax: float) -> torch.Tensor:
+    """T5b: per-channel K scale pooled over ALL text positions and ALL visual
+    positions separately.
+
+    Unlike F5 (kivi_text_visual_split) which uses v_start/v_end of the FIRST
+    visual page only, T5b reads slice_info["text_positions"] and
+    slice_info["visual_positions"] (absolute coordinates) and pools every
+    visual token across every image page into ONE per-channel scale, and
+    every text token into ONE per-channel scale. The correct coarse
+    modality-split control on multi-image MM-NIAH.
+
+    Decode-time fallback (cache_offset > 0): plain F4 per-channel-seq on
+    the small new chunk.
+    """
+    B, H, T, D = K.shape
+    if T == 0:
+        return K
+    if slice_info is None or cache_offset > 0:
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+
+    text_abs = slice_info.get("text_positions") or []
+    visual_abs = slice_info.get("visual_positions") or []
+    abs_lo = cache_offset
+    abs_hi = cache_offset + T
+    text_local = [p - abs_lo for p in text_abs if abs_lo <= p < abs_hi]
+    visual_local = [p - abs_lo for p in visual_abs if abs_lo <= p < abs_hi]
+
+    if not text_local and not visual_local:
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+
+    K_q = K.clone()
+    if text_local:
+        idx = torch.tensor(text_local, dtype=torch.long, device=K.device)
+        K_text = K.index_select(dim=-2, index=idx)
+        scale = _per_channel_seq_scale(K_text, qmax, percentile=None)
+        K_text_q = _quantize_with_scale(K_text, scale, qmax)
+        K_q.index_copy_(dim=-2, index=idx, source=K_text_q)
+    if visual_local:
+        idx = torch.tensor(visual_local, dtype=torch.long, device=K.device)
+        K_vis = K.index_select(dim=-2, index=idx)
+        scale = _per_channel_seq_scale(K_vis, qmax, percentile=None)
+        K_vis_q = _quantize_with_scale(K_vis, scale, qmax)
+        K_q.index_copy_(dim=-2, index=idx, source=K_vis_q)
     return K_q
 
 
@@ -1407,7 +1467,13 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         # All variants stay at TRUE ≈4.00 KV bits — scale metadata and
         # tiny sentinel restoration overhead are negligible vs cache.
         # ============================================================
-        # T5: TextVisualLocal-F4 — already covered by F5_KIVI_TextVisualSplit.
+        # T5: TextVisualLocal-F4 — covered by F5_KIVI_TextVisualSplit (legacy,
+        # uses v_start/v_end of FIRST visual page only).
+        # T5b: TrueTextVisualSplit-F4 — correct coarse modality-split using ALL
+        # text positions and ALL visual positions. The proper paired-control
+        # baseline for T8 PageLocal-F4 on multi-image MM-NIAH.
+        KQuantizerConfig(name="T5b_TrueTextVisualSplit_F4",
+                         kind="kivi_true_text_visual_split", bits=4),
         # T6: TokenBlockLocal-F4 — token-block control with 16 equal segments.
         KQuantizerConfig(name="T6_TokenBlock16_F4", kind="kivi_temporal_window",
                          bits=4, n_temporal_windows=16, temporal_mode="token_block"),
