@@ -191,6 +191,9 @@ def slice_cond_order(slice_tag: str) -> list[str]:
             "C7", "C8",
             "S4", "S8", "S12", "SJ",
         ]
+    if slice_tag == "S":
+        # Exp S Phase 1 sidecode ladder.
+        return ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]
     return []
 
 
@@ -318,8 +321,34 @@ def write_summary(rows: list[dict], out_md: Path, slice_tag: str) -> None:
 
 # ---------------- paired McNemar ----------------
 
+def pairs_slice_s() -> list[tuple[str, str, str]]:
+    """Exp S Phase 1 sidecode bit-ladder load-bearing pairs.
+
+    S2 = F9 dense (4.75 KV bits anchor); S3 = SJ = J12 INT8 sidecode (4.25);
+    S4 = top-16 INT7 (4.1875); S5 = top-16 INT6 (4.125); S6 = top-16 INT5 (4.0625);
+    S7 = top-24 INT6 (4.1875); S8 = top-32 INT6 (4.250); S9 = TextOnly-SJ.
+    """
+    return [
+        ("S3", "S2", "SJ INT8 sidecode vs F9 dense — PARETO TIE TEST (Exp R replication)"),
+        ("S3", "S0", "SJ vs BF16 ceiling — headroom"),
+        ("S4", "S3", "INT7 sidecode vs INT8 (one step lower precision)"),
+        ("S5", "S3", "INT6 sidecode vs INT8 (two steps; -0.125 KV bits)"),
+        ("S5", "S4", "INT6 vs INT7 sidecode (one step lower)"),
+        ("S6", "S5", "INT5 vs INT6 sidecode — does precision collapse?"),
+        ("S6", "S2", "INT5 sidecode (lowest ladder point) vs F9 dense"),
+        ("S5", "S2", "INT6 sidecode vs F9 dense — the Pareto candidate"),
+        ("S7", "S4", "top-24 INT6 vs top-16 INT7 — SAME bits, WIDER channels"),
+        ("S8", "S3", "top-32 INT6 vs top-16 INT8 — SAME bits, WIDER channels"),
+        ("S9", "S2", "TextOnly-SJ vs F9 dense — visual=F4 + text=SJ"),
+        ("S9", "S3", "TextOnly-SJ vs SJ dense — does visual-F4 hurt vs all-SJ?"),
+        ("S2", "S0", "F9 vs BF16 anchor (sanity)"),
+        ("S1", "S0", "F4 vs BF16 anchor (sanity)"),
+    ]
+
+
 def pairs_slice_c() -> list[tuple[str, str, str]]:
-    """Exp R Sub-experiment C load-bearing paired-McNemar tests."""
+    """Exp R Sub-experiment C load-bearing paired-McNemar tests.
+    Includes Exp S Phase 0 SJ-anchored pairs (added 2026-05-13)."""
     return [
         ("C4", "C2", "AllVisual-Quest vs F9 dense — PARETO TIE TEST"),
         ("C4", "C3", "AllVisual-Quest vs TextOnly — does visual routing matter?"),
@@ -332,6 +361,12 @@ def pairs_slice_c() -> list[tuple[str, str, str]]:
         ("C4", "S8", "AllVisual-Quest vs static F8 (matched budget)"),
         ("C4", "S4", "AllVisual-Quest vs static S4 (4.19 KV bits)"),
         ("C4", "SJ", "AllVisual-Quest vs J12 (F9 INT8 sidecode)"),
+        # Exp S Phase 0 — SJ-anchored sidecode-format tests on existing Exp R data
+        ("SJ", "C2", "Exp S Phase 0: SJ (J12 INT8 sidecode) vs F9 dense — IS INT8 SIDECODE A REAL WIN?"),
+        ("SJ", "C0", "Exp S Phase 0: SJ vs BF16 ceiling — how much accuracy is left on the table?"),
+        ("SJ", "C3", "Exp S Phase 0: SJ vs C3 TextOnly — competing static recipes"),
+        ("SJ", "S12", "Exp S Phase 0: SJ INT8 sidecode vs static top-12 BF16 — same bit budget, different format"),
+        ("C3", "C2", "Exp S Phase 0: TextOnly vs F9 dense — is text-only F9 protection enough?"),
     ]
 
 
@@ -376,6 +411,8 @@ def write_paired(rows: list[dict], out_md: Path, slice_tag: str) -> None:
         pairs = pairs_slice_b()
     elif slice_tag == "C":
         pairs = pairs_slice_c()
+    elif slice_tag == "S":
+        pairs = pairs_slice_s()
     else:
         pairs = []
     lines = [f"# Exp Q/R paired McNemar slice {slice_tag} — "
@@ -648,9 +685,10 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slice", choices=("A", "B", "C"), default="A",
+    ap.add_argument("--slice", choices=("A", "B", "C", "S"), default="A",
                     help="A=Slice A retrieval-image (Exp Q), B=Slice B reasoning-image (Exp Q), "
-                         "C=Exp R Sub-experiment C (AllVisual + static baselines).")
+                         "C=Exp R Sub-experiment C (AllVisual + static baselines), "
+                         "S=Exp S Phase 1 sidecode bit-ladder (S0..S9).")
     ap.add_argument("--in-jsonl", type=Path, default=None,
                     help="Default: results/expQ_rollouts_slice{A|B}.jsonl")
     ap.add_argument("--out-summary", type=Path, default=None)

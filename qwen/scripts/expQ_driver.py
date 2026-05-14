@@ -204,6 +204,46 @@ def s_conditions_static_baselines() -> list[CondSpec]:
     ]
 
 
+def s_conditions_sidecode_ladder() -> list[CondSpec]:
+    """Exp S Phase 1 — sidecode bit-ladder on the same multi-image slice.
+
+    All conditions are dense (no FormatBook routing). They sweep the
+    protected-channel count and sidecode storage width while keeping the
+    INT4 base. The user-defined ladder, in order of increasing aggressiveness:
+
+      S0  BF16 dense                                  16.000 KV bits
+      S1  F4 dense                                     4.000 KV bits
+      S2  F9 top-16 BF16 sidecode (anchor)             4.750 KV bits
+      S3  SJ top-16 INT8 sidecode (Exp R winner)       4.250 KV bits
+      S4  top-16 INT7 sidecode                         4.1875 KV bits
+      S5  top-16 INT6 sidecode                         4.125 KV bits
+      S6  top-16 INT5 sidecode                         4.0625 KV bits
+      S7  top-24 INT6 sidecode                         4.1875 KV bits  (= S4 budget)
+      S8  top-32 INT6 sidecode                         4.250  KV bits  (= S3 budget)
+      S9  TextOnly-SJ: text pages SJ, visual pages F4
+
+    The S4/S7 and S3/S8 pairs are matched-budget controls: at the same
+    KV-bit budget, do "fewer channels at higher precision" or "more channels
+    at lower precision" win?
+
+    S9 uses formatbook_role_only with include_choice_routing=True so ALL
+    visual pages (in-context + choice) get F4 cold, and text pages stay
+    at the cache's hot format (SJ = J12).
+    """
+    return [
+        CondSpec("S0", None,                       RoutePolicy("none"),                    False),
+        CondSpec("S1", F4,                         RoutePolicy("none"),                    False),
+        CondSpec("S2", "F9_KIVI_Outlier16",        RoutePolicy("none"),                    True),
+        CondSpec("S3", "J12_F9_INT8side",          RoutePolicy("none"),                    True),
+        CondSpec("S4", "SL_Outlier16_INT7side",    RoutePolicy("none"),                    True),
+        CondSpec("S5", "SL_Outlier16_INT6side",    RoutePolicy("none"),                    True),
+        CondSpec("S6", "SL_Outlier16_INT5side",    RoutePolicy("none"),                    True),
+        CondSpec("S7", "SL_Outlier24_INT6side",    RoutePolicy("none"),                    True),
+        CondSpec("S8", "SL_Outlier32_INT6side",    RoutePolicy("none"),                    True),
+        CondSpec("S9", "J12_F9_INT8side",          RoutePolicy("formatbook_role_only"),    True),
+    ]
+
+
 def e_conditions_cold_ladder(best_route_name: str,
                              budget_fraction: float = 0.25) -> list[CondSpec]:
     """Exp R Sub-experiment E — cold-format ladder on the best AllVisual policy.
@@ -277,12 +317,27 @@ def _page_format_dense(k_cfg_name: Optional[str]) -> str:
     return k_cfg_name
 
 
+def _k_bits_top_n_int_m(n: int, m: int) -> float:
+    """K-bits/token for top-N outlier channels stored at INT-M (or BF16 if m=16),
+    with the remaining (128-N) channels at INT4 base.
+        K-bits = (m·N + 4·(128 − N)) / 128
+    """
+    return (m * n + 4 * (128 - n)) / 128.0
+
+
 _STATIC_K_BITS = {
-    "S4_Outlier4_BF16side": S4_K_BITS,
-    "S8_Outlier8_BF16side": S8_K_BITS,
-    "F8_KIVI_Outlier8":     S8_K_BITS,   # alias used by S8 = F8
-    "S12_Outlier12_BF16side": S12_K_BITS,
-    "J12_F9_INT8side":       SJ_K_BITS,
+    "S4_Outlier4_BF16side":   _k_bits_top_n_int_m(4, 16),   # 4.375
+    "S8_Outlier8_BF16side":   _k_bits_top_n_int_m(8, 16),   # 4.750
+    "F8_KIVI_Outlier8":       _k_bits_top_n_int_m(8, 16),   # 4.750 (alias S8 = F8)
+    "S12_Outlier12_BF16side": _k_bits_top_n_int_m(12, 16),  # 5.125
+    # Exp R: J12 = F9 + INT8 sidecode
+    "J12_F9_INT8side":        _k_bits_top_n_int_m(16, 8),   # 4.500
+    # Exp S Phase 1 sidecode ladder
+    "SL_Outlier16_INT7side":  _k_bits_top_n_int_m(16, 7),   # 4.375
+    "SL_Outlier16_INT6side":  _k_bits_top_n_int_m(16, 6),   # 4.250
+    "SL_Outlier16_INT5side":  _k_bits_top_n_int_m(16, 5),   # 4.125
+    "SL_Outlier24_INT6side":  _k_bits_top_n_int_m(24, 6),   # 4.375
+    "SL_Outlier32_INT6side":  _k_bits_top_n_int_m(32, 6),   # 4.500
 }
 
 
@@ -791,6 +846,9 @@ def main():
                     help="Exp R: build_page_layout flags choice-image pages as "
                          "routable so AllVisual policies can route them. "
                          "Required for C and E conditions.")
+    # Exp S flags
+    ap.add_argument("--exp-s-ladder", action="store_true",
+                    help="Exp S Phase 1: sidecode bit-ladder S0..S9 (no AllVisual).")
     ap.add_argument("--no-resume", action="store_true",
                     help="Re-run items already in the JSONL.")
     ap.add_argument("--split-path", type=Path, default=None,
@@ -856,13 +914,27 @@ def main():
     if args.calib_npz.exists():
         arr = np.load(args.calib_npz)
         calib = {k: arr[k] for k in arr.files}
+        # Exp S Phase 1: derive outlier_channel_idx_top32 from k_channel_energy
+        # if the NPZ only has top-16. Lets S7 (top-24) and S8 (top-32) use the
+        # existing NPZ without recalibration. _outlier_channel_indices also
+        # falls back to energy argsort, but precomputing here is cheap and
+        # makes the path explicit.
+        if "k_channel_energy" in calib:
+            energy = np.asarray(calib["k_channel_energy"])  # [L, H_kv, D]
+            top32 = np.argsort(energy, axis=-1)[..., -32:][..., ::-1].copy().astype(np.int32)
+            calib["outlier_channel_idx_top32"] = top32
+            print(f"  derived outlier_channel_idx_top32 from k_channel_energy "
+                  f"(shape {top32.shape})", flush=True)
         print(f"loaded calibration {args.calib_npz} ({len(calib)} keys)", flush=True)
     else:
         print(f"[warn] calib NPZ not found at {args.calib_npz} — F9 conditions will fail",
               flush=True)
 
     # Build conditions
-    if args.exp_r_c:
+    if args.exp_s_ladder:
+        # Exp S Phase 1: sidecode bit-ladder S0..S9.
+        primary = s_conditions_sidecode_ladder()
+    elif args.exp_r_c:
         # Exp R Sub-exp C: AllVisual + static matched-budget baselines.
         primary = c_conditions_allvisual() + s_conditions_static_baselines()
     elif args.exp_r_e_best_route:

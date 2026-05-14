@@ -523,13 +523,12 @@ def _outlier_channel_indices(cfg: KQuantizerConfig, layer_idx: int,
     key = cfg.outlier_idx_key or "outlier_channel_idx_top16"
     if key in cfg.calib:
         idx = cfg.calib[key]  # numpy [L, H_kv, K]
-        if idx.shape[-1] < n:
-            raise RuntimeError(
-                f"{cfg.name}: cfg.calib[{key!r}].shape[-1]={idx.shape[-1]} < n={n}; "
-                f"recalibrate with at least n protected channels per (L, H_kv)."
-            )
-        return torch.as_tensor(idx[layer_idx, :, :n], dtype=torch.long)
-    if cfg.outlier_idx_key is not None:
+        if idx.shape[-1] >= n:
+            return torch.as_tensor(idx[layer_idx, :, :n], dtype=torch.long)
+        # Stored key has fewer channels than requested — fall through to
+        # k_channel_energy argsort. Exp S Phase 1 needs top-24 / top-32 with
+        # only top-16 precomputed.
+    elif cfg.outlier_idx_key is not None:
         # User explicitly asked for a key that's missing — fail loudly rather
         # than silently falling back to the generic top-16.
         raise RuntimeError(
@@ -538,7 +537,10 @@ def _outlier_channel_indices(cfg: KQuantizerConfig, layer_idx: int,
         )
     energy = cfg.calib.get("k_channel_energy")
     if energy is None:
-        raise RuntimeError(f"{cfg.name}: cfg.calib missing 'k_channel_energy'.")
+        raise RuntimeError(
+            f"{cfg.name}: cfg.calib missing 'k_channel_energy' (needed for n={n} "
+            f"channels when precomputed key has fewer)."
+        )
     e = torch.as_tensor(energy[layer_idx])  # [H_kv, D]
     return torch.argsort(e, dim=-1, descending=True)[:, :n]
 
@@ -1078,4 +1080,31 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         #      K-bits = (16·12 + 116·4)/128 = 5.125 → KV avg 4.5625
         KQuantizerConfig(name="S12_Outlier12_BF16side", kind="kivi_outlier16", bits=4,
                          n_outliers=12, calib=calib, outlier_storage_bits=16),
+        # ============================================================
+        # Exp S: sidecode bit-ladder. Same protected-channel identities as
+        # F9 (top-16 by k_channel_energy) but with INT-N sidecode instead
+        # of BF16. Tests whether F9's BF16 sidecode is overkill.
+        # ============================================================
+        # SL_INT7: top-16 outliers at INT7 sidecode.
+        #          K-bits = (7·16 + 4·112)/128 = 4.375 → KV avg 4.1875
+        KQuantizerConfig(name="SL_Outlier16_INT7side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib, outlier_storage_bits=7),
+        # SL_INT6: top-16 outliers at INT6 sidecode (alias of existing J13).
+        #          K-bits = (6·16 + 4·112)/128 = 4.250 → KV avg 4.125
+        KQuantizerConfig(name="SL_Outlier16_INT6side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib, outlier_storage_bits=6),
+        # SL_INT5: top-16 outliers at INT5 sidecode (aggressive).
+        #          K-bits = (5·16 + 4·112)/128 = 4.125 → KV avg 4.0625
+        KQuantizerConfig(name="SL_Outlier16_INT5side", kind="kivi_outlier16", bits=4,
+                         n_outliers=16, calib=calib, outlier_storage_bits=5),
+        # SL_top24_INT6: top-24 outliers at INT6 sidecode.
+        #                K-bits = (6·24 + 4·104)/128 = 4.375 → KV avg 4.1875
+        # (same bit budget as SL_INT7, different "width × depth" tradeoff)
+        KQuantizerConfig(name="SL_Outlier24_INT6side", kind="kivi_outlier16", bits=4,
+                         n_outliers=24, calib=calib, outlier_storage_bits=6),
+        # SL_top32_INT6: top-32 outliers at INT6 sidecode.
+        #                K-bits = (6·32 + 4·96)/128 = 4.500 → KV avg 4.250
+        # (same bit budget as SJ = J12 INT8 top-16; tests "wider lower-precision")
+        KQuantizerConfig(name="SL_Outlier32_INT6side", kind="kivi_outlier16", bits=4,
+                         n_outliers=32, calib=calib, outlier_storage_bits=6),
     ]
