@@ -3163,3 +3163,269 @@ qwen-expS — COMPLETE 2026-05-14
 
 Total Exp S wall: **56 min** (launch 05:34:19 → DONE 06:30:33 local). Total compute: 840 main rows + 9 conditions × 3 smoke items = 867 forward passes. No new calibration items (existing Exp P MM-NIAH NPZ reused; top-32 outlier indices derived in-driver from `k_channel_energy`).
 
+## Experiment T — Seed=1 replication of S4 INT7 sidecode (2026-05-14) — IN PROGRESS (partial)
+
+**Status:** Phase 0 complete (smoke 136 PASS / 0 FAIL; seed=1 split + seed=1 F9 calibration). Phase 1 main run launched 07:06:41 local; **3 of 6 conditions done at 07:29** (T0/T1/T2 anchors complete; T3 SJ in-flight at 20/82; T4 INT7 and T5 INT6 pending). This section will be updated when the run completes (~07:43 local).
+
+Driven by the Exp S finding that S4 (top-16 INT7 sidecode, 4.1875 KV bits, acc=0.571) paired-tied with S3 SJ (top-16 INT8) and decisively beat matched-budget wider-lower-precision controls. Exp T is the **non-negotiable seed=1 replication** that the project's prior history (Exp J seed=2 → Exp K seed=1 J7 retraction) shows is required before any "deployable" claim.
+
+Conditions: T0 BF16 / T1 F4 / T2 F9 BF16-sidecode / T3 SJ top-16 INT8 / **T4 top-16 INT7 (load-bearing)** / T5 top-16 INT6 (cliff control). Pool: MM-NIAH retrieval-image multi-image filter (`num_images ≥ 8`), seed=1 stratified split, n=82 items at 336° equal-resolution. Fresh F9 calibration on the seed=1 cal-100 split via `expP_calibrate.py --seed 1`.
+
+### Phase 0 (smoke + seed=1 split + seed=1 cal) — complete
+
+```
+07:01:40 launch
+07:01:40 → 07:03:30  smoke n=3 short bucket (--exp-t): 136 PASS / 0 FAIL
+                     New T-assertions (P/Q/R/U):
+                       P. ||S4(INT7) - S3(INT8)|| > 1e-4 on every smoke item
+                          ||S5(INT6) - S4(INT7)|| > 1e-4 on every smoke item
+                          ||S3(INT8) - Q1(F4)|| > 1e-3 on every smoke item
+                       Q. effective_k_bits = 4.500/4.375/4.250 for S3/S4/S5 (exact)
+                       R. effective_v_bits = 4.0 for S3/S4/S5 (sidecode is K-only)
+                       U. BF16 dense V correctly 16.0, kv_bits=16.0 (V_BITS regression)
+07:03:30 → 07:03:30  seed=1 split (mid bucket has only 90 items; warned but accepted)
+07:03:30 → 07:06:41  seed=1 F9 calibration on cal-100 (3 min, 100/100 ok, 0 fails)
+                     -> calibration/expP_mmniah_kcalib_..._seed1.npz
+```
+
+### Phase 1 (T0..T5 on seed=1) — IN PROGRESS
+
+Partial results at 07:29 local (3 of 6 conditions complete):
+
+| Cond | Status | Acc | KV bits | vs Exp S (seed=0) |
+|---|---|---:|---:|---|
+| T0 = S0 BF16 | DONE | **0.537** | 16.00 | seed=0 = 0.607 → **−7 pp** (seed=1 is harder) |
+| T1 = S1 F4 dense | DONE | **0.280** | 4.00 | seed=0 = 0.274 → essentially identical (F4 collapse replicates) |
+| T2 = S2 F9 BF16-sidecode | DONE | **0.524** | 4.75 | seed=0 = 0.548 → **−2.4 pp** (in line) |
+| T3 = S3 SJ top-16 INT8 | in flight 20/82 | **0.450 partial** | 4.25 | seed=0 = 0.583 → partial −13 pp ⚠️ |
+| T4 = S4 top-16 INT7 | pending | — | 4.1875 | seed=0 = 0.571 |
+| T5 = S5 top-16 INT6 | pending | — | 4.125 | seed=0 = 0.286 (collapsed) |
+
+### Early reads (subject to final Phase 1 paired McNemar)
+
+1. **Seed=1 is harder.** T0 BF16 = 0.537 (seed=0 was 0.607). The F4 floor is unchanged at 0.28, so the rescue gap shrank from 0.33 pp (seed=0) to 0.26 pp (seed=1). Less headroom for any quantization rescue to demonstrate value.
+
+2. **F9 essentially at ceiling on seed=1.** T2 F9 = 0.524 vs T0 BF16 = 0.537 is only a 1.3 pp gap (seed=0 had a 5.9 pp gap). On the seed=1 multi-image slice, F9 is already at or near the BF16 ceiling — there is very little room for any sidecode-compressed variant to BEAT F9. The interesting comparison shifts from "does S4 INT7 BEAT F9?" to "does S4 INT7 PAIRED-TIE F9?"
+
+3. **T3 SJ partial at 0.450 is concerning but pre-final.** 20 items into the run, SJ trails F9 by 7 pp. This is the seed-collapse pattern the J7 retraction warned about. **However:** the running mean swings substantially before n=82 — Exp S/R showed swings of 5–10 pp during the first 30 items before settling. The final result could come in at any value between ~0.45 and ~0.58. We need the full 82 items + paired-McNemar before reframing the headline.
+
+4. **The paired-tie test is what matters, not absolute acc.** Even if T3 SJ comes in lower than T2 F9 in aggregate, the paired-McNemar (and the T4 vs T3 vs T2 set) is what tells us whether INT7 sidecode is a viable replicated method. The decision rule from the orchestrator: T4 paired-ties T3 AND T2 (χ² < 3.84) → S4 INT7 deploys; T5 paired-WORSE than T4 → cliff confirmed.
+
+### Pipeline status (Exp T, in-progress)
+
+```
+qwen-expT — IN PROGRESS
+├── ✅ Phase 0a smoke: 136 PASS / 0 FAIL (new P/Q/R/U assertions)
+├── ✅ Phase 0b seed=1 split (n=82 multi-image after filter)
+├── ✅ Phase 0c seed=1 F9 calibration (3 min, 100/100)
+├── ⏳ Phase 1 main run: T0/T1/T2 done; T3 in flight at 20/82; T4/T5 pending
+│       ETA ~07:43 local (~15 min remaining at time of writing)
+└── ⏸ Phase 1 analyze: pending Phase 1 completion
+```
+
+**This section will be replaced with the final results + paired McNemar tests + Pareto analysis once Phase 1 completes.**
+
+## Experiment T-mini — VLM page-aware KV formats on MM-NIAH (2026-05-14) — COMPLETE
+
+**Status: COMPLETE 2026-05-14. Total wall: 4h57m (07:59 launch → 12:56 done) + 3 min T5b backfill (13:30 done).**
+
+Tests a paper-worthy VLM-specific axis beyond the sidecode-width family that Exps Q/R/S/T exhausted: do multimodal **page boundaries** matter for K quantization? Hypothesis from the MM-NIAH paper failure-mode analysis:
+
+> Long multimodal KV caches need page-aware formats that preserve both local K-channel distributions and image/page identity.
+
+Two mechanisms:
+
+1. **PageLocal-F4** — one per-(layer, KV-head, channel) K scale per multimodal page (image page / choice page / text chunk), instead of one shared scale across the whole sequence.
+2. **PageSentinel** — keep the first N visual tokens of each image page at original BF16 (image-identity register).
+
+### Slices
+
+- **Phase 1 — retrieval-image** (anchor slice with Q/R/S baselines): seed=0, `--use-full-pool --min-num-images 8`, n=84, 336². Existing NPZ.
+- **Phase 2 — reasoning-image** (binary MCQ, ≠ 4-way; required `_normalize` fix): seed=0, `--use-full-pool --min-num-images 5 --n-items 84`, n=47 items after filter, 336². Fresh cal-100 NPZ generated (100/100, 0 fails).
+- **Phase 3 — counting-image** (multi-token generation + list-output parsing, `max_new_tokens=96`): seed=0, `--use-full-pool --min-num-images 5 --n-items 64`, n=64, 336². Fresh cal-100 NPZ.
+
+### Condition lists
+
+**T0–T16 + T5b** (Phases 1 & 2, identical conditions):
+
+| ID | Method | KV bits |
+|---|---|---|
+| T0 | BF16 dense | 16.00 |
+| T1 | Global-F4 (floor) | 4.00 |
+| T2 | F9 top-16 BF16 sidecode | 4.75 |
+| T3 | SJ top-16 INT8 sidecode | 4.25 |
+| T4 | S4 top-16 INT7 sidecode | 4.1875 |
+| T5 | F5 TextVisualSplit (legacy; uses first visual page only) | 4.00 |
+| T5b | **TrueTextVisualSplit-F4** (pools ALL text/visual positions) | 4.00 |
+| T6 | TokenBlock16-F4 (16 equal-token segments, modality-blind) | 4.00 |
+| T7 | RandomPageLocal-F4 (matched n_pages, shuffled boundaries) | 4.00 |
+| **T8** | **PageLocal-F4** (main hypothesis) | 4.00 |
+| T9 | ImageOnlyLocal-F4 | 4.00 |
+| T10 | TextOnlyLocal-F4 | 4.00 |
+| T11 | PageSentinel-1 (Global-F4 base) | 4.005 |
+| T12 | PageSentinel-4 (Global-F4 base) | 4.022 |
+| T13 | RandomSentinel-4 (Global-F4 base) | 4.022 |
+| T14 | LastSentinel-4 (Global-F4 base) | 4.022 |
+| T15 | TextSentinel-4 (Global-F4 base) | 4.023 |
+| T16 | PageLocal-F4 + PageSentinel-4 (combined) | 4.022 |
+
+**C0–C12** (Phase 3, counting-image): drops T5/T5b/T9/T10 (counting needs all images, no sparse/modality-restricted methods). 13 conditions.
+
+### Infrastructure built
+
+- 5 new K-quantizer kinds (`kivi_page_local`, `kivi_random_page_local`, `kivi_image_only_local`, `kivi_text_only_local`, `kivi_page_sentinel`) + `kivi_true_text_visual_split` for T5b.
+- `PageSentinel` composite: base kind (Global-F4 or PageLocal-F4) + sentinel positions kept at BF16 (keep-from-original, like F9 sidecode but on POSITIONS instead of CHANNELS).
+- `slice_info` extended with `page_boundaries`, `visual_token_positions_per_image`, `text_chunk_positions`, `item_id`.
+- `MMNiahItem.num_choices` (4/2/0 for retrieval/reasoning/counting); `_normalize` reasoning-image fix; counting-image `answer` JSON-string parsing; dynamic "Answer with A, B" instruction tail.
+- `format_counting_messages()` builder; `counting_parser.py` (list parse + soft-accuracy scorer); `score_item_counting()` multi-token generation path.
+- Sentinel-aware bit accounting per item; `_t_mini_sentinel_token_count()` helper.
+- 14 CPU smoke checks + 4-check live runtime audit (real Qwen processor, no GPU).
+- `expT_mini_analyze.py` bucketed analyzer + paired McNemar matrix.
+- `run_expT_mini_overnight.sh` orchestrating Phases 0–4.
+
+### Retrieval-image (Phase 1, n=84, anchor slice)
+
+| Cond | Acc | 95% CI | KV bits | Notes |
+|---|---:|---|---:|---|
+| T0 BF16 | **0.607** | [0.500, 0.705] | 16.00 | ceiling; matches Exp R C0=0.607 ✓ |
+| T1 Global-F4 | 0.274 | [0.190, 0.377] | 4.00 | floor; matches Exp R C1=0.274 ✓ |
+| T2 F9 | 0.548 | [0.441, 0.650] | 4.75 | matches Exp R/S baseline 0.548 ✓ |
+| T3 SJ INT8 | **0.583** | [0.477, 0.683] | 4.25 | matches Exp R SJ=0.583 ✓ |
+| T4 S4 INT7 | 0.571 | [0.465, 0.672] | 4.1875 | matches Exp S S4=0.571 ✓ |
+| T5 F5 legacy | 0.226 | [0.150, 0.326] | 4.00 | BROKEN — uses first visual page only |
+| T5b TrueTextVisualSplit | 0.274 | [0.190, 0.377] | 4.00 | ties Global-F4 |
+| T6 TokenBlock16 | 0.321 | [0.231, 0.427] | 4.00 | +4.7 pp over F4 |
+| T7 RandomPageLocal | 0.274 | [0.190, 0.377] | 4.00 | ties Global-F4 |
+| **T8 PageLocal-F4** | **0.369** | [0.274, 0.476] | 4.00 | **+9.5 pp over F4; best of T1–T16 page-aware family** |
+| T9 ImageOnlyLocal | 0.190 | [0.121, 0.287] | 4.00 | WORSE than floor — text pooling hurts |
+| T10 TextOnlyLocal | 0.310 | [0.221, 0.415] | 4.00 | text-side > image-side page locality |
+| T11 PageSentinel-1 | 0.298 | [0.210, 0.402] | 4.005 | minimal sentinel helps slightly |
+| T12 PageSentinel-4 | 0.262 | [0.180, 0.365] | 4.022 | worse than T11 — less is more |
+| T13 RandomSentinel-4 | 0.262 | [0.180, 0.365] | 4.022 | **ties T12 — positions don't matter** |
+| T14 LastSentinel-4 | 0.238 | [0.160, 0.339] | 4.022 | worst of sentinel family |
+| T15 TextSentinel-4 | 0.250 | [0.170, 0.352] | 4.023 | text-side sentinels comparable |
+| T16 PageLocal + PageSentinel-4 | 0.274 | [0.190, 0.377] | 4.022 | combined WORSE than T8 alone — sentinel hurts |
+
+**Paired McNemar (n=84):**
+
+| Comparison | net (A−B) | χ² | Verdict |
+|---|---:|---:|---|
+| **T8 PageLocal vs T1 Global-F4** | +8 | 1.882 | directional ↑, **not sig** (p≈0.17) |
+| **T8 PageLocal vs T6 TokenBlock16** | +4 | 0.400 | directional ↑, not sig |
+| **T8 PageLocal vs T7 RandomPageLocal** | +8 | 2.133 | directional ↑, not sig |
+| **T8 PageLocal vs T5b TrueTextVisualSplit** | +8 | 2.286 | directional ↑, not sig — coarse modality-split provides no benefit |
+| **T8 PageLocal vs T5 (legacy F5)** | +12 | 4.500 | sig at p<0.05 BUT vs a broken control |
+| **T16 Combined vs T8 PageLocal** | −8 | 2.462 | sentinel on top of PageLocal HURTS |
+| **T12 vs T13 (PageSentinel vs RandomSentinel)** | 0 | 0.000 | **sentinel positions DO NOT matter** |
+| **T12 vs T1 (PageSentinel vs F4)** | −1 | 0.037 | sentinel on F4 base provides essentially zero net benefit |
+| **T8 PageLocal vs T2 F9** | −15 | 5.488 | **F9 significantly beats PageLocal** at p<0.05 |
+| **T16 Combined vs T2 F9** | −23 | 11.756 | F9 strongly beats combined |
+
+### Reasoning-image (Phase 2, n=47, binary MCQ)
+
+Headline overall (n=47):
+
+| Cond | Acc | KV bits |
+|---|---:|---:|
+| T0 BF16 | 0.532 | 16.00 |
+| T1 Global-F4 | 0.638 | 4.00 |
+| T2 F9 | 0.553 | 4.75 |
+| T3 SJ INT8 | 0.532 | 4.25 |
+| T4 S4 INT7 | 0.489 | 4.1875 |
+| T5 F5 legacy | 0.447 | 4.00 |
+| T5b TrueTextVisualSplit | 0.532 | 4.00 |
+| T6 TokenBlock16 | **0.617** | 4.00 |
+| T7 RandomPageLocal | 0.532 | 4.00 |
+| **T8 PageLocal-F4** | **0.660** | 4.00 |
+| T9 ImageOnlyLocal | 0.553 | 4.00 |
+| T10 TextOnlyLocal | 0.596 | 4.00 |
+| T11 PageSentinel-1 | 0.532 | 4.005 |
+| T12 PageSentinel-4 | 0.574 | 4.022 |
+| T13 RandomSentinel-4 | 0.553 | 4.022 |
+| T14 LastSentinel-4 | 0.553 | 4.022 |
+| T15 TextSentinel-4 | 0.596 | 4.023 |
+| T16 PageLocal + PageSentinel-4 | 0.468 | 4.022 |
+
+**Anomaly:** T1 Global-F4 (0.638) BEATS T0 BF16 (0.532) by +10.6 pp. χ²=3.67. The F4-better-than-BF16 inversion comes from n=47 with binary MCQ baseline ~50% (variance is large); BF16 was unlucky on this seed/slice. PageLocal T8=0.660 still tops the table, but the ceiling is anchored on shaky data — reasoning-image conclusions need a larger pool.
+
+**Paired McNemar (n=47):**
+
+| Comparison | net (A−B) | χ² | Verdict |
+|---|---:|---:|---|
+| T8 PageLocal vs T1 Global-F4 | +2 | 0.167 | not sig (T1 anomalously high) |
+| T8 PageLocal vs T6 TokenBlock16 | +2 | 0.182 | not sig |
+| T8 PageLocal vs T5b TrueTextVisualSplit | +6 | 1.636 | directional ↑ |
+| T8 PageLocal vs T5 legacy | +10 | 4.167 | sig vs broken control |
+| **T8 PageLocal vs T2 F9** | **+9** | 3.000 | **directional — PageLocal beats F9 directionally on reasoning-image** (not sig at p<0.05) |
+| T16 Combined vs T8 PageLocal | −9 | 4.263 | sig: combined HURTS at p<0.05 |
+| T16 Combined vs T12 PageSentinel-4 | −5 | 1.000 | combined hurts here too |
+| F9 vs BF16 | +4 | 2.000 | F9 directionally beats BF16 (consistent with the F4>BF16 anomaly) |
+
+### Counting-image (Phase 3, n=64, multi-token gen, max_new_tokens=96)
+
+| Cond | exact | **valid_format** | length_match | sum_match | soft_acc | mean latency ms |
+|---|---:|---:|---:|---:|---:|---:|
+| C0 BF16 | 0.000 | **0.781** | 0.047 | 0.094 | 0.023 | 2447 |
+| C1 Global-F4 | 0.000 | 0.016 | 0.000 | 0.000 | 0.000 | 4038 |
+| C2 F9 | 0.000 | **0.812** | 0.094 | 0.078 | 0.023 | 9983 |
+| C3 SJ INT8 | 0.000 | **0.781** | 0.141 | 0.062 | 0.029 | 10819 |
+| C4 S4 INT7 | 0.000 | 0.766 | 0.109 | 0.031 | 0.000 | 4646 |
+| C5 TokenBlock16 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 714 |
+| **C6 PageLocal-F4** | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 677 |
+| C7 PageSentinel-1 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 836 |
+| C8 PageSentinel-4 | 0.000 | 0.031 | 0.000 | 0.000 | 0.000 | 803 |
+| C9 RandomSentinel-4 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 799 |
+| C10 LastSentinel-4 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 815 |
+| C11 TextSentinel-4 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 733 |
+| C12 PageLocal + Sentinel-4 | 0.000 | 0.000 | 0.000 | 0.000 | 0.000 | 668 |
+
+**Two distinct counting-image failures:**
+
+1. **BF16 itself emits broken-format outputs.** Sample C0 outputs: `'```json\n[]\n```'` (empty list), `'```json\n[[0, 0, 0]]\n```'` (nested list — model treats `[x, x, x...]` as a template for INNER elements), or dict-style outputs. valid_format=78% but exact_match=0% because the SHAPES are wrong. This is a prompt-engineering issue, not a quantization issue. **Counting-image as currently prompted is not a viable accuracy ceiling** — confirms the pre-run risk flag.
+2. **Multi-token generation under non-outlier-protected K formats collapses entirely.** C5–C12 all produce `valid_format=0%` (literal outputs like `' addCriterion\n\n'`, `'The passage of the'`, `''`). The new K kinds (PageLocal, sentinels) AND the pre-existing `kivi_temporal_window` (C5) all fail. The decode-time fallback (plain F4 per-channel-seq on T=1 chunks) is essentially lossless mathematically, but the model can't recover from compounding prefill K error across 96 successive attention patterns when no outlier sidecode protects the high-energy channels. **F9 / SJ / S4 (top-16 outlier sidecode) hold at valid_format=77–81% — sidecode protection is decisive for multi-token generation, while it's optional for first-token MCQ scoring.**
+
+Counting-image therefore does NOT discriminate between page-aware methods at this prompt configuration. It DOES cleanly separate "outlier-protected" K formats (BF16 / F9 / SJ / S4) from "unprotected" (F4 / all page-aware variants). The original "image-count recognition register" hypothesis cannot be tested until: (a) the prompt is rewritten to forbid nested output, AND (b) page-aware kinds are composed with outlier-channel protection (a `PageLocal-F9` or `PageSentinel-on-F9` variant — not in the T0–T16 grid).
+
+### Bottom line
+
+- **PageLocal-F4 (T8) directionally wins the page-aware family** on both retrieval-image (0.369) and reasoning-image (0.660). It beats every matched-bit-budget control (F4, TokenBlock, RandomPageLocal, TextVisualLocal, TrueTextVisualSplit) by +2 to +12 pp aggregate.
+- **No comparison reaches paired McNemar significance at n=84 (retrieval) or n=47 (reasoning).** The pass criterion from the design (≥7 pp AND paired-significant AND closing half the F4→F9 gap) is NOT met on either slice.
+- **F9 / SJ / S4 sidecode formats strictly dominate PageLocal-F4** on retrieval-image (T8 vs T2 F9: net=−15, χ²=5.49, p<0.05). On reasoning-image PageLocal directionally beats F9 but n=47 is too small to be conclusive.
+- **PageSentinel mechanism falsified**: PageSentinel-4 ties RandomSentinel-4 (net=0, χ²=0.000) on retrieval-image — sentinel POSITIONS don't matter, and adding sentinels on top of PageLocal-F4 HURTS by −8 pp.
+- **T16 combined (PageLocal + PageSentinel) is significantly worse than F9** (χ²=11.76) and at best ties Global-F4 (0.274). The combined hypothesis is falsified.
+- **Counting-image is unusable at this prompt configuration** as a head-to-head benchmark — BF16 ceiling collapses to 0% exact-match because the model misformats the output. Salvageable signal is in `valid_format_rate`, which cleanly separates outlier-protected formats (78–81%) from unprotected ones (0–1.6%).
+- **The deployable Pareto winners remain Exp S's S4 (top-16 INT7 sidecode, 4.1875 KV bits)** and Exp R's SJ (top-16 INT8 sidecode, 4.25 KV bits). VLM page-aware K formats add no Pareto point at n=84.
+
+### Anomalies / open issues for next iteration
+
+- **Reasoning-image BF16 < F4 by 10.6 pp** on n=47. Likely seed/sample luck given the small pool (binary MCQ near random baseline), but worth a larger reasoning-image slice (n=200+) or a different seed before drawing reasoning-image conclusions.
+- **Counting-image prompt** needs to explicitly forbid nested lists and dict-style outputs, AND counting-image conditions need to be composed with outlier-channel protection (e.g. PageLocal layered on F9) to test the page-aware hypothesis in a regime where BF16 itself works.
+- **Multi-token generation under any non-outlier-protected K format collapses** — this is a real, deployable-relevant finding independent of the page-aware hypothesis: F4 / TokenBlock / PageLocal / Sentinel are first-token-only methods. For generation tasks, outlier sidecode is mandatory.
+- **Legacy F5 (T5) semantics drifted**: under the new T-mini slice_info, F5 uses only the first visual page's `v_start/v_end`, so its number is not comparable to prior Exp F runs. T5b (`kivi_true_text_visual_split`) is the correct coarse modality-split control going forward.
+
+### Pipeline status
+
+```
+qwen-expT-mini — COMPLETE 2026-05-14
+├── ✅ Phase 0  CPU smoke 13/13 → 14/14 (after T5b add) → also 4/4 live runtime audit
+├── ✅ Phase 1  retrieval-image T0..T16, n=84 (~2h53m wall)
+├── ✅ Phase 2a reasoning-image cal-100 NPZ (~3min, 100/100, 0 fails)
+├── ✅ Phase 2  reasoning-image T0..T16 + T5b, n=47 (~1h15m wall)
+├── ✅ Phase 3a counting-image cal-100 NPZ (~3min)
+├── ✅ Phase 3  counting-image C0..C12, n=64, max_new_tokens=96 (~43min wall, generation-bound)
+├── ✅ Phase 4  analyzer + bucketed headlines + paired McNemar (3 markdown files)
+└── ✅ Phase 5  retrieval-image T5b backfill, n=84 (~3min)
+```
+
+Total wall: 4h57m main run + 3min T5b backfill = **5h00m end-to-end**.
+
+Output artifacts in `qwen/results/`:
+- `expT_mini_smoke.md`, `expT_mini_runtime_audit.md`
+- `expT_mini_rollouts_{retrieval-image,reasoning-image,counting-image}.jsonl` (1512 + 846 + 832 = 3190 rows)
+- `expT_mini_summary_{retrieval-image,reasoning-image,counting-image}.md` (bucketed headlines + paired McNemar)
+- `expT_mini_overnight.progress.log`, per-phase progress logs, T5b backfill log
+
+Calibrations in `qwen/calibration/`:
+- `expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_reasoning-image_seed0.{json,npz}` (NEW, 100/100)
+- `expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_counting-image_seed0.{json,npz}` (NEW, 100/100)
+
