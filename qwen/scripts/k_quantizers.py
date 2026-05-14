@@ -42,7 +42,7 @@ Calibration data (when needed) is supplied via cfg.calib, a dict-like:
 The caller (`expF_kquant_screen.py`) loads the NPZ once at startup and
 attaches it to each KQuantizerConfig that needs it.
 
-Slice info (for F5/F6/F13) is passed at runtime via `slice_info` argument:
+Slice info (for F5/F6/F13/T-mini) is passed at runtime via `slice_info` argument:
   {
     "v_start": int, "v_end": int,        # visual span (absolute positions)
     "text_positions": list[int],          # absolute positions of non-visual tokens
@@ -51,6 +51,18 @@ Slice info (for F5/F6/F13) is passed at runtime via `slice_info` argument:
                   role in {header, question, options, instruction,
                            answer_prefix, visual}
     "seq_len": int,
+    # T-mini fields (PageLocal / PageSentinel / Random*):
+    "page_boundaries": list[(start, end, kind)],   # absolute; kind in
+                                                   #   {"text",
+                                                   #    "in_context_image",
+                                                   #    "choice_image"}
+    "visual_token_positions_per_image": list[list[int]],  # one list per visual
+                                                          #   page (absolute pos)
+    "text_chunk_positions": list[list[int]],       # one list per text page
+                                                   #   (absolute pos)
+    "item_id": str,                                # used to seed per-item RNG
+                                                   #   for kivi_random_page_local
+                                                   #   and random_visual sentinel
   }
 """
 from __future__ import annotations
@@ -78,6 +90,19 @@ KQUANTIZER_KINDS = (
     # segment instead of one scale shared across the whole sequence. Stays at
     # TRUE 4.00 KV bits (no outlier spend; scale metadata is negligible).
     "kivi_temporal_window",
+    # T-mini: VLM page-aware K formats.
+    # PageLocal-F4: one per-channel scale per (Page.start, Page.end) from PageLayout.
+    "kivi_page_local",
+    # RandomPageLocal-F4: same page-count budget, randomly chosen boundary positions
+    # (seeded per item). Stronger control than TokenBlock.
+    "kivi_random_page_local",
+    # ImageOnlyLocal-F4: page-local scales only on visual pages; text gets one global scale.
+    "kivi_image_only_local",
+    # TextOnlyLocal-F4: page-local scales only on text pages; visual gets one global scale.
+    "kivi_text_only_local",
+    # PageSentinel composite: base kind (F4 or PageLocal-F4) + sentinel positions kept at
+    # original BF16 (keep-from-original, like F9 outlier sidecode but on POSITIONS).
+    "kivi_page_sentinel",
 )
 
 
@@ -119,6 +144,18 @@ class KQuantizerConfig:
     # int tensor with budget=n_outliers in the top fraction of cells (by risk)
     # and 0 elsewhere. When set as a tensor, _kivi_outlier honors it per-cell.
     layer_adaptive_outlier_budget: Optional[object] = None
+    # T-mini: PageSentinel composite — base K format applied first, then sentinel
+    # positions are restored to original (BF16). base_kind must be one of the
+    # non-sentinel KQUANTIZER_KINDS. sentinel_kind in {first_visual, last_visual,
+    # random_visual, first_text} chooses how to pick the sentinel positions from
+    # the page boundaries in slice_info. sentinel_n_per_page is the count per page.
+    base_kind: Optional[str] = None
+    sentinel_kind: Optional[str] = None
+    sentinel_n_per_page: int = 0
+    # T-mini: random seed namespace for kivi_random_page_local and the
+    # random_visual sentinel pattern. Combined with item-id at runtime so the
+    # same item produces the same random boundaries / sentinels each pass.
+    random_seed_namespace: Optional[str] = None
 
     def __post_init__(self):
         if self.kind not in KQUANTIZER_KINDS:
@@ -290,6 +327,29 @@ def apply_k_quantizer(K: torch.Tensor, cfg: KQuantizerConfig,
             n_windows=int(cfg.n_temporal_windows or 0),
             mode=str(cfg.temporal_mode or "visual_only"),
         )
+
+    if kind == "kivi_page_local":
+        # T8/C6: one per-channel scale per Page from slice_info["page_boundaries"].
+        return _kivi_page_local(K, cfg, slice_info, cache_offset, qmax,
+                                page_filter=None)
+
+    if kind == "kivi_random_page_local":
+        # T7: same page-count as PageLocal but boundaries randomly chosen per item.
+        return _kivi_random_page_local(K, cfg, slice_info, cache_offset, qmax)
+
+    if kind == "kivi_image_only_local":
+        # T9: page-local scales only on visual pages; text gets one global scale.
+        return _kivi_page_local(K, cfg, slice_info, cache_offset, qmax,
+                                page_filter="visual_only")
+
+    if kind == "kivi_text_only_local":
+        # T10: page-local scales only on text pages; visual gets one global scale.
+        return _kivi_page_local(K, cfg, slice_info, cache_offset, qmax,
+                                page_filter="text_only")
+
+    if kind == "kivi_page_sentinel":
+        # T11-T16: base K format + sentinel positions restored to original BF16.
+        return _kivi_page_sentinel(K, cfg, layer_idx, slice_info, cache_offset, qmax)
 
     raise ValueError(f"apply_k_quantizer: unhandled kind={kind!r}")
 
@@ -493,6 +553,241 @@ def _kivi_temporal_window(K: torch.Tensor, cfg: KQuantizerConfig,
             ch = outlier_idx[h]
             if ch.numel() > 0:
                 K_q[:, h, :, ch] = K[:, h, :, ch]
+    return K_q
+
+
+# ===================================================================
+# T-mini: page-aware K quantizers (PageLocal, RandomPageLocal,
+# ImageOnlyLocal, TextOnlyLocal, PageSentinel)
+# ===================================================================
+
+
+_VISUAL_PAGE_KINDS = ("in_context_image", "choice_image")
+
+
+def _kivi_page_local(K: torch.Tensor, cfg: KQuantizerConfig,
+                     slice_info: Optional[dict], cache_offset: int,
+                     qmax: float, page_filter: Optional[str] = None) -> torch.Tensor:
+    """T8/T9/T10: per-page per-channel K scales.
+
+    slice_info["page_boundaries"] is a list of (start, end, kind) tuples in
+    absolute coordinates where kind ∈ {"text", "in_context_image", "choice_image"}.
+
+    page_filter:
+      None           -> every page gets a local scale (T8 PageLocal-F4)
+      "visual_only"  -> visual pages get local scales; text spans share one global
+                        scale (T9 ImageOnlyLocal-F4)
+      "text_only"    -> text pages get local scales; visual spans share one global
+                        scale (T10 TextOnlyLocal-F4)
+
+    Decode-time fallback (cache_offset > 0): plain F4 per-channel-seq on the
+    small new chunk — generated tokens lie after the prefill page coverage.
+    """
+    B, H, T, D = K.shape
+    if T == 0:
+        return K
+
+    # Fallback when slice_info is missing or has no page_boundaries.
+    page_boundaries = None
+    if slice_info is not None:
+        page_boundaries = slice_info.get("page_boundaries")
+    if not page_boundaries or cache_offset > 0:
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+
+    abs_lo = cache_offset
+    abs_hi = cache_offset + T
+    K_q = K.clone()
+
+    # Page intersections that get their own per-channel scale.
+    local_positions: list[int] = []  # chunk-local indices receiving local scales
+    # Positions that belong to the modality-pooled (single-scale) bucket.
+    pooled_positions: list[int] = []
+
+    for (lo, hi, kind) in page_boundaries:
+        chunk_lo = max(int(lo) - abs_lo, 0)
+        chunk_hi = min(int(hi) - abs_lo, T)
+        if chunk_hi <= chunk_lo:
+            continue
+        is_visual = kind in _VISUAL_PAGE_KINDS
+        if page_filter is None:
+            give_local_scale = True
+        elif page_filter == "visual_only":
+            give_local_scale = is_visual
+        elif page_filter == "text_only":
+            give_local_scale = (not is_visual)
+        else:
+            raise ValueError(f"unknown page_filter={page_filter!r}")
+
+        if give_local_scale:
+            seg = K[:, :, chunk_lo:chunk_hi, :]
+            scale = _per_channel_seq_scale(seg, qmax, percentile=None)
+            K_q[:, :, chunk_lo:chunk_hi, :] = _quantize_with_scale(seg, scale, qmax)
+            local_positions.extend(range(chunk_lo, chunk_hi))
+        else:
+            pooled_positions.extend(range(chunk_lo, chunk_hi))
+
+    # Single pooled global scale for whichever modality was not page-locally scaled.
+    if pooled_positions:
+        idx = torch.tensor(pooled_positions, dtype=torch.long, device=K.device)
+        K_pool = K.index_select(dim=-2, index=idx)
+        scale = _per_channel_seq_scale(K_pool, qmax, percentile=None)
+        K_pool_q = _quantize_with_scale(K_pool, scale, qmax)
+        K_q.index_copy_(dim=-2, index=idx, source=K_pool_q)
+
+    # Catch-all for positions not covered by any page boundary (rare, but
+    # generated decode-time tokens or unparsed prefill ranges). Fall back to F4.
+    covered = set(local_positions) | set(pooled_positions)
+    leftover = [i for i in range(T) if i not in covered]
+    if leftover:
+        idx = torch.tensor(leftover, dtype=torch.long, device=K.device)
+        K_left = K.index_select(dim=-2, index=idx)
+        scale = _per_channel_seq_scale(K_left, qmax, percentile=None)
+        K_left_q = _quantize_with_scale(K_left, scale, qmax)
+        K_q.index_copy_(dim=-2, index=idx, source=K_left_q)
+
+    return K_q
+
+
+def _kivi_random_page_local(K: torch.Tensor, cfg: KQuantizerConfig,
+                            slice_info: Optional[dict], cache_offset: int,
+                            qmax: float) -> torch.Tensor:
+    """T7: same number of pages as PageLocal, randomly chosen boundaries.
+
+    Reads slice_info["page_boundaries"] for n_pages and slice_info["item_id"]
+    for the per-item RNG seed. If page_boundaries is missing, falls back to F4.
+    """
+    B, H, T, D = K.shape
+    if T == 0:
+        return K
+    page_boundaries = None
+    item_id = None
+    if slice_info is not None:
+        page_boundaries = slice_info.get("page_boundaries")
+        item_id = slice_info.get("item_id")
+    if not page_boundaries or cache_offset > 0:
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+
+    n_pages = len(page_boundaries)
+    if n_pages <= 1:
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+
+    # Deterministic per-item random boundary positions across [0, T).
+    import random
+    seed_basis = f"{cfg.random_seed_namespace or 'random_page_local'}:{item_id or 0}"
+    rng = random.Random(abs(hash(seed_basis)) % (2 ** 31))
+    # Pick n_pages-1 unique interior boundaries.
+    if T - 1 <= n_pages - 1:
+        # Not enough positions to split. Fallback.
+        scale = _per_channel_seq_scale(K, qmax, percentile=None)
+        return _quantize_with_scale(K, scale, qmax)
+    interior = rng.sample(range(1, T), n_pages - 1)
+    interior.sort()
+    boundaries = [0] + interior + [T]
+
+    K_q = K.clone()
+    for i in range(len(boundaries) - 1):
+        a, b = boundaries[i], boundaries[i + 1]
+        if b <= a:
+            continue
+        seg = K[:, :, a:b, :]
+        scale = _per_channel_seq_scale(seg, qmax, percentile=None)
+        K_q[:, :, a:b, :] = _quantize_with_scale(seg, scale, qmax)
+    return K_q
+
+
+def _resolve_sentinel_positions(slice_info: Optional[dict],
+                                sentinel_kind: str,
+                                n_per_page: int,
+                                seed_namespace: Optional[str]) -> list[int]:
+    """Resolve sentinel token positions in absolute coordinates.
+
+    sentinel_kind options:
+      "first_visual" — first n_per_page visual tokens of each image page
+      "last_visual"  — last n_per_page visual tokens of each image page
+      "random_visual" — random n_per_page positions per image page (seeded per item)
+      "first_text"   — first n_per_page tokens of each text page/chunk
+    """
+    if slice_info is None or n_per_page <= 0:
+        return []
+    pos: list[int] = []
+    item_id = slice_info.get("item_id") or 0
+    if sentinel_kind in ("first_visual", "last_visual", "random_visual"):
+        per_image = slice_info.get("visual_token_positions_per_image") or []
+        for img_idx, pos_list in enumerate(per_image):
+            if not pos_list:
+                continue
+            if sentinel_kind == "first_visual":
+                pos.extend(pos_list[:n_per_page])
+            elif sentinel_kind == "last_visual":
+                pos.extend(pos_list[-n_per_page:])
+            else:  # random_visual
+                import random
+                seed_basis = f"{seed_namespace or 'random_sentinel'}:{item_id}:{img_idx}"
+                rng = random.Random(abs(hash(seed_basis)) % (2 ** 31))
+                n = min(n_per_page, len(pos_list))
+                pos.extend(rng.sample(list(pos_list), n))
+    elif sentinel_kind == "first_text":
+        per_chunk = slice_info.get("text_chunk_positions") or []
+        for pos_list in per_chunk:
+            if not pos_list:
+                continue
+            pos.extend(pos_list[:n_per_page])
+    else:
+        raise ValueError(f"unknown sentinel_kind={sentinel_kind!r}")
+    return sorted(set(pos))
+
+
+def _kivi_page_sentinel(K: torch.Tensor, cfg: KQuantizerConfig,
+                        layer_idx: int,
+                        slice_info: Optional[dict], cache_offset: int,
+                        qmax: float) -> torch.Tensor:
+    """T11-T16: base K format + sentinel positions restored to original BF16.
+
+    cfg.base_kind selects the base K format ("kivi_per_channel_seq" for Global-F4
+    base in T11-T15; "kivi_page_local" for the combined T16). cfg.sentinel_kind
+    chooses which positions to protect. cfg.sentinel_n_per_page controls count.
+
+    Sentinel positions are kept at original BF16 (lossless on those positions),
+    mirroring the F9 outlier sidecode pattern but on POSITIONS instead of
+    CHANNELS.
+    """
+    base_kind = cfg.base_kind or "kivi_per_channel_seq"
+    # Construct a transient base cfg. Reuse calib / outlier-storage fields if
+    # the base needs them (e.g. PageLocal base with outlier sidecode is not in
+    # T-mini, but keep extensibility).
+    base_cfg = KQuantizerConfig(
+        name=f"{cfg.name}:base",
+        kind=base_kind,
+        bits=cfg.bits,
+        calib=cfg.calib,
+        random_seed_namespace=cfg.random_seed_namespace,
+    )
+    K_q = apply_k_quantizer(K, base_cfg, layer_idx,
+                            slice_info=slice_info, cache_offset=cache_offset)
+
+    # Restore sentinel positions from original K (BF16 keep-from-original).
+    if cache_offset > 0:
+        # Sentinels are defined on prefill positions only; decode-time chunks
+        # contain generated tokens which are never sentinel.
+        return K_q
+    sentinel_abs = _resolve_sentinel_positions(
+        slice_info, cfg.sentinel_kind or "first_visual",
+        int(cfg.sentinel_n_per_page or 0),
+        cfg.random_seed_namespace,
+    )
+    if not sentinel_abs:
+        return K_q
+    B, H, T, D = K.shape
+    abs_lo = cache_offset
+    abs_hi = cache_offset + T
+    sentinel_local = [p - abs_lo for p in sentinel_abs if abs_lo <= p < abs_hi]
+    if not sentinel_local:
+        return K_q
+    idx = torch.tensor(sentinel_local, dtype=torch.long, device=K.device)
+    K_q.index_copy_(dim=-2, index=idx, source=K.index_select(dim=-2, index=idx))
     return K_q
 
 
@@ -1107,4 +1402,55 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
         # (same bit budget as SJ = J12 INT8 top-16; tests "wider lower-precision")
         KQuantizerConfig(name="SL_Outlier32_INT6side", kind="kivi_outlier16", bits=4,
                          n_outliers=32, calib=calib, outlier_storage_bits=6),
+        # ============================================================
+        # T-mini: VLM page-aware K formats (PageLocal + PageSentinel).
+        # All variants stay at TRUE ≈4.00 KV bits — scale metadata and
+        # tiny sentinel restoration overhead are negligible vs cache.
+        # ============================================================
+        # T5: TextVisualLocal-F4 — already covered by F5_KIVI_TextVisualSplit.
+        # T6: TokenBlockLocal-F4 — token-block control with 16 equal segments.
+        KQuantizerConfig(name="T6_TokenBlock16_F4", kind="kivi_temporal_window",
+                         bits=4, n_temporal_windows=16, temporal_mode="token_block"),
+        # T7: RandomPageLocal-F4 — same per-item page count as PageLocal,
+        # randomly chosen boundary positions.
+        KQuantizerConfig(name="T7_RandomPageLocal_F4", kind="kivi_random_page_local",
+                         bits=4, random_seed_namespace="T7_random_page"),
+        # T8: PageLocal-F4 — main hypothesis. Per-page per-channel K scales.
+        KQuantizerConfig(name="T8_PageLocal_F4", kind="kivi_page_local", bits=4),
+        # T9: ImageOnlyLocal-F4 — page-local scales only on visual pages.
+        KQuantizerConfig(name="T9_ImageOnlyLocal_F4", kind="kivi_image_only_local", bits=4),
+        # T10: TextOnlyLocal-F4 — page-local scales only on text pages.
+        KQuantizerConfig(name="T10_TextOnlyLocal_F4", kind="kivi_text_only_local", bits=4),
+        # T11: PageSentinel-1 — first visual token of each image page kept at BF16.
+        KQuantizerConfig(name="T11_PageSentinel1_F4base",
+                         kind="kivi_page_sentinel", bits=4,
+                         base_kind="kivi_per_channel_seq",
+                         sentinel_kind="first_visual", sentinel_n_per_page=1),
+        # T12: PageSentinel-4 — first 4 visual tokens of each image page at BF16.
+        KQuantizerConfig(name="T12_PageSentinel4_F4base",
+                         kind="kivi_page_sentinel", bits=4,
+                         base_kind="kivi_per_channel_seq",
+                         sentinel_kind="first_visual", sentinel_n_per_page=4),
+        # T13: RandomSentinel-4 — same number of protected visual tokens, random
+        # positions within each image page (seeded per-item).
+        KQuantizerConfig(name="T13_RandomSentinel4_F4base",
+                         kind="kivi_page_sentinel", bits=4,
+                         base_kind="kivi_per_channel_seq",
+                         sentinel_kind="random_visual", sentinel_n_per_page=4,
+                         random_seed_namespace="T13_random_sentinel"),
+        # T14: LastSentinel-4 — last 4 visual tokens of each image page at BF16.
+        KQuantizerConfig(name="T14_LastSentinel4_F4base",
+                         kind="kivi_page_sentinel", bits=4,
+                         base_kind="kivi_per_channel_seq",
+                         sentinel_kind="last_visual", sentinel_n_per_page=4),
+        # T15: TextSentinel-4 — first 4 tokens of each text page/chunk at BF16.
+        KQuantizerConfig(name="T15_TextSentinel4_F4base",
+                         kind="kivi_page_sentinel", bits=4,
+                         base_kind="kivi_per_channel_seq",
+                         sentinel_kind="first_text", sentinel_n_per_page=4),
+        # T16: PageLocal-F4 + PageSentinel-4 (combined).
+        KQuantizerConfig(name="T16_PageLocal_PageSentinel4",
+                         kind="kivi_page_sentinel", bits=4,
+                         base_kind="kivi_page_local",
+                         sentinel_kind="first_visual", sentinel_n_per_page=4),
     ]

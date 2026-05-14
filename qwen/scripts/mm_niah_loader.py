@@ -38,7 +38,7 @@ from typing import Optional
 DEFAULT_ROOT = Path(os.environ.get("MM_NIAH_ROOT", "/data/subha2/mm_niah"))
 DEFAULT_SUBSET = "mm_niah_val"
 DEFAULT_TASK = "retrieval-image"
-SUPPORTED_TASKS = ("retrieval-image", "reasoning-image")
+SUPPORTED_TASKS = ("retrieval-image", "reasoning-image", "counting-image")
 DEFAULT_SPLIT_FILE = (
     Path(__file__).resolve().parents[1] / "calibration" / "mm_niah_split_seed0.json"
 )
@@ -58,14 +58,23 @@ class MMNiahItem:
     id: str
     context: str
     question: str
-    correct_choice: int             # 0..3
+    correct_choice: int             # 0..3 for MCQ tasks; -1 for counting-image
     images_list: list[str]          # absolute paths after `_resolve_image_paths`
     choices_image_paths: list[str]  # 4 absolute paths, in choice order A..D
+                                    # (empty for counting-image)
     needle_idx_in_images: int       # which position of images_list is the needle
     placed_depth: float             # 0..1
     context_length: int             # from dataset metadata (text+image rough tokens)
     context_length_bucket: str      # short / mid / long (binned by context_length)
     num_images: int
+    # T-mini extensions:
+    # - For counting-image, gold_counts holds the per-image-page integer counts
+    #   (length = num_images - 1; the first image in images_list is the needle
+    #   pattern, the rest are the haystack pages where counts apply).
+    # - task records the originating task so downstream code can branch
+    #   (MCQ scoring vs counting-image generation+list-parse).
+    gold_counts: Optional[list[int]] = None
+    task: str = DEFAULT_TASK
     raw: Optional[dict] = field(default=None, repr=False)
 
 
@@ -133,6 +142,11 @@ def _find_needle_idx_by_task(images_list: list[str], meta: dict, task: str) -> i
         return _find_needle_idx_retrieval(images_list)
     if task == "reasoning-image":
         return _find_needle_idx_reasoning(images_list, meta)
+    if task == "counting-image":
+        # In counting-image the first image is the needle pattern (e.g.
+        # "abnormal_pic_val/sun.jpg") and the remaining images are the
+        # haystack pages whose counts the model must report.
+        return 0
     raise ValueError(f"unsupported task={task!r}")
 
 
@@ -180,15 +194,52 @@ def _normalize(rec: dict, images_root: Path, task: str = DEFAULT_TASK) -> Option
     answer = rec.get("answer")
     images_list_raw = rec.get("images_list", [])
     meta = rec.get("meta", {})
-    choices_raw = meta.get("choices_image_path", [])
+    choices_raw = meta.get("choices_image_path") or []
     placed = meta.get("placed_depth", [0.0])
     ctx_len = int(meta.get("context_length", 0))
     n_imgs = int(meta.get("num_images", len(images_list_raw)))
 
-    if answer is None or not isinstance(answer, int):
-        return None
+    if task == "counting-image":
+        # Counting-image: answer is a list[int] of per-image needle counts.
+        # The first image in images_list is the needle pattern; the answer
+        # has length num_images - 1.
+        if not isinstance(answer, list) or not all(isinstance(x, int) for x in answer):
+            return None
+        if len(answer) != max(0, n_imgs - 1):
+            return None
+        if len(images_list_raw) != n_imgs:
+            return None
+        if context.count("<image>") != n_imgs - 1:
+            # Counting-image context only has placeholders for haystack pages;
+            # the needle pattern is referenced inline in the question.
+            return None
+        bucket = context_bucket(ctx_len)
+        if bucket is None:
+            return None
+        needle_idx = _find_needle_idx_by_task(images_list_raw, meta, task)
+        if needle_idx < 0:
+            return None
+        return MMNiahItem(
+            id=rid,
+            context=context,
+            question=question,
+            correct_choice=-1,
+            images_list=_resolve_image_paths(images_list_raw, images_root),
+            choices_image_paths=[],  # no MCQ choices
+            needle_idx_in_images=needle_idx,
+            placed_depth=float(placed[0]) if placed else 0.0,
+            context_length=ctx_len,
+            context_length_bucket=bucket,
+            num_images=n_imgs,
+            gold_counts=list(answer),
+            task=task,
+            raw=rec,
+        )
+
     # retrieval-image and reasoning-image are both 4-way single-choice MCQ over
     # candidate images.
+    if answer is None or not isinstance(answer, int):
+        return None
     if not (0 <= answer < 4):
         return None
     if len(choices_raw) != 4:
@@ -215,6 +266,7 @@ def _normalize(rec: dict, images_root: Path, task: str = DEFAULT_TASK) -> Option
         context_length=ctx_len,
         context_length_bucket=bucket,
         num_images=n_imgs,
+        task=task,
         raw=rec,
     )
 
@@ -328,6 +380,61 @@ def format_mcq_messages(item: MMNiahItem,
         })
         content.append({"type": "text", "text": "\n"})
     content.append({"type": "text", "text": "\nAnswer with a single letter from A, B, C, D."})
+    return [{"role": "user", "content": content}]
+
+
+def format_counting_messages(item: MMNiahItem,
+                             max_pixels_context: int = 144 * 144,
+                             max_pixels_needle: int = 144 * 144) -> list[dict]:
+    """Build Qwen2.5-VL chat messages for an MM-NIAH counting-image item.
+
+    Counting-image format (different from retrieval/reasoning-image MCQ):
+      images_list[0]   - the needle pattern (referenced inline in the question)
+      images_list[1:]  - the haystack pages, one <image> placeholder per page
+      question         - explicit instruction: "Please help me collect the number
+                         of this sun: <image> in each image in the above document,
+                         for example: [x, x, x...]". The <image> in the question
+                         refers to images_list[0] (the needle pattern).
+
+    The model is expected to output a JSON list of length num_images - 1.
+    """
+    # The context contains num_images - 1 placeholders (haystack pages).
+    text_parts = item.context.split("<image>")
+    haystack_imgs = item.images_list[1:]
+    if len(text_parts) - 1 != len(haystack_imgs):
+        raise RuntimeError(
+            f"MM-NIAH counting-image item {item.id}: <image> count "
+            f"({len(text_parts) - 1}) does not match haystack image count "
+            f"({len(haystack_imgs)})"
+        )
+    content: list[dict] = []
+    for i, txt in enumerate(text_parts):
+        if txt:
+            content.append({"type": "text", "text": txt})
+        if i < len(haystack_imgs):
+            content.append({
+                "type": "image",
+                "image": "file://" + haystack_imgs[i],
+                "max_pixels": max_pixels_context,
+            })
+    # Counting-image question has its OWN <image> referring to the needle pattern.
+    q_parts = item.question.split("<image>")
+    if len(q_parts) >= 2:
+        content.append({"type": "text", "text": "\n\n" + q_parts[0]})
+        content.append({
+            "type": "image",
+            "image": "file://" + item.images_list[0],
+            "max_pixels": max_pixels_needle,
+        })
+        content.append({"type": "text", "text": "".join(q_parts[1:])})
+    else:
+        # Defensive fallback: needle inserted at end of question.
+        content.append({"type": "text", "text": "\n\n" + item.question})
+        content.append({
+            "type": "image",
+            "image": "file://" + item.images_list[0],
+            "max_pixels": max_pixels_needle,
+        })
     return [{"role": "user", "content": content}]
 
 

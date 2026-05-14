@@ -34,8 +34,9 @@ import torch
 
 from expF_calibrate import KStatsCache, QStatsHook
 from mm_niah_loader import (
-    DEFAULT_SPLIT_FILE, MMNiahItem, filter_items, format_mcq_messages,
-    load_all_items, load_split, make_split, save_split,
+    DEFAULT_SPLIT_FILE, DEFAULT_TASK, MMNiahItem, SUPPORTED_TASKS,
+    filter_items, format_counting_messages, format_mcq_messages,
+    load_all_items, load_split, make_split, save_split, split_file_for_task,
 )
 from page_layout import find_all_visual_spans
 
@@ -62,11 +63,11 @@ def _mmniah_visual_envelope(input_ids: torch.Tensor, processor) -> tuple[int, in
 def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
                     out_json: Path, out_npz: Path, seed: int = 0,
                     max_q_per_item: int = 256, progress_every: int = 5,
-                    limit: int = 0) -> None:
+                    limit: int = 0, task: str = DEFAULT_TASK) -> None:
     from run_inference import load_model
     from qwen_vl_utils import process_vision_info  # type: ignore
 
-    items = load_all_items()
+    items = load_all_items(task=task)
     if split_file.exists():
         split = load_split(split_file)
         if "cal" not in split:
@@ -79,7 +80,8 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
     cal_items = filter_items(items, split["cal"])
     if limit:
         cal_items = cal_items[:limit]
-    print(f"[mmniah-calib] cal_items={len(cal_items)} model={model_id} seed={seed}", flush=True)
+    print(f"[mmniah-calib] task={task} cal_items={len(cal_items)} model={model_id} seed={seed}",
+          flush=True)
 
     model, processor = load_model(model_id, awq=False, dtype="bfloat16",
                                   attn_impl="sdpa", device_map="auto")
@@ -116,7 +118,10 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
     try:
         for i, it in enumerate(cal_items):
             try:
-                msgs = format_mcq_messages(it)
+                if task == "counting-image":
+                    msgs = format_counting_messages(it)
+                else:
+                    msgs = format_mcq_messages(it)
                 prompt_text = processor.apply_chat_template(
                     msgs, tokenize=False, add_generation_prompt=True
                 )
@@ -175,7 +180,8 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
 
     meta = {
         "model": model_id,
-        "dataset": "MM-NIAH val retrieval-image",
+        "dataset": f"MM-NIAH val {task}",
+        "task": task,
         "seed": seed,
         "n_cal_items": len(cal_items),
         "n_done": n_done,
@@ -210,7 +216,10 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="Qwen/Qwen2.5-VL-7B-Instruct")
     ap.add_argument("--seed", type=int, default=0)
-    ap.add_argument("--split_file", type=Path, default=DEFAULT_SPLIT_FILE)
+    ap.add_argument("--task", choices=SUPPORTED_TASKS, default=DEFAULT_TASK)
+    ap.add_argument("--split_file", type=Path, default=None,
+                    help="Per-task split JSON path. Defaults to "
+                         "split_file_for_task(task) with seed suffix.")
     ap.add_argument("--max_q_per_item", type=int, default=256)
     ap.add_argument("--n_outliers_top", type=int, default=16)
     ap.add_argument("--progress_every", type=int, default=5)
@@ -219,15 +228,37 @@ def main():
     ap.add_argument("--out_npz", type=Path, default=None)
     args = ap.parse_args()
     model_short = args.model.split("/")[-1]
+    if args.split_file is None:
+        base = split_file_for_task(args.task)
+        if args.task == "retrieval-image" and args.seed == 0:
+            args.split_file = base
+        else:
+            args.split_file = base.with_name(
+                f"mm_niah_{args.task}_split_seed{args.seed}.json"
+            )
     if args.out_json is None:
-        args.out_json = CALIBRATION_DIR / f"expP_mmniah_kcalib_{model_short}_seed{args.seed}.json"
+        if args.task == "retrieval-image":
+            args.out_json = CALIBRATION_DIR / (
+                f"expP_mmniah_kcalib_{model_short}_seed{args.seed}.json"
+            )
+        else:
+            args.out_json = CALIBRATION_DIR / (
+                f"expP_mmniah_kcalib_{model_short}_{args.task}_seed{args.seed}.json"
+            )
     if args.out_npz is None:
-        args.out_npz = CALIBRATION_DIR / f"expP_mmniah_kcalib_{model_short}_seed{args.seed}.npz"
+        if args.task == "retrieval-image":
+            args.out_npz = CALIBRATION_DIR / (
+                f"expP_mmniah_kcalib_{model_short}_seed{args.seed}.npz"
+            )
+        else:
+            args.out_npz = CALIBRATION_DIR / (
+                f"expP_mmniah_kcalib_{model_short}_{args.task}_seed{args.seed}.npz"
+            )
     run_calibration(
         model_id=args.model, n_outliers_top=args.n_outliers_top,
         split_file=args.split_file, out_json=args.out_json, out_npz=args.out_npz,
         seed=args.seed, max_q_per_item=args.max_q_per_item,
-        progress_every=args.progress_every, limit=args.limit,
+        progress_every=args.progress_every, limit=args.limit, task=args.task,
     )
 
 

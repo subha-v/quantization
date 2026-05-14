@@ -204,6 +204,75 @@ def s_conditions_static_baselines() -> list[CondSpec]:
     ]
 
 
+def t_conditions_main() -> list[CondSpec]:
+    """Exp T-mini main conditions T0..T16.
+
+    Identical set runs on retrieval-image (Phase 1) and reasoning-image (Phase 2).
+    All conditions are dense (no FormatBook routing). T0 is BF16 (no cache),
+    T1-T16 use PageAwareFakeQuantKVCache for per-page bit accounting.
+
+      T0  BF16 dense                                      (anchor ceiling)
+      T1  Global-F4                                       (broken 4-bit floor)
+      T2  F9 top-16 BF16 sidecode                         (strong baseline 4.75 KV bits)
+      T3  SJ top-16 INT8 sidecode                         (sidecode anchor 4.25)
+      T4  S4 top-16 INT7 sidecode                         (lowest useful 4.1875)
+      T5  TextVisualLocal-F4                              (coarse modality-local control)
+      T6  TokenBlockLocal-F4 (16 segments)                (no-page-structure control)
+      T7  RandomPageLocal-F4                              (same n_pages, shuffled boundaries)
+      T8  PageLocal-F4                                    (MAIN hypothesis)
+      T9  ImageOnlyLocal-F4                               (image-side ablation)
+      T10 TextOnlyLocal-F4                                (text-side ablation)
+      T11 PageSentinel-1 (Global-F4 base)                 (minimal image anchor)
+      T12 PageSentinel-4 (Global-F4 base)                 (stronger image anchor)
+      T13 RandomSentinel-4 (Global-F4 base)               (position-control)
+      T14 LastSentinel-4 (Global-F4 base)                 (image-end vs start)
+      T15 TextSentinel-4 (Global-F4 base)                 (text-boundary control)
+      T16 PageLocal-F4 + PageSentinel-4 (combined)        (combined method)
+    """
+    return [
+        CondSpec("T0",  None,                              RoutePolicy("none"), False),
+        CondSpec("T1",  F4,                                RoutePolicy("none"), True),
+        CondSpec("T2",  HOT,                               RoutePolicy("none"), True),
+        CondSpec("T3",  "J12_F9_INT8side",                 RoutePolicy("none"), True),
+        CondSpec("T4",  "SL_Outlier16_INT7side",           RoutePolicy("none"), True),
+        CondSpec("T5",  "F5_KIVI_TextVisualSplit",         RoutePolicy("none"), True),
+        CondSpec("T6",  "T6_TokenBlock16_F4",              RoutePolicy("none"), True),
+        CondSpec("T7",  "T7_RandomPageLocal_F4",           RoutePolicy("none"), True),
+        CondSpec("T8",  "T8_PageLocal_F4",                 RoutePolicy("none"), True),
+        CondSpec("T9",  "T9_ImageOnlyLocal_F4",            RoutePolicy("none"), True),
+        CondSpec("T10", "T10_TextOnlyLocal_F4",            RoutePolicy("none"), True),
+        CondSpec("T11", "T11_PageSentinel1_F4base",        RoutePolicy("none"), True),
+        CondSpec("T12", "T12_PageSentinel4_F4base",        RoutePolicy("none"), True),
+        CondSpec("T13", "T13_RandomSentinel4_F4base",      RoutePolicy("none"), True),
+        CondSpec("T14", "T14_LastSentinel4_F4base",        RoutePolicy("none"), True),
+        CondSpec("T15", "T15_TextSentinel4_F4base",        RoutePolicy("none"), True),
+        CondSpec("T16", "T16_PageLocal_PageSentinel4",     RoutePolicy("none"), True),
+    ]
+
+
+def c_conditions_counting() -> list[CondSpec]:
+    """Exp T-mini Phase 3 counting-image conditions C0..C12.
+
+    Counting-image needs all-retained (no sparse routing). Drops T5/T9/T10 and
+    re-orders to match the user spec.
+    """
+    return [
+        CondSpec("C0",  None,                              RoutePolicy("none"), False),
+        CondSpec("C1",  F4,                                RoutePolicy("none"), True),
+        CondSpec("C2",  HOT,                               RoutePolicy("none"), True),
+        CondSpec("C3",  "J12_F9_INT8side",                 RoutePolicy("none"), True),
+        CondSpec("C4",  "SL_Outlier16_INT7side",           RoutePolicy("none"), True),
+        CondSpec("C5",  "T6_TokenBlock16_F4",              RoutePolicy("none"), True),
+        CondSpec("C6",  "T8_PageLocal_F4",                 RoutePolicy("none"), True),
+        CondSpec("C7",  "T11_PageSentinel1_F4base",        RoutePolicy("none"), True),
+        CondSpec("C8",  "T12_PageSentinel4_F4base",        RoutePolicy("none"), True),
+        CondSpec("C9",  "T13_RandomSentinel4_F4base",      RoutePolicy("none"), True),
+        CondSpec("C10", "T14_LastSentinel4_F4base",        RoutePolicy("none"), True),
+        CondSpec("C11", "T15_TextSentinel4_F4base",        RoutePolicy("none"), True),
+        CondSpec("C12", "T16_PageLocal_PageSentinel4",     RoutePolicy("none"), True),
+    ]
+
+
 def s_conditions_sidecode_ladder() -> list[CondSpec]:
     """Exp S Phase 1 — sidecode bit-ladder on the same multi-image slice.
 
@@ -299,6 +368,67 @@ def num_layers_and_kv_heads(model) -> tuple[int, int]:
     return int(n_layers), int(n_kv)
 
 
+# ---------------- T-mini slice_info plumbing ----------------
+
+def _build_t_mini_slice_info(layout, seq_len: int, item) -> dict:
+    """Construct slice_info dict for PageLocal / PageSentinel / Random* K kinds.
+
+    Reads the PageLayout to populate:
+      - v_start, v_end:   span of the FIRST visual page (kept for F5/F6 back-compat).
+      - text_positions, visual_positions: lists of absolute prefill positions
+        partitioned by modality.
+      - role_spans:       dict {role_name -> (start, end)}; only "visual" is
+        meaningful here (best-effort role inference; full role-spans would need
+        the prompt template parser used by Exp F).
+      - page_boundaries:  list of (start, end, kind) tuples per Page.
+      - visual_token_positions_per_image: list[list[int]] — one list per visual
+        page in order (in-context first, then choice). Used by sentinel kinds.
+      - text_chunk_positions: list[list[int]] — one list per text page. Used by
+        the "first_text" sentinel.
+      - item_id: stringified item identifier; seeds per-item RNG for random
+        boundaries / random sentinel positions.
+
+    Falls back gracefully when layout is None (returns minimal slice_info with
+    seq_len only).
+    """
+    if layout is None or not layout.pages:
+        return {"seq_len": int(seq_len), "item_id": str(getattr(item, "id", ""))}
+    page_boundaries: list[tuple[int, int, str]] = []
+    visual_token_positions_per_image: list[list[int]] = []
+    text_chunk_positions: list[list[int]] = []
+    text_positions: list[int] = []
+    visual_positions: list[int] = []
+    first_visual_span: Optional[tuple[int, int]] = None
+    for p in layout.pages:
+        page_boundaries.append((int(p.start), int(p.end), str(p.kind)))
+        positions = list(range(int(p.start), int(p.end)))
+        if p.kind in ("in_context_image", "choice_image"):
+            visual_token_positions_per_image.append(positions)
+            visual_positions.extend(positions)
+            if first_visual_span is None:
+                first_visual_span = (int(p.start), int(p.end))
+        else:
+            text_chunk_positions.append(positions)
+            text_positions.extend(positions)
+    v_start, v_end = (first_visual_span if first_visual_span is not None
+                      else (-1, -1))
+    role_spans: dict[str, tuple[int, int]] = {}
+    if v_start >= 0 and v_end > v_start:
+        role_spans["visual"] = (v_start, v_end)
+    return {
+        "v_start": int(v_start),
+        "v_end": int(v_end),
+        "seq_len": int(seq_len),
+        "text_positions": text_positions,
+        "visual_positions": visual_positions,
+        "role_spans": role_spans,
+        "page_boundaries": page_boundaries,
+        "visual_token_positions_per_image": visual_token_positions_per_image,
+        "text_chunk_positions": text_chunk_positions,
+        "item_id": str(getattr(item, "id", "")),
+    }
+
+
 # ---------------- per-page format / bit accounting ----------------
 
 def _page_format_dense(k_cfg_name: Optional[str]) -> str:
@@ -338,7 +468,60 @@ _STATIC_K_BITS = {
     "SL_Outlier16_INT5side":  _k_bits_top_n_int_m(16, 5),   # 4.125
     "SL_Outlier24_INT6side":  _k_bits_top_n_int_m(24, 6),   # 4.375
     "SL_Outlier32_INT6side":  _k_bits_top_n_int_m(32, 6),   # 4.500
+    # F5 TextVisualLocal-F4 is also a true 4.00 K-bits format (text/visual
+    # scales add only metadata overhead).
+    "F5_KIVI_TextVisualSplit": 4.0,
+    # T-mini: page-aware K formats. All page-local kinds keep TRUE 4.00 K-bits;
+    # scale metadata is negligible vs cache size.
+    "T6_TokenBlock16_F4":     4.0,
+    "T7_RandomPageLocal_F4":  4.0,
+    "T8_PageLocal_F4":        4.0,
+    "T9_ImageOnlyLocal_F4":   4.0,
+    "T10_TextOnlyLocal_F4":   4.0,
+    # PageSentinel base K-bits (before adding sentinel BF16 overhead). The
+    # sentinel adjustment happens per-item in _compute_bit_metrics via
+    # _t_mini_sentinel_k_bits_adjustment().
+    "T11_PageSentinel1_F4base": 4.0,
+    "T12_PageSentinel4_F4base": 4.0,
+    "T13_RandomSentinel4_F4base": 4.0,
+    "T14_LastSentinel4_F4base": 4.0,
+    "T15_TextSentinel4_F4base": 4.0,
+    "T16_PageLocal_PageSentinel4": 4.0,
 }
+
+
+# T-mini PageSentinel cfg-name → (sentinel_kind, n_per_page). Used to compute
+# the per-item sentinel-token count for accurate bit accounting.
+_T_MINI_SENTINEL_PROPS: dict[str, tuple[str, int]] = {
+    "T11_PageSentinel1_F4base":    ("first_visual", 1),
+    "T12_PageSentinel4_F4base":    ("first_visual", 4),
+    "T13_RandomSentinel4_F4base":  ("random_visual", 4),
+    "T14_LastSentinel4_F4base":    ("last_visual", 4),
+    "T15_TextSentinel4_F4base":    ("first_text", 4),
+    "T16_PageLocal_PageSentinel4": ("first_visual", 4),
+}
+
+
+def _t_mini_sentinel_token_count(layout, cfg_name: str) -> int:
+    """Compute the number of sentinel-protected tokens for a given T-mini
+    PageSentinel cfg, using the PageLayout. Matches the resolution rules in
+    k_quantizers._resolve_sentinel_positions: ``per_image`` lists for visual
+    sentinels (clamped by min(n_per_page, page.n_tokens)) and ``per_chunk``
+    lists for first_text.
+    """
+    if layout is None or cfg_name not in _T_MINI_SENTINEL_PROPS:
+        return 0
+    kind, n_per_page = _T_MINI_SENTINEL_PROPS[cfg_name]
+    count = 0
+    if kind in ("first_visual", "last_visual", "random_visual"):
+        for p in layout.pages:
+            if p.kind in ("in_context_image", "choice_image"):
+                count += min(n_per_page, p.n_tokens)
+    elif kind == "first_text":
+        for p in layout.pages:
+            if p.kind == "text":
+                count += min(n_per_page, p.n_tokens)
+    return count
 
 
 def _page_k_bits_dense(k_cfg_name: Optional[str]) -> float:
@@ -424,7 +607,15 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
         k_bits = _page_k_bits_dense(cond.k_cfg_name)
         v_bits = _v_bits_dense(cond.k_cfg_name)
         label = _page_format_dense(cond.k_cfg_name)
-        return {
+        # T-mini sentinel overhead: PageSentinel kinds restore N positions per
+        # page to BF16. Adjust k_bits to reflect the per-item sentinel-token
+        # fraction; record diagnostics.
+        sentinel_count = _t_mini_sentinel_token_count(layout, cond.k_cfg_name or "")
+        if sentinel_count > 0 and total_tokens > 0:
+            k_bits = (
+                (total_tokens - sentinel_count) * k_bits + sentinel_count * 16.0
+            ) / total_tokens
+        row = {
             "effective_k_bits": float(k_bits),
             "effective_v_bits": float(v_bits),
             "effective_kv_bits": float((k_bits + v_bits) / 2.0),
@@ -433,6 +624,10 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
             "tokens_per_format": {label: int(total_tokens)},
             "pages_per_format": {label: int(total_pages)},
         }
+        if sentinel_count > 0:
+            row["n_sentinel_tokens"] = int(sentinel_count)
+            row["sentinel_token_fraction"] = float(sentinel_count) / float(total_tokens)
+        return row
 
     # Routed path: read cache.routing_log per layer.
     rl = getattr(cache, "routing_log", {}) or {}
@@ -504,6 +699,137 @@ def _compute_bit_metrics(layout, cache, cond: CondSpec) -> dict:
     }
 
 
+# ---------------- counting-image scoring (multi-token generation) ----------------
+
+@torch.no_grad()
+def score_item_counting(model, processor, item: MMNiahItem, cond: CondSpec,
+                        k_cfg_obj, num_layers: int, num_kv_heads: int,
+                        max_pixels_context: int,
+                        max_pixels_needle: int,
+                        include_choice_routing: bool = False,
+                        max_new_tokens: int = 96) -> dict:
+    """One forward + multi-token generation for an MM-NIAH counting-image item.
+
+    Counting-image has no MCQ choices — the model emits a JSON list of integers
+    that the parser decodes. Compared to MCQ items the page layout uses
+    n_in_context_images = num_images - 1 (haystack pages) and n_choice_images = 1
+    (the needle pattern which appears in the question, always-on).
+    """
+    from qwen_vl_utils import process_vision_info  # type: ignore
+    from mm_niah_loader import format_counting_messages
+    from counting_parser import parse_counting_output, score_counting
+
+    messages = format_counting_messages(item, max_pixels_context=max_pixels_context,
+                                        max_pixels_needle=max_pixels_needle)
+    text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+    image_inputs, video_inputs = process_vision_info(messages)
+    inputs = processor(text=[text], images=image_inputs, videos=video_inputs,
+                       padding=True, return_tensors="pt").to(model.device)
+    input_ids = inputs["input_ids"]
+    seq_len = int(input_ids.shape[1])
+
+    layout = None
+    cache = None
+    if k_cfg_obj is not None or cond.use_page_cache:
+        controller = BitController(num_layers=num_layers, num_kv_heads=num_kv_heads,
+                                   mode="V1", default_k_bits=4, default_v_bits=4)
+        if cond.use_page_cache:
+            layout = build_page_layout(
+                input_ids, processor,
+                n_in_context_images=max(0, item.num_images - 1),  # haystack pages
+                n_choice_images=1,                                # needle pattern
+                needle_idx_in_images=-1,                          # no in-context needle
+                include_choice_routing=include_choice_routing,
+            )
+            cache = PageAwareFakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
+            rng_seed = (abs(hash(f"{item.id}:{cond.name}")) % (2**31)) ^ 0xCAFEBABE
+            cache.set_page_layout(layout, rng_seed=rng_seed)
+            cache.correct_choice_idx = 0
+        else:
+            cache = FakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
+
+        slice_info = _build_t_mini_slice_info(layout, seq_len, item)
+        if hasattr(cache, "set_slice_info"):
+            cache.set_slice_info(slice_info)
+
+    t0 = time.perf_counter()
+    if cache is not None and cond.route.name != "none":
+        with page_routing_sdpa_context(cache, cond.route):
+            out = model.generate(**inputs, past_key_values=cache,
+                                 max_new_tokens=max_new_tokens,
+                                 do_sample=False, return_dict_in_generate=True,
+                                 use_cache=True)
+    elif cache is not None:
+        with page_routing_sdpa_context(cache, RoutePolicy("none")):
+            out = model.generate(**inputs, past_key_values=cache,
+                                 max_new_tokens=max_new_tokens,
+                                 do_sample=False, return_dict_in_generate=True,
+                                 use_cache=True)
+    else:
+        out = model.generate(**inputs, max_new_tokens=max_new_tokens,
+                             do_sample=False, return_dict_in_generate=True,
+                             use_cache=True)
+    latency_ms = (time.perf_counter() - t0) * 1000.0
+
+    gen_tokens = out.sequences[0, input_ids.shape[1]:]
+    output_text = processor.tokenizer.decode(gen_tokens, skip_special_tokens=True)
+    parse_res = parse_counting_output(output_text)
+    score_res = score_counting(parse_res["parsed"], item.gold_counts or [])
+
+    row: dict = {
+        "condition": cond.name,
+        "item_id": item.id,
+        "task": item.task,
+        "num_images": item.num_images,
+        "context_length_bucket": item.context_length_bucket,
+        "context_length": item.context_length,
+        "placed_depth": item.placed_depth,
+        "gold_counts": list(item.gold_counts or []),
+        "output_text": output_text,
+        "parsed": parse_res["parsed"],
+        "valid_format": parse_res["valid_format"],
+        "predicted_length": parse_res["predicted_length"],
+        "exact_match": score_res["exact_match"],
+        "is_correct": score_res["exact_match"],
+        "length_match": score_res["length_match"],
+        "soft_accuracy": score_res["soft_accuracy"],
+        "pred_sum": score_res["pred_sum"],
+        "gold_sum": score_res["gold_sum"],
+        "sum_match": score_res["sum_match"],
+        "missing_format": score_res["missing_format"],
+        "seq_len": seq_len,
+        "latency_ms": latency_ms,
+        "route_policy": cond.route.name,
+        "route_budget": cond.route.budget_fraction,
+        "cold_quantizer": cond.route.cold_quantizer,
+        "cold_v_quantizer": cond.route.cold_v_quantizer,
+        "token_budgeted": cond.route.token_budgeted,
+        "include_choice_routing": include_choice_routing,
+        "k_cfg": cond.k_cfg_name,
+    }
+
+    if layout is not None:
+        row["n_pages"] = layout.n_pages
+        row["n_in_context_images"] = layout.n_in_context_images
+        row["n_choice_images"] = layout.n_choice_images
+        bits_row = _compute_bit_metrics(layout, cache, cond)
+        row.update(bits_row)
+    else:
+        # Dense BF16 (C0) — single static bit value.
+        k_bits = _page_k_bits_dense(cond.k_cfg_name)
+        v_bits = _v_bits_dense(cond.k_cfg_name)
+        label = _page_format_dense(cond.k_cfg_name)
+        row.update({
+            "effective_k_bits": float(k_bits),
+            "effective_v_bits": float(v_bits),
+            "effective_kv_bits": float((k_bits + v_bits) / 2.0),
+            "f9_sidecode_token_fraction": (1.0 if label == "F9" else 0.0),
+            "f9_sidecode_page_fraction": (1.0 if label == "F9" else 0.0),
+        })
+
+    return row
+
+
 # ---------------- per-item scoring ----------------
 
 @torch.no_grad()
@@ -512,13 +838,26 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
                answer_ids: list[int],
                max_pixels_context: int,
                max_pixels_choices: int,
-               include_choice_routing: bool = False) -> dict:
+               include_choice_routing: bool = False,
+               max_new_tokens_counting: int = 96) -> dict:
     """One forward, one condition, one item. Returns a JSONL-ready dict.
+
+    Dispatches on item.task:
+      - retrieval-image / reasoning-image: MCQ first-token logit scoring (existing path)
+      - counting-image: multi-token generation + list-output parsing (T-mini Phase 3)
 
     include_choice_routing (Exp R AllVisual): when True, choice-image pages
     are flagged is_routable=True in the layout so Quest/Random/Oracle
     FormatBook can route them. Default False preserves Exp Q behavior.
     """
+    if item.task == "counting-image":
+        return score_item_counting(model, processor, item, cond, k_cfg_obj,
+                                   num_layers, num_kv_heads,
+                                   max_pixels_context=max_pixels_context,
+                                   max_pixels_needle=max_pixels_choices,
+                                   include_choice_routing=include_choice_routing,
+                                   max_new_tokens=max_new_tokens_counting)
+
     from qwen_vl_utils import process_vision_info  # type: ignore
 
     messages = format_mcq_messages(item, max_pixels_context=max_pixels_context,
@@ -551,6 +890,14 @@ def score_item(model, processor, item: MMNiahItem, cond: CondSpec,
             cache.correct_choice_idx = int(item.correct_choice)
         else:
             cache = FakeQuantKVCache(controller, k_quantizer_config=k_cfg_obj)
+
+        # T-mini: plumb page-aware slice_info into the cache for PageLocal /
+        # PageSentinel / Random* kinds. Reuses existing F5/F6 plumbing pattern
+        # (cache.set_slice_info) — backward-compatible because non-T-mini kinds
+        # simply ignore the new fields.
+        slice_info = _build_t_mini_slice_info(layout, seq_len, item)
+        if hasattr(cache, "set_slice_info"):
+            cache.set_slice_info(slice_info)
 
     t0 = time.perf_counter()
     if cache is not None and cond.route.name != "none":
@@ -711,7 +1058,8 @@ def run_condition_on_items(model, processor, items: list[MMNiahItem],
                            progress_every: int = 10, summary_every: int = 25,
                            summary_callback=None,
                            skip_ids: Optional[set] = None,
-                           include_choice_routing: bool = False) -> None:
+                           include_choice_routing: bool = False,
+                           max_new_tokens_counting: int = 96) -> None:
     skip_ids = skip_ids or set()
     n = len(items)
     n_done = 0
@@ -728,7 +1076,8 @@ def run_condition_on_items(model, processor, items: list[MMNiahItem],
                                  answer_ids=answer_ids,
                                  max_pixels_context=max_pixels_context,
                                  max_pixels_choices=max_pixels_choices,
-                                 include_choice_routing=include_choice_routing)
+                                 include_choice_routing=include_choice_routing,
+                                 max_new_tokens_counting=max_new_tokens_counting)
             except torch.cuda.OutOfMemoryError:
                 _append_progress(progress_log,
                                  f"WARN [{cond.name}] OOM on item {it.id} "
@@ -802,7 +1151,10 @@ def _default_calib_npz(task: str, seed: int = 0) -> Path:
             return CALIBRATION_DIR / "expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0.npz"
         # Exp R seed=1 calibration on the new seed=1 cal split.
         return CALIBRATION_DIR / f"expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed{seed}.npz"
-    return CALIBRATION_DIR / f"expQ_mmniah_{task}_kcalib_Qwen2.5-VL-7B-Instruct_seed{seed}.npz"
+    # T-mini Phase 2/3: per-task NPZ named with the task slug.
+    return CALIBRATION_DIR / (
+        f"expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_{task}_seed{seed}.npz"
+    )
 
 
 def _default_split_path(task: str, seed: int = 0) -> Path:
@@ -849,6 +1201,15 @@ def main():
     # Exp S flags
     ap.add_argument("--exp-s-ladder", action="store_true",
                     help="Exp S Phase 1: sidecode bit-ladder S0..S9 (no AllVisual).")
+    # Exp T-mini flags
+    ap.add_argument("--exp-t-mini", action="store_true",
+                    help="Exp T-mini Phase 1/2: T0..T16 page-aware K formats on "
+                         "retrieval-image / reasoning-image.")
+    ap.add_argument("--exp-t-mini-counting", action="store_true",
+                    help="Exp T-mini Phase 3: C0..C12 page-aware K formats on "
+                         "counting-image (multi-token generation + list-output parsing).")
+    ap.add_argument("--max-new-tokens-counting", type=int, default=96,
+                    help="max_new_tokens for counting-image generation (default 96).")
     ap.add_argument("--no-resume", action="store_true",
                     help="Re-run items already in the JSONL.")
     ap.add_argument("--split-path", type=Path, default=None,
@@ -866,7 +1227,14 @@ def main():
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
 
-    slice_tag = "A" if args.task == "retrieval-image" else "B"
+    if args.task == "retrieval-image":
+        slice_tag = "A"
+    elif args.task == "reasoning-image":
+        slice_tag = "B"
+    elif args.task == "counting-image":
+        slice_tag = "Count"
+    else:
+        slice_tag = args.task
     if args.out_jsonl is None:
         args.out_jsonl = RESULTS_DIR / f"expQ_rollouts_slice{slice_tag}.jsonl"
     if args.out_summary is None:
@@ -931,7 +1299,13 @@ def main():
               flush=True)
 
     # Build conditions
-    if args.exp_s_ladder:
+    if args.exp_t_mini_counting:
+        # Exp T-mini Phase 3: counting-image C0..C12.
+        primary = c_conditions_counting()
+    elif args.exp_t_mini:
+        # Exp T-mini Phase 1/2: T0..T16 on retrieval-image or reasoning-image.
+        primary = t_conditions_main()
+    elif args.exp_s_ladder:
         # Exp S Phase 1: sidecode bit-ladder S0..S9.
         primary = s_conditions_sidecode_ladder()
     elif args.exp_r_c:
@@ -942,8 +1316,10 @@ def main():
         primary = e_conditions_cold_ladder(args.exp_r_e_best_route)
     elif args.task == "retrieval-image":
         primary = q_conditions_slice_a(include_int2=args.include_int2_stretch)
-    else:
+    elif args.task == "reasoning-image":
         primary = r_conditions_slice_b()
+    else:
+        primary = q_conditions_slice_a(include_int2=False)
     all_conds = primary
     if args.include_reseed:
         all_conds = all_conds + q_conditions_reseed()
@@ -991,6 +1367,7 @@ def main():
             max_pixels_choices=args.max_pixels_choices,
             summary_callback=summary_cb, skip_ids=skip,
             include_choice_routing=args.include_choice_routing,
+            max_new_tokens_counting=args.max_new_tokens_counting,
         )
     total_wall = time.perf_counter() - t_overall
     _append_progress(progress_log, f"=== overall wall={timedelta(seconds=int(total_wall))} ===")
