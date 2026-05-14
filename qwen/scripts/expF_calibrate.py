@@ -59,6 +59,13 @@ class KStatsCache(DynamicCache):
 
     On update() we sum K**2 and track running max(|K|) across (item, t)
     before delegating to DynamicCache.update().
+
+    Modality-split mode (T-mini extension): when set_item_context() is called
+    with text_positions / visual_positions before each item, we ALSO accumulate
+    k_sumsq_text and k_sumsq_visual separately, plus their per-layer counts.
+    These let downstream code compute k_channel_energy_text and
+    k_channel_energy_visual and the TT/TV/VT/VV cross-modal scoring scores
+    that the LongVideoBench Exp J calibration captured.
     """
 
     def __init__(self, num_layers: int, num_kv_heads: int, head_dim: int):
@@ -70,11 +77,35 @@ class KStatsCache(DynamicCache):
         self.k_sumsq = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
         self.k_count = torch.zeros(num_layers, dtype=torch.int64)
         self.k_max = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
+        # Modality-split accumulators (lazy; only allocated when split is enabled)
+        self.split_enabled = False
+        self.k_sumsq_text = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
+        self.k_sumsq_visual = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
+        self.k_count_text = torch.zeros(num_layers, dtype=torch.int64)
+        self.k_count_visual = torch.zeros(num_layers, dtype=torch.int64)
+        # Per-item slice info (absolute positions)
+        self._text_positions: torch.Tensor = torch.empty(0, dtype=torch.long)
+        self._visual_positions: torch.Tensor = torch.empty(0, dtype=torch.long)
+
+    def set_item_context(self, text_positions: list[int],
+                         visual_positions: list[int]) -> None:
+        """Enable modality-split K accumulation for the upcoming forward pass.
+
+        Pass lists of absolute prefill positions (typically derived from a
+        PageLayout). Resets per-item state; safe to call before each
+        model.generate() call.
+        """
+        self.split_enabled = True
+        self._text_positions = torch.tensor(sorted(set(int(p) for p in text_positions)),
+                                            dtype=torch.long)
+        self._visual_positions = torch.tensor(sorted(set(int(p) for p in visual_positions)),
+                                              dtype=torch.long)
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         # K shape: [B, H_kv, T, D]
         with torch.no_grad():
             B, H, T, D = key_states.shape
+            cache_offset = self.get_seq_length(layer_idx)
             # Sum-of-squares and max-abs over (B, T)
             kf = key_states.float()
             sumsq = (kf * kf).sum(dim=(0, 2)).cpu()  # [H, D]
@@ -82,6 +113,25 @@ class KStatsCache(DynamicCache):
             self.k_sumsq[layer_idx] += sumsq
             self.k_count[layer_idx] += int(B * T)
             self.k_max[layer_idx] = torch.maximum(self.k_max[layer_idx], mx)
+
+            if self.split_enabled and (self._text_positions.numel()
+                                       + self._visual_positions.numel()) > 0:
+                # Map absolute positions -> chunk-local indices in [0, T).
+                lo, hi = cache_offset, cache_offset + T
+                abs_text = self._text_positions
+                abs_vis = self._visual_positions
+                mask_text = (abs_text >= lo) & (abs_text < hi)
+                mask_vis = (abs_vis >= lo) & (abs_vis < hi)
+                text_local = (abs_text[mask_text] - lo)
+                vis_local = (abs_vis[mask_vis] - lo)
+                if text_local.numel() > 0:
+                    K_text = kf[:, :, text_local, :]
+                    self.k_sumsq_text[layer_idx] += (K_text * K_text).sum(dim=(0, 2)).cpu()
+                    self.k_count_text[layer_idx] += int(B * text_local.numel())
+                if vis_local.numel() > 0:
+                    K_vis = kf[:, :, vis_local, :]
+                    self.k_sumsq_visual[layer_idx] += (K_vis * K_vis).sum(dim=(0, 2)).cpu()
+                    self.k_count_visual[layer_idx] += int(B * vis_local.numel())
         return super().update(key_states, value_states, layer_idx, cache_kwargs)
 
 

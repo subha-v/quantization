@@ -38,7 +38,7 @@ from mm_niah_loader import (
     filter_items, format_counting_messages, format_mcq_messages,
     load_all_items, load_split, make_split, save_split, split_file_for_task,
 )
-from page_layout import find_all_visual_spans
+from page_layout import build_page_layout, find_all_visual_spans
 
 
 CALIBRATION_DIR = Path(__file__).resolve().parents[1] / "calibration"
@@ -113,6 +113,11 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
     k_sumsq_total = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
     k_count_total = torch.zeros(num_layers, dtype=torch.int64)
     k_max_total = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
+    # Modality-split accumulators (T-mini extension)
+    k_sumsq_text_total = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
+    k_sumsq_vis_total = torch.zeros(num_layers, num_kv_heads, head_dim, dtype=torch.float32)
+    k_count_text_total = torch.zeros(num_layers, dtype=torch.int64)
+    k_count_vis_total = torch.zeros(num_layers, dtype=torch.int64)
 
     n_done, n_failed = 0, 0
     try:
@@ -132,8 +137,41 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
                 v_start, v_end = _mmniah_visual_envelope(inputs["input_ids"], processor)
                 q_hook.set_item_context(v_start, v_end)
 
+                # Build per-item text/visual position lists from the page layout.
+                # For counting-image the needle pattern image lives in the question
+                # (positioned LAST in the visual span order), so we treat it as a
+                # choice page (always-on, never routable).
+                if task == "counting-image":
+                    n_in_ctx = max(0, it.num_images - 1)
+                    n_choice = 1
+                else:
+                    n_in_ctx = it.num_images
+                    n_choice = (it.num_choices if it.num_choices else 4)
+                try:
+                    layout = build_page_layout(
+                        inputs["input_ids"], processor,
+                        n_in_context_images=n_in_ctx, n_choice_images=n_choice,
+                        needle_idx_in_images=(it.needle_idx_in_images
+                                              if task != "counting-image" else -1),
+                        include_choice_routing=False,
+                    )
+                    text_positions: list[int] = []
+                    visual_positions: list[int] = []
+                    for p in layout.pages:
+                        positions = list(range(int(p.start), int(p.end)))
+                        if p.kind in ("in_context_image", "choice_image"):
+                            visual_positions.extend(positions)
+                        else:
+                            text_positions.extend(positions)
+                except Exception as e:
+                    _log(f"WARN item={it.id} layout failed: {type(e).__name__}: {e};"
+                         f" skipping modality split for this item")
+                    text_positions, visual_positions = [], []
+
                 cache = KStatsCache(num_layers=num_layers, num_kv_heads=num_kv_heads,
                                     head_dim=head_dim)
+                if text_positions or visual_positions:
+                    cache.set_item_context(text_positions, visual_positions)
                 _ = model.generate(**inputs, past_key_values=cache,
                                    max_new_tokens=1, do_sample=False,
                                    return_dict_in_generate=True, output_scores=True,
@@ -141,6 +179,11 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
                 k_sumsq_total += cache.k_sumsq
                 k_count_total += cache.k_count
                 k_max_total = torch.maximum(k_max_total, cache.k_max)
+                if cache.split_enabled:
+                    k_sumsq_text_total += cache.k_sumsq_text
+                    k_sumsq_vis_total += cache.k_sumsq_visual
+                    k_count_text_total += cache.k_count_text
+                    k_count_vis_total += cache.k_count_visual
 
                 n_done += 1
                 if torch.cuda.is_available():
@@ -169,6 +212,19 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
     k_channel_energy_np = k_channel_energy.numpy().astype(np.float32)
     k_max_np = k_max_total.numpy().astype(np.float32)
 
+    # Modality-split K energy (T-mini): E[K_d^2 | position in text/visual]
+    k_ce_text = torch.zeros_like(k_sumsq_text_total)
+    k_ce_vis = torch.zeros_like(k_sumsq_vis_total)
+    for L in range(num_layers):
+        ct = float(k_count_text_total[L].item())
+        cv = float(k_count_vis_total[L].item())
+        if ct > 0:
+            k_ce_text[L] = k_sumsq_text_total[L] / ct
+        if cv > 0:
+            k_ce_vis[L] = k_sumsq_vis_total[L] / cv
+    k_ce_text_np = k_ce_text.numpy().astype(np.float32)
+    k_ce_vis_np = k_ce_vis.numpy().astype(np.float32)
+
     n_top = int(n_outliers_top)
     outlier_idx = np.argsort(k_channel_energy_np, axis=-1)[..., -n_top:][..., ::-1].copy()
     outlier_idx = outlier_idx.astype(np.int32)
@@ -177,6 +233,19 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
     q_data["q_energy"] = np.clip(q_data["q_energy"], 1e-12, None).astype(np.float32)
     q_data["q_energy_text"] = np.clip(q_data["q_energy_text"], 1e-12, None).astype(np.float32)
     q_data["q_energy_visual"] = np.clip(q_data["q_energy_visual"], 1e-12, None).astype(np.float32)
+
+    # Cross-modal outlier rankings: score_XY[d] = E[Q_X_d^2] * E[K_Y_d^2]
+    # X = query modality (T or V); Y = key modality (T or V).
+    # Top-N channels by each scheme give the four outlier_idx_XY_top16 arrays.
+    def _topn(score: np.ndarray, n: int) -> np.ndarray:
+        return np.argsort(score, axis=-1)[..., -n:][..., ::-1].copy().astype(np.int32)
+    qet = q_data["q_energy_text"]; qev = q_data["q_energy_visual"]
+    has_split = (k_count_text_total.sum().item() > 0
+                 and k_count_vis_total.sum().item() > 0)
+    outlier_idx_TT = _topn(qet * k_ce_text_np, n_top) if has_split else None
+    outlier_idx_TV = _topn(qet * k_ce_vis_np, n_top) if has_split else None
+    outlier_idx_VT = _topn(qev * k_ce_text_np, n_top) if has_split else None
+    outlier_idx_VV = _topn(qev * k_ce_vis_np, n_top) if has_split else None
 
     meta = {
         "model": model_id,
@@ -197,8 +266,7 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
     }
     out_json.parent.mkdir(parents=True, exist_ok=True)
     out_json.write_text(json.dumps(meta, indent=2))
-    np.savez_compressed(
-        out_npz,
+    save_kwargs = dict(
         k_channel_energy=k_channel_energy_np,
         k_abs_max=k_max_np,
         outlier_channel_idx_top16=outlier_idx,
@@ -209,6 +277,18 @@ def run_calibration(model_id: str, n_outliers_top: int, split_file: Path,
         q_count_text=q_data["q_count_text"],
         q_count_visual=q_data["q_count_visual"],
     )
+    if has_split:
+        save_kwargs.update(
+            k_channel_energy_text=k_ce_text_np,
+            k_channel_energy_visual=k_ce_vis_np,
+            k_count_text=k_count_text_total.numpy().astype(np.int64),
+            k_count_visual=k_count_vis_total.numpy().astype(np.int64),
+            outlier_idx_TT_top16=outlier_idx_TT,
+            outlier_idx_TV_top16=outlier_idx_TV,
+            outlier_idx_VT_top16=outlier_idx_VT,
+            outlier_idx_VV_top16=outlier_idx_VV,
+        )
+    np.savez_compressed(out_npz, **save_kwargs)
     _log(f"DONE wrote meta -> {out_json} arrays -> {out_npz}")
 
 
