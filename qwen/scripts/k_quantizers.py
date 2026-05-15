@@ -1643,4 +1643,46 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
                          outlier_storage_bits=7,
                          outlier_idx_extra_key="outlier_idx_EXTRA_ALL_16",
                          outlier_idx_extra_n=16),
+        # ============================================================
+        # Exp V: confirmation + budget-ladder additions.
+        # Three deterministically-seeded RND8 variants for robust paired-vs-random,
+        # plus a BAL budget ladder (4/12/16 residual channels at per_block=1/3/4)
+        # to test whether 8 is genuinely the sweet spot.
+        # ============================================================
+        # RND8 with seeds 0/1/2 (separate KQuantizerConfigs, each reads its own
+        # precomputed array from the extras NPZ).
+        KQuantizerConfig(name="V5_S4_plus_RND8_INT7_s0", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_RND_8_s0",
+                         outlier_idx_extra_n=8),
+        KQuantizerConfig(name="V6_S4_plus_RND8_INT7_s1", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_RND_8_s1",
+                         outlier_idx_extra_n=8),
+        KQuantizerConfig(name="V7_S4_plus_RND8_INT7_s2", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_RND_8_s2",
+                         outlier_idx_extra_n=8),
+        # BAL ladder. K-bits at INT7 sidecode + INT4 base:
+        #   V15 BAL4  → 20 INT7 + 108 INT4 → K = 4.46875, KV = 4.234375
+        #   V16 BAL12 → 28 INT7 + 100 INT4 → K = 4.65625, KV = 4.328125
+        #   V17 BAL16 → 32 INT7 +  96 INT4 → K = 4.75000, KV = 4.375000
+        KQuantizerConfig(name="V15_S4_plus_BAL4_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=20, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_BAL_4",
+                         outlier_idx_extra_n=4),
+        KQuantizerConfig(name="V16_S4_plus_BAL12_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=28, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_BAL_12",
+                         outlier_idx_extra_n=12),
+        KQuantizerConfig(name="V17_S4_plus_BAL16_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=32, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_BAL_16",
+                         outlier_idx_extra_n=16),
     ]

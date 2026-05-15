@@ -66,6 +66,20 @@ EXTRA_KEYS_8 = (
 )
 EXTRA_KEY_16 = "outlier_idx_EXTRA_ALL_16"
 
+# Exp V additions:
+# - Three deterministically-seeded RND arrays for robust paired-against-random test.
+# - BAL budget ladder (per-block = 1/3/4 giving 4/12/16 residual channels).
+EXTRA_RND_SEED_KEYS = {
+    0: "outlier_idx_EXTRA_RND_8_s0",
+    1: "outlier_idx_EXTRA_RND_8_s1",
+    2: "outlier_idx_EXTRA_RND_8_s2",
+}
+EXTRA_BAL_LADDER = {
+    4:  ("outlier_idx_EXTRA_BAL_4",  1),   # per_block=1, total=4
+    12: ("outlier_idx_EXTRA_BAL_12", 3),
+    16: ("outlier_idx_EXTRA_BAL_16", 4),
+}
+
 
 # ----------------------------- core helpers -----------------------------
 
@@ -159,26 +173,84 @@ def _residual_balanced_8(block_scores: dict, banned: np.ndarray) -> np.ndarray:
     return out
 
 
-def _residual_random_8(L: int, H_kv: int, D: int, banned: np.ndarray,
-                       seed: int = 2026) -> np.ndarray:
-    """Per (L, H_kv), pick 8 random channel ids uniformly from D \\ banned.
+def _residual_random_n(L: int, H_kv: int, D: int, banned: np.ndarray,
+                       n: int = 8, seed: int = 2026) -> np.ndarray:
+    """Per (L, H_kv), pick n random channel ids uniformly from D \\ banned.
     Seeded deterministically for reproducibility across runs.
     """
     rng = np.random.default_rng(seed)
-    out = np.full((L, H_kv, 8), -1, dtype=np.int32)
+    out = np.full((L, H_kv, n), -1, dtype=np.int32)
     all_ids = np.arange(D, dtype=np.int32)
     for l in range(L):
         for h in range(H_kv):
             bset = set(int(x) for x in banned[l, h].tolist())
             pool = np.array([c for c in all_ids if int(c) not in bset], dtype=np.int32)
-            if pool.size < 8:
+            if pool.size < n:
                 raise RuntimeError(
-                    f"_residual_random_8: cell (L={l}, H={h}) pool size {pool.size} "
-                    f"< 8."
+                    f"_residual_random_n: cell (L={l}, H={h}) pool size {pool.size} "
+                    f"< {n}."
                 )
-            sel = rng.choice(pool, size=8, replace=False)
+            sel = rng.choice(pool, size=n, replace=False)
             out[l, h] = sel.astype(np.int32)
     return out
+
+
+# Backwards-compat alias for code outside this file.
+_residual_random_8 = _residual_random_n
+
+
+def _residual_balanced_n(block_scores: dict, banned: np.ndarray,
+                         n_total: int, per_block: int) -> np.ndarray:
+    """Balanced per_block-from-each residual pick. Takes top-`per_block` from each
+    of TT/TV/VT/VV that are not in banned and not already picked, then pads with
+    composite (TT+TV+VT+VV) descending order until n_total channels are chosen.
+
+    With per_block * 4 >= n_total, padding is rarely needed; with
+    per_block * 4 < n_total, composite padding kicks in.
+    """
+    keys = ("TT", "TV", "VT", "VV")
+    L, H_kv, D = block_scores[keys[0]].shape
+    composite = sum(block_scores[k] for k in keys)
+    comp_order = np.argsort(composite, axis=-1)[..., ::-1]
+    block_orders = {k: np.argsort(block_scores[k], axis=-1)[..., ::-1] for k in keys}
+    out = np.full((L, H_kv, n_total), -1, dtype=np.int32)
+    for l in range(L):
+        for h in range(H_kv):
+            bset = set(int(x) for x in banned[l, h].tolist())
+            seen: set[int] = set()
+            picked: list[int] = []
+            for k in keys:
+                got = 0
+                for c in block_orders[k][l, h].tolist():
+                    if got >= per_block or len(picked) >= n_total:
+                        break
+                    c = int(c)
+                    if c in bset or c in seen:
+                        continue
+                    seen.add(c)
+                    picked.append(c)
+                    got += 1
+            # Pad with composite descending.
+            for c in comp_order[l, h].tolist():
+                if len(picked) >= n_total:
+                    break
+                c = int(c)
+                if c in bset or c in seen:
+                    continue
+                seen.add(c)
+                picked.append(c)
+            if len(picked) < n_total:
+                raise RuntimeError(
+                    f"_residual_balanced_n: cell (L={l}, H={h}) only found "
+                    f"{len(picked)} residual channels (need {n_total})."
+                )
+            out[l, h] = np.array(picked[:n_total], dtype=np.int32)
+    return out
+
+
+def _residual_balanced_8(block_scores, banned):
+    # Backwards-compat alias (per_block=2 for n=8).
+    return _residual_balanced_n(block_scores, banned, n_total=8, per_block=2)
 
 
 # ----------------------------- block scoring -----------------------------
@@ -268,13 +340,19 @@ def compute_extras(
     # GEN = top-8 by k_channel_energy not in S4 (residual to S4 — these are
     # channels 17..24 by generic ranking).
     out["outlier_idx_EXTRA_GEN_8"] = _residual_topn(energy_full, s4, 8)
-    # RND = random-8 from D \ S4 (seed=2026).
-    out["outlier_idx_EXTRA_RND_8"] = _residual_random_8(L, H_kv, D, s4, seed=2026)
+    # RND = random-8 from D \ S4 (seed=2026 keeps U1 back-compat).
+    out["outlier_idx_EXTRA_RND_8"] = _residual_random_n(L, H_kv, D, s4, n=8, seed=2026)
+    # Exp V: 3 deterministically-seeded RND arrays for robust paired-vs-random.
+    for s, key in EXTRA_RND_SEED_KEYS.items():
+        out[key] = _residual_random_n(L, H_kv, D, s4, n=8, seed=s)
     # Per-modality-block top-8 residuals.
     for k in ("TT", "TV", "VT", "VV"):
         out[f"outlier_idx_EXTRA_{k}_8"] = _residual_topn(block[k], s4, 8)
-    # Balanced 2/block.
+    # Balanced 2/block (n=8) — U1 baseline.
     out["outlier_idx_EXTRA_BAL_8"] = _residual_balanced_8(block, s4)
+    # Exp V BAL ladder: 1/block (n=4), 3/block (n=12), 4/block (n=16).
+    for n_total, (key, per_block) in EXTRA_BAL_LADDER.items():
+        out[key] = _residual_balanced_n(block, s4, n_total=n_total, per_block=per_block)
     # Composite top-16 (used for U13 ALL-16 extra at 4.375 KV bits).
     out[EXTRA_KEY_16] = _residual_topn(composite, s4, 16)
     # Cross-dataset priors. The prior arrays are averaged composite scores

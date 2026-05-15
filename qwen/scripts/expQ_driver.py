@@ -321,6 +321,58 @@ def u_conditions_residual_screen() -> list[CondSpec]:
     ]
 
 
+def v_conditions_residual_screen() -> list[CondSpec]:
+    """Exp V1 — full-pool confirmation + budget-ladder residual screen.
+
+    Builds on Exp U1's S4-anchored residual extras family. The U1 result was
+    paired-significant over S4 but only directional over F9 at n=84; Exp V
+    runs the full retrieval-image pool (n≈261) to push the F9 comparison
+    toward paired significance. Adds three deterministically-seeded RND
+    variants (V5/V6/V7) for robust paired-vs-random testing, and a BAL
+    budget ladder (V15/V16/V17 at 4/12/16 residual channels) to confirm
+    that 8 extras is the sweet spot.
+
+      V0   BF16 ceiling                              16.000 KV bits
+      V1   F4 floor                                   4.000
+      V2   F9 (top-16 BF16 sidecode)                  4.750
+      V3   S4 (top-16 INT7 sidecode) — anchor         4.188
+      V4   S4 + GEN extra-8 INT7                      4.281
+      V5   S4 + RND extra-8 INT7 (seed 0)             4.281
+      V6   S4 + RND extra-8 INT7 (seed 1)             4.281
+      V7   S4 + RND extra-8 INT7 (seed 2)             4.281
+      V8   S4 + TT extra-8 INT7                       4.281
+      V9   S4 + TV extra-8 INT7                       4.281
+      V10  S4 + VT extra-8 INT7                       4.281
+      V11  S4 + BAL extra-8 INT7 (U10 replication)    4.281
+      V12  S4 + MMNIAH-prior extra-8 INT7             4.281
+      V13  S4 + LVB-prior extra-8 INT7                4.281
+      V14  S4 + ALL-16 composite extra INT7           4.375
+      V15  S4 + BAL extra-4  (per_block=1)            4.234
+      V16  S4 + BAL extra-12 (per_block=3)            4.328
+      V17  S4 + BAL extra-16 (per_block=4)            4.375
+    """
+    return [
+        CondSpec("V0",  None,                              RoutePolicy("none"), False),
+        CondSpec("V1",  F4,                                RoutePolicy("none"), True),
+        CondSpec("V2",  "F9_KIVI_Outlier16",               RoutePolicy("none"), True),
+        CondSpec("V3",  "SL_Outlier16_INT7side",           RoutePolicy("none"), True),
+        CondSpec("V4",  "U4_S4_plus_GEN8_INT7",            RoutePolicy("none"), True),
+        CondSpec("V5",  "V5_S4_plus_RND8_INT7_s0",         RoutePolicy("none"), True),
+        CondSpec("V6",  "V6_S4_plus_RND8_INT7_s1",         RoutePolicy("none"), True),
+        CondSpec("V7",  "V7_S4_plus_RND8_INT7_s2",         RoutePolicy("none"), True),
+        CondSpec("V8",  "U6_S4_plus_TT8_INT7",             RoutePolicy("none"), True),
+        CondSpec("V9",  "U7_S4_plus_TV8_INT7",             RoutePolicy("none"), True),
+        CondSpec("V10", "U8_S4_plus_VT8_INT7",             RoutePolicy("none"), True),
+        CondSpec("V11", "U10_S4_plus_BAL8_INT7",           RoutePolicy("none"), True),
+        CondSpec("V12", "U11_S4_plus_MMNIAH8_INT7",        RoutePolicy("none"), True),
+        CondSpec("V13", "U12_S4_plus_LVB8_INT7",           RoutePolicy("none"), True),
+        CondSpec("V14", "U13_S4_plus_ALL16_INT7",          RoutePolicy("none"), True),
+        CondSpec("V15", "V15_S4_plus_BAL4_INT7",           RoutePolicy("none"), True),
+        CondSpec("V16", "V16_S4_plus_BAL12_INT7",          RoutePolicy("none"), True),
+        CondSpec("V17", "V17_S4_plus_BAL16_INT7",          RoutePolicy("none"), True),
+    ]
+
+
 def s_conditions_sidecode_ladder() -> list[CondSpec]:
     """Exp S Phase 1 — sidecode bit-ladder on the same multi-image slice.
 
@@ -527,6 +579,14 @@ _STATIC_K_BITS = {
     "U11_S4_plus_MMNIAH8_INT7": _k_bits_top_n_int_m(24, 7),  # 4.5625
     "U12_S4_plus_LVB8_INT7":    _k_bits_top_n_int_m(24, 7),  # 4.5625
     "U13_S4_plus_ALL16_INT7":   _k_bits_top_n_int_m(32, 7),  # 4.750
+    # Exp V additions — RND seed variants share U-family bits (24·INT7).
+    "V5_S4_plus_RND8_INT7_s0":  _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "V6_S4_plus_RND8_INT7_s1":  _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "V7_S4_plus_RND8_INT7_s2":  _k_bits_top_n_int_m(24, 7),  # 4.5625
+    # BAL budget ladder.
+    "V15_S4_plus_BAL4_INT7":    _k_bits_top_n_int_m(20, 7),  # 4.46875 → KV 4.234375
+    "V16_S4_plus_BAL12_INT7":   _k_bits_top_n_int_m(28, 7),  # 4.65625 → KV 4.328125
+    "V17_S4_plus_BAL16_INT7":   _k_bits_top_n_int_m(32, 7),  # 4.75000 → KV 4.375000
     # F5 TextVisualLocal-F4 is also a true 4.00 K-bits format (text/visual
     # scales add only metadata overhead).
     "F5_KIVI_TextVisualSplit": 4.0,
@@ -1274,6 +1334,12 @@ def main():
     ap.add_argument("--extras-npz", type=Path, default=None,
                     help="Override the auto-derived expU_extras NPZ path. "
                          "Default: <calib-npz-stem>_expU_extras.npz")
+    # Exp V flags
+    ap.add_argument("--exp-v", action="store_true",
+                    help="Exp V1: full-pool confirmation + budget-ladder residual "
+                         "screen V0..V17 (18 conditions). Requires the same extras "
+                         "NPZ as --exp-u (extended with BAL{4,12,16} and RND seed "
+                         "variants by expU_compute_extras.py).")
     # Exp T-mini flags
     ap.add_argument("--exp-t-mini", action="store_true",
                     help="Exp T-mini Phase 1/2: T0..T16 page-aware K formats on "
@@ -1368,9 +1434,9 @@ def main():
             print(f"  derived outlier_channel_idx_top32 from k_channel_energy "
                   f"(shape {top32.shape})", flush=True)
         print(f"loaded calibration {args.calib_npz} ({len(calib)} keys)", flush=True)
-        # Exp U: merge sibling expU_extras NPZ if --exp-u is on (or if the
-        # extras NPZ exists next to the calib NPZ — harmless if not used).
-        if args.exp_u or args.extras_npz is not None:
+        # Exp U/V: merge sibling expU_extras NPZ if --exp-u/--exp-v is on (or if
+        # the extras NPZ path was supplied explicitly).
+        if args.exp_u or args.exp_v or args.extras_npz is not None:
             extras_path = args.extras_npz
             if extras_path is None:
                 extras_path = args.calib_npz.with_name(
@@ -1390,7 +1456,9 @@ def main():
               flush=True)
 
     # Build conditions
-    if args.exp_u:
+    if args.exp_v:
+        primary = v_conditions_residual_screen()
+    elif args.exp_u:
         primary = u_conditions_residual_screen()
     elif args.exp_t_mini_counting:
         # Exp T-mini Phase 3: counting-image C0..C12.

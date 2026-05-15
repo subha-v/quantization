@@ -199,6 +199,13 @@ def slice_cond_order(slice_tag: str) -> list[str]:
         return ["U0", "U1", "U2", "U3", "U4", "U5",
                 "U6", "U7", "U8", "U9", "U10",
                 "U11", "U12", "U13"]
+    if slice_tag == "V":
+        # Exp V1 full-pool confirmation + budget-ladder.
+        return ["V0", "V1", "V2", "V3", "V4",
+                "V5", "V6", "V7",
+                "V8", "V9", "V10", "V11",
+                "V12", "V13", "V14",
+                "V15", "V16", "V17"]
     return []
 
 
@@ -431,6 +438,67 @@ def pairs_slice_u() -> list[tuple[str, str, str]]:
     ]
 
 
+def pairs_slice_v() -> list[tuple[str, str, str]]:
+    """Exp V1 — full-pool confirmation + budget-ladder load-bearing pairs.
+
+    Anchors: V0 BF16, V1 F4, V2 F9 (4.75 KV bits), V3 S4 (4.188 KV bits).
+    Extra-8 conditions V4..V13 all at 4.281 KV bits. V14 = ALL-16 at 4.375.
+    Budget ladder: V15 BAL4 (4.234), V11 BAL8 (4.281), V16 BAL12 (4.328),
+                   V17 BAL16 (4.375).
+
+    The PRIMARY tests are V11 BAL8 and V12 MMNIAH8 vs V2 F9 — does the
+    Exp U1 directional gain become paired-significant at full pool?
+    """
+    return [
+        # Anchor sanity
+        ("V2", "V0", "F9 vs BF16 ceiling (anchor sanity)"),
+        ("V3", "V0", "S4 vs BF16 ceiling"),
+        ("V3", "V2", "S4 (INT7, 4.188) vs F9 (4.75) — Pareto-tie test from Exp S"),
+        # Every extra-N vs S4 anchor
+        ("V4", "V3", "GEN extra-8 vs S4 — does generic-energy extra help?"),
+        ("V8", "V3", "TT extra-8 vs S4"),
+        ("V9", "V3", "TV extra-8 vs S4"),
+        ("V10", "V3", "VT extra-8 vs S4"),
+        ("V11", "V3", "BAL extra-8 vs S4 — U10 REPLICATION"),
+        ("V12", "V3", "MMNIAH-prior extra-8 vs S4 — U11 REPLICATION"),
+        ("V13", "V3", "LVB-prior extra-8 vs S4"),
+        ("V14", "V3", "ALL-16 extra vs S4 (4.375 KV bits)"),
+        # vs each random seed (robust-vs-random)
+        ("V11", "V5", "BAL extra-8 vs RND-s0 — structured > random?"),
+        ("V11", "V6", "BAL extra-8 vs RND-s1"),
+        ("V11", "V7", "BAL extra-8 vs RND-s2"),
+        ("V12", "V5", "MMNIAH-prior extra-8 vs RND-s0"),
+        ("V12", "V6", "MMNIAH-prior extra-8 vs RND-s1"),
+        ("V12", "V7", "MMNIAH-prior extra-8 vs RND-s2"),
+        ("V4",  "V5", "GEN extra-8 vs RND-s0"),
+        ("V4",  "V6", "GEN extra-8 vs RND-s1"),
+        ("V4",  "V7", "GEN extra-8 vs RND-s2"),
+        # Structured vs generic-energy
+        ("V11", "V4", "BAL extra-8 vs GEN extra-8 — does balance criterion add?"),
+        ("V12", "V4", "MMNIAH-prior extra-8 vs GEN extra-8"),
+        ("V13", "V4", "LVB-prior extra-8 vs GEN extra-8"),
+        ("V8",  "V4", "TT extra-8 vs GEN extra-8"),
+        ("V9",  "V4", "TV extra-8 vs GEN extra-8"),
+        ("V10", "V4", "VT extra-8 vs GEN extra-8"),
+        # Cross-domain prior
+        ("V12", "V13", "MMNIAH-prior vs LVB-prior — cross-domain transfer"),
+        # Budget ladder (sweet-spot test)
+        ("V15", "V11", "BAL4 vs BAL8 — does shrinking budget hurt?"),
+        ("V16", "V11", "BAL12 vs BAL8 — does growing budget help?"),
+        ("V17", "V11", "BAL16 vs BAL8 — does growing budget further help?"),
+        ("V14", "V17", "ALL-16 composite vs BAL-16 — does balance vs composite matter?"),
+        # PRIMARY DEPLOYABLE: V vs F9 (target Pareto beat)
+        ("V11", "V2", "BAL extra-8 vs F9 dense — PRIMARY DEPLOYABLE TEST"),
+        ("V12", "V2", "MMNIAH-prior extra-8 vs F9 — PRIMARY DEPLOYABLE TEST"),
+        ("V4",  "V2", "GEN extra-8 vs F9 dense"),
+        ("V14", "V2", "ALL-16 vs F9 dense"),
+        ("V16", "V2", "BAL12 vs F9 dense"),
+        # Headroom check vs BF16
+        ("V11", "V0", "BAL extra-8 vs BF16 ceiling"),
+        ("V12", "V0", "MMNIAH-prior extra-8 vs BF16 ceiling"),
+    ]
+
+
 def pairs_slice_a() -> list[tuple[str, str, str]]:
     return [
         ("Q2", "Q0", "F9 vs BF16 anchor"),
@@ -476,6 +544,8 @@ def write_paired(rows: list[dict], out_md: Path, slice_tag: str) -> None:
         pairs = pairs_slice_s()
     elif slice_tag == "U":
         pairs = pairs_slice_u()
+    elif slice_tag == "V":
+        pairs = pairs_slice_v()
     else:
         pairs = []
     lines = [f"# Exp Q/R paired McNemar slice {slice_tag} — "
@@ -687,6 +757,117 @@ def write_branch_json(rows: list[dict], out_json: Path, slice_tag: str) -> dict:
             "U3_acc": _acc(by_cond.get("U3", [])),
             "U2_acc": _acc(by_cond.get("U2", [])),
         }
+    elif slice_tag == "V":
+        # Exp V1 — full-pool confirmation + budget-ladder verdict.
+        out["accuracy"] = {c: _acc(rs) for c, rs in by_cond.items()}
+        out["paired_net"] = {}
+
+        def _net(a, b):
+            if a in rows_by_item and b in rows_by_item:
+                m = paired_mcnemar(rows_by_item[a], rows_by_item[b])
+                return m, m["a_only_correct"] - m["b_only_correct"]
+            return None, None
+
+        def _sig_A_wins(a, b):
+            if a not in rows_by_item or b not in rows_by_item:
+                return False
+            m = paired_mcnemar(rows_by_item[a], rows_by_item[b])
+            return m["chi2"] >= 3.84 and m["favored"] == "A"
+
+        def _tied_or_A(a, b):
+            if a not in rows_by_item or b not in rows_by_item:
+                return False
+            m = paired_mcnemar(rows_by_item[a], rows_by_item[b])
+            return m["chi2"] < 3.84 or m["favored"] == "A"
+
+        # Record paired_nets for every load-bearing pair.
+        for a, b in (
+            ("V11", "V3"), ("V11", "V4"), ("V11", "V2"),
+            ("V11", "V5"), ("V11", "V6"), ("V11", "V7"),
+            ("V11", "V14"), ("V11", "V15"), ("V11", "V16"), ("V11", "V17"),
+            ("V12", "V2"), ("V12", "V3"), ("V12", "V4"),
+            ("V12", "V5"), ("V12", "V6"), ("V12", "V7"),
+            ("V12", "V13"),
+            ("V4", "V3"), ("V4", "V2"),
+            ("V14", "V2"),
+        ):
+            mn = _net(a, b)
+            if mn[0] is not None:
+                out["paired_net"][f"{a}_vs_{b}"] = mn[1]
+
+        # PRIMARY DEPLOYABLE: do V11/V12 paired-significantly beat F9?
+        out["pass_v11_beats_f9"] = _sig_A_wins("V11", "V2")
+        out["pass_v12_beats_f9"] = _sig_A_wins("V12", "V2")
+        # Paired-tied-or-beats F9 at < 4.75 KV bits.
+        def _mean_ekvb(cond_name: str) -> float:
+            if cond_name not in by_cond:
+                return float("nan")
+            vals = [r.get("effective_kv_bits") for r in by_cond[cond_name]
+                    if r.get("effective_kv_bits") is not None]
+            return float(np.mean(vals)) if vals else float("nan")
+        out["v_extras_kv_bits"] = {
+            c: _mean_ekvb(c) for c in (
+                "V2", "V3", "V4", "V11", "V12", "V14",
+                "V15", "V16", "V17",
+            )
+        }
+        out["pass_match_or_beat_f9"] = any(
+            _tied_or_A(u, "V2")
+            and _mean_ekvb(u) < 4.75 - 1e-3
+            for u in ("V4", "V8", "V9", "V10", "V11", "V12",
+                      "V13", "V14", "V15", "V16", "V17")
+        )
+
+        # vs S4 anchor (replicates U10/U11 finding).
+        out["pass_v11_beats_s4"] = _sig_A_wins("V11", "V3")
+        out["pass_v12_beats_s4"] = _sig_A_wins("V12", "V3")
+
+        # Robust-vs-random: BAL8 paired-sig over EACH of three RND seeds.
+        out["pass_v11_beats_random_robust"] = all(
+            _sig_A_wins("V11", r) for r in ("V5", "V6", "V7")
+        )
+        out["pass_v12_beats_random_robust"] = all(
+            _sig_A_wins("V12", r) for r in ("V5", "V6", "V7")
+        )
+
+        # Budget sweet-spot: is BAL8 best among {BAL4, BAL8, BAL12, BAL16}?
+        bal_accs = {c: _acc(by_cond.get(c, []))
+                    for c in ("V15", "V11", "V16", "V17")}
+        valid_bal = {c: a for c, a in bal_accs.items() if not math.isnan(a)}
+        if valid_bal:
+            best_bal = max(valid_bal, key=valid_bal.get)
+            out["bal_ladder_winner"] = best_bal
+            out["bal_ladder_acc"] = valid_bal
+        else:
+            out["bal_ladder_winner"] = None
+
+        # winning_policy across all V4..V17 (tie-break by lower KV bits).
+        candidates = []
+        for v in ("V4", "V5", "V6", "V7", "V8", "V9", "V10",
+                  "V11", "V12", "V13", "V14",
+                  "V15", "V16", "V17"):
+            if v in by_cond:
+                a = _acc(by_cond[v])
+                kvb = _mean_ekvb(v)
+                if not math.isnan(a):
+                    candidates.append((v, a, kvb))
+        candidates_sorted = sorted(
+            candidates,
+            key=lambda t: (-t[1], (t[2] if not math.isnan(t[2]) else 99.0))
+        )
+        out["winning_policy"] = candidates_sorted[0][0] if candidates_sorted else None
+        out["candidate_ranking"] = [
+            {"cond": c, "acc": a, "eff_kv_bits": k}
+            for c, a, k in candidates_sorted
+        ]
+
+        # Anchor sanity (Exp S/U cross-checks).
+        out["anchor_actual"] = {
+            "V0_BF16_acc": _acc(by_cond.get("V0", [])),
+            "V1_F4_acc":   _acc(by_cond.get("V1", [])),
+            "V2_F9_acc":   _acc(by_cond.get("V2", [])),
+            "V3_S4_acc":   _acc(by_cond.get("V3", [])),
+        }
     else:
         # Slice B does not branch into further reseeds in this plan.
         out["accuracy"] = {c: _acc(rs) for c, rs in by_cond.items()}
@@ -838,6 +1019,72 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
             verdicts.append(
                 f"NOT STRONG PASS — at least one of the three pass conditions failed."
             )
+    elif slice_tag == "V":
+        v0, v1, v2, v3 = acc("V0"), acc("V1"), acc("V2"), acc("V3")
+        if not any(math.isnan(x) for x in (v0, v1, v2, v3)):
+            verdicts.append(
+                f"Anchors: V0 BF16={v0:.3f} V1 F4={v1:.3f} "
+                f"V2 F9={v2:.3f} V3 S4={v3:.3f}"
+            )
+
+        # Primary deployable
+        verdicts.append(
+            f"PRIMARY pass_v11_beats_f9 (BAL8 paired-sig > F9) = "
+            f"{branch.get('pass_v11_beats_f9')}"
+        )
+        verdicts.append(
+            f"PRIMARY pass_v12_beats_f9 (MMNIAH8 paired-sig > F9) = "
+            f"{branch.get('pass_v12_beats_f9')}"
+        )
+        verdicts.append(
+            f"pass_match_or_beat_f9 (any V tied-or-beats F9 at <4.75 bits) = "
+            f"{branch.get('pass_match_or_beat_f9')}"
+        )
+        verdicts.append(
+            f"pass_v11_beats_s4 (BAL8 paired-sig > S4) = "
+            f"{branch.get('pass_v11_beats_s4')}"
+        )
+        verdicts.append(
+            f"pass_v12_beats_s4 (MMNIAH8 paired-sig > S4) = "
+            f"{branch.get('pass_v12_beats_s4')}"
+        )
+        verdicts.append(
+            f"pass_v11_beats_random_robust (BAL8 > each of V5/V6/V7) = "
+            f"{branch.get('pass_v11_beats_random_robust')}"
+        )
+        verdicts.append(
+            f"pass_v12_beats_random_robust (MMNIAH8 > each of V5/V6/V7) = "
+            f"{branch.get('pass_v12_beats_random_robust')}"
+        )
+        verdicts.append(
+            f"bal_ladder_winner = {branch.get('bal_ladder_winner')} "
+            f"(accs: {branch.get('bal_ladder_acc')})"
+        )
+        verdicts.append(
+            f"winning_policy (argmax acc, tie-break lower KV bits) = "
+            f"{branch.get('winning_policy')}"
+        )
+        for r in (branch.get("candidate_ranking") or [])[:3]:
+            verdicts.append(
+                f"  {r['cond']}: acc={r['acc']:.3f} eff_kv_bits="
+                f"{r.get('eff_kv_bits', float('nan')):.3f}"
+            )
+
+        strong_pass = (
+            (branch.get("pass_v11_beats_f9") or branch.get("pass_v12_beats_f9"))
+            and branch.get("pass_match_or_beat_f9")
+        )
+        if strong_pass:
+            verdicts.append(
+                "STRONG PASS — at least one V variant paired-significantly "
+                "beats F9 at lower bits. This is the deployable headline."
+            )
+        else:
+            verdicts.append(
+                "NOT STRONG PASS — no V variant paired-significantly beats F9; "
+                "check the directional/borderline pairs and consider whether the "
+                "Exp U1 trend survived larger n."
+            )
     else:
         # Slice B
         r0, r2 = acc("R0"), acc("R2")
@@ -878,6 +1125,17 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
                 "U10": "BALANCED", "U11": "MMNIAH_PRIOR",
                 "U12": "LVB_PRIOR", "U13": "ALL16_EXTRA",
             }.get(c, "PROPOSED")
+        elif slice_tag == "V":
+            status = {
+                "V0": "ANCHOR", "V1": "ANCHOR", "V2": "ANCHOR", "V3": "ANCHOR",
+                "V4": "GENERIC_EXTRA",
+                "V5": "RANDOM_s0", "V6": "RANDOM_s1", "V7": "RANDOM_s2",
+                "V8": "TT", "V9": "TV", "V10": "VT",
+                "V11": "BAL8 (PRIMARY)", "V12": "MMNIAH_PRIOR (PRIMARY)",
+                "V13": "LVB_PRIOR", "V14": "ALL16_EXTRA",
+                "V15": "BAL4 (LADDER)", "V16": "BAL12 (LADDER)",
+                "V17": "BAL16 (LADDER)",
+            }.get(c, "PROPOSED")
         else:
             status = {"R0": "ANCHOR", "R1": "ANCHOR", "R2": "ANCHOR",
                       "R3": "ROLE_ONLY", "R6": "ORACLE"}.get(c, "PROPOSED")
@@ -889,11 +1147,12 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slice", choices=("A", "B", "C", "S", "U"), default="A",
+    ap.add_argument("--slice", choices=("A", "B", "C", "S", "U", "V"), default="A",
                     help="A=Slice A retrieval-image (Exp Q), B=Slice B reasoning-image (Exp Q), "
                          "C=Exp R Sub-experiment C (AllVisual + static baselines), "
                          "S=Exp S Phase 1 sidecode bit-ladder (S0..S9), "
-                         "U=Exp U1 residual channel oracle/policy screen (U0..U13).")
+                         "U=Exp U1 residual channel oracle/policy screen (U0..U13), "
+                         "V=Exp V1 full-pool confirmation + budget-ladder (V0..V17).")
     ap.add_argument("--out-prefix", default=None,
                     help="Override the output file prefix. Default: expQ for "
                          "A/B/C/S; expU for U. Useful when running multiple Exp U "
@@ -910,6 +1169,8 @@ def main():
 
     if args.out_prefix is not None:
         prefix = args.out_prefix
+    elif args.slice == "V":
+        prefix = "expV"
     elif args.slice == "U":
         prefix = "expU"
     else:

@@ -158,6 +158,29 @@ CONDITIONS_NEEDING_CALIB_U = {
 }
 
 
+# Exp V Phase C — LVB-128f at stage=3 (n=200), trimmed 11-condition slate that
+# matches the Exp V plan L0..L10. Uses the same KQuantizerConfig registry as
+# Exp U + V additions; no new K-quantizers needed.
+FIXED_FRAME_CONDITIONS_V_LVB = [
+    ("V0_BF16_128f",                128, "F0_BF16",                    "bf16"),
+    ("V1_F4_128f",                  128, "F4_KIVI_PerChannelSeq",      "v1_kcfg"),
+    ("V2_F9_128f",                  128, "F9_KIVI_Outlier16",          "v1_kcfg"),
+    ("V3_S4_INT7_128f",             128, "SL_Outlier16_INT7side",      "v1_kcfg"),
+    ("V4_S4_GEN8_INT7_128f",        128, "U4_S4_plus_GEN8_INT7",       "v1_kcfg"),
+    ("V5_S4_RND8_s0_INT7_128f",     128, "V5_S4_plus_RND8_INT7_s0",    "v1_kcfg"),
+    ("V9_S4_TV8_INT7_128f",         128, "U7_S4_plus_TV8_INT7",        "v1_kcfg"),
+    ("V11_S4_BAL8_INT7_128f",       128, "U10_S4_plus_BAL8_INT7",      "v1_kcfg"),
+    ("V12_S4_MMNIAH8_INT7_128f",    128, "U11_S4_plus_MMNIAH8_INT7",   "v1_kcfg"),
+    ("V13_S4_LVB8_INT7_128f",       128, "U12_S4_plus_LVB8_INT7",      "v1_kcfg"),
+    ("V14_S4_ALL16_INT7_128f",      128, "U13_S4_plus_ALL16_INT7",     "v1_kcfg"),
+]
+
+CONDITIONS_NEEDING_CALIB_V_LVB = {
+    name for name, _, _, _ in FIXED_FRAME_CONDITIONS_V_LVB
+    if name not in ("V0_BF16_128f", "V1_F4_128f")
+}
+
+
 # Pre-registered Stage-3 anchors (always run regardless of Stage-1 verdict).
 # J15/J16/J17 are pre-registered controls added at Stage 3.
 ANCHORS_ALWAYS_PROMOTED = {
@@ -188,6 +211,15 @@ def build_u_conditions_lvb(calib: Optional[dict]) -> list[dict]:
     EXTRA index arrays merged from the sibling _expU_extras.npz.
     """
     return _build_conditions_from_tuples(FIXED_FRAME_CONDITIONS_U, calib)
+
+
+def build_v_conditions_lvb(calib: Optional[dict]) -> list[dict]:
+    """Build V-suite condition spec dicts for LongVideoBench-128f (Phase C).
+
+    Same calib shape as U; the trimmed 11-condition slate L0..L10 maps to
+    KQuantizerConfig names already registered in k_quantizers.build_f_conditions.
+    """
+    return _build_conditions_from_tuples(FIXED_FRAME_CONDITIONS_V_LVB, calib)
 
 
 def _build_conditions_from_tuples(specs, calib):
@@ -348,12 +380,17 @@ def main():
                     help="Run Exp U1 (residual channel oracle/policy screen) on "
                          "LongVideoBench-128f instead of the J-suite. Requires "
                          "the sibling _expU_extras.npz alongside the calib.")
+    ap.add_argument("--exp-v", action="store_true",
+                    help="Run Exp V1 Phase C (trimmed 11-condition residual screen "
+                         "L0..L10) on LongVideoBench-128f at stage=3 (n=200).")
     ap.add_argument("--extras-npz", type=Path, default=None,
-                    help="Override the auto-derived expU_extras NPZ path for --exp-u.")
+                    help="Override the auto-derived expU_extras NPZ path for --exp-u/--exp-v.")
     args = ap.parse_args()
 
     if args.out is None:
-        if args.exp_u:
+        if args.exp_v:
+            args.out = RESULTS_DIR / f"expV_lvb_stage{args.stage}_seed{args.seed}.jsonl"
+        elif args.exp_u:
             args.out = RESULTS_DIR / f"expU_lvb_stage{args.stage}_seed{args.seed}.jsonl"
         else:
             args.out = RESULTS_DIR / f"expJ_xmodal_stage{args.stage}_seed{args.seed}.jsonl"
@@ -391,24 +428,25 @@ def main():
             "outlier indices. Run expJ_calibrate.py first."
         )
 
-    if args.exp_u:
-        # Exp U merges the residual extras NPZ alongside the calib. The
-        # required keys are the EXTRA index arrays + k_channel_energy.
+    if args.exp_u or args.exp_v:
+        # Merge the residual extras NPZ alongside the calib. The required keys
+        # are the EXTRA index arrays + k_channel_energy.
         extras_path = args.extras_npz
         if extras_path is None:
             extras_path = args.calib_npz.with_name(
                 args.calib_npz.stem + "_expU_extras.npz")
         if not extras_path.exists():
             raise SystemExit(
-                f"[expU] required extras NPZ not found: {extras_path}. "
+                f"[expU/V] required extras NPZ not found: {extras_path}. "
                 f"Run `python expU_compute_extras.py --all` first."
             )
         xarr = np.load(extras_path)
         for k in xarr.files:
             calib[k] = xarr[k]
-        print(f"[expU] merged extras from {extras_path.name} "
+        tag = "expV" if args.exp_v else "expU"
+        print(f"[{tag}] merged extras from {extras_path.name} "
               f"({len(xarr.files)} new keys)", flush=True)
-        required_u_keys = {
+        required_keys = {
             "k_channel_energy",
             "outlier_idx_EXTRA_GEN_8",
             "outlier_idx_EXTRA_RND_8",
@@ -419,10 +457,20 @@ def main():
             "outlier_idx_EXTRA_LVB_PRIOR_8",
             "outlier_idx_EXTRA_ALL_16",
         }
-        missing = required_u_keys - set(calib)
+        if args.exp_v:
+            # V additionally needs the budget-ladder + RND seed arrays.
+            required_keys |= {
+                "outlier_idx_EXTRA_RND_8_s0",
+                "outlier_idx_EXTRA_RND_8_s1",
+                "outlier_idx_EXTRA_RND_8_s2",
+                "outlier_idx_EXTRA_BAL_4",
+                "outlier_idx_EXTRA_BAL_12",
+                "outlier_idx_EXTRA_BAL_16",
+            }
+        missing = required_keys - set(calib)
         if missing:
             raise SystemExit(
-                f"[expU] calib+extras missing required arrays: {sorted(missing)}. "
+                f"[{tag}] calib+extras missing required arrays: {sorted(missing)}. "
                 f"Available keys: {sorted(calib)}"
             )
     else:
@@ -442,13 +490,20 @@ def main():
     # Inject Stage-3 control arrays (J15 random, J16 random-cell, J17
     # error-weighted pivot). Computed on the fly with fixed seeds so the
     # randomness is reproducible and doesn't require recalibration.
-    # Skipped for Exp U (different control arrays — already in extras NPZ).
-    if args.exp_u:
-        conditions = build_u_conditions_lvb(calib=calib)
+    # Skipped for Exp U/V (different control arrays — already in extras NPZ).
+    if args.exp_u or args.exp_v:
+        if args.exp_v:
+            conditions = build_v_conditions_lvb(calib=calib)
+            exp_tag = "V"
+            bf16_cond = "V0_BF16_128f"
+        else:
+            conditions = build_u_conditions_lvb(calib=calib)
+            exp_tag = "U"
+            bf16_cond = "U0_BF16_128f"
         if args.conditions:
             wanted = set(args.conditions)
             conditions = [c for c in conditions if c["name"] in wanted]
-            print(f"[expU] filtered conditions: {[c['name'] for c in conditions]}",
+            print(f"[exp{exp_tag}] filtered conditions: {[c['name'] for c in conditions]}",
                   flush=True)
         if not args.append and args.out.exists():
             args.out.unlink()
@@ -459,7 +514,7 @@ def main():
         layers = lm.layers if hasattr(lm, "layers") else lm.model.layers
         num_layers = len(layers)
         num_kv_heads = getattr(model.config, "num_key_value_heads", 4)
-        print(f"[expU] model loaded; num_layers={num_layers} num_kv_heads={num_kv_heads}",
+        print(f"[exp{exp_tag}] model loaded; num_layers={num_layers} num_kv_heads={num_kv_heads}",
               flush=True)
         run_stage_g(model, processor, eval_items,
                     num_layers=num_layers, num_kv_heads=num_kv_heads,
@@ -467,9 +522,9 @@ def main():
                     calibration_id=calibration_id,
                     out_jsonl=args.out, progress_every=args.progress_every,
                     min_free_gb_for_256=args.min_free_gb_256)
-        # Rewrite the experiment/phase tag from G to U.
-        _rewrite_experiment_tag(args.out, exp="U", phase=f"U{args.stage}")
-        backfill_bf16_join_j(args.out, bf16_cond_name="U0_BF16_128f")
+        # Rewrite the experiment/phase tag from G to U/V.
+        _rewrite_experiment_tag(args.out, exp=exp_tag, phase=f"{exp_tag}{args.stage}")
+        backfill_bf16_join_j(args.out, bf16_cond_name=bf16_cond)
         return
 
     L, H_kv, D = calib["k_channel_energy"].shape
