@@ -276,6 +276,51 @@ def c_conditions_counting() -> list[CondSpec]:
     ]
 
 
+def u_conditions_residual_screen() -> list[CondSpec]:
+    """Exp U1 — residual channel oracle/policy screen.
+
+    Anchored on S4 (top-16 INT7 sidecode, 4.1875 KV bits, paired-tied with F9
+    in Exp S). Tests whether adding extra residual channels — selected by
+    modality-block (TT/TV/VT/VV) criteria, dataset-empirical priors, or a
+    composite (TT+TV+VT+VV) score — beats both the S4 anchor and a random
+    extra-N control, and whether the winning policy differs by dataset.
+
+      U0  BF16 dense                                       16.00  KV bits
+      U1  F4 dense (broken floor)                           4.00
+      U2  F9 top-16 BF16 sidecode                           4.75
+      U3  S4 top-16 INT7 sidecode (anchor)                  4.1875
+      U4  S4 + generic-extra-8 INT7                         4.28125
+      U5  S4 + random-extra-8 INT7 (seeded)                 4.28125
+      U6  S4 + TT-extra-8 INT7                              4.28125
+      U7  S4 + TV-extra-8 INT7                              4.28125
+      U8  S4 + VT-extra-8 INT7                              4.28125
+      U9  S4 + VV-extra-8 INT7                              4.28125
+      U10 S4 + balanced-2/block-extra-8 INT7                4.28125
+      U11 S4 + MM-NIAH-prior-extra-8 INT7                   4.28125
+      U12 S4 + LVB-prior-extra-8 INT7                       4.28125
+      U13 S4 + all-block top-16 residual extra INT7         4.375
+
+    All "extra" channel sets are residual to S4 (precomputed by
+    expU_compute_extras.py with the residual invariant enforced).
+    """
+    return [
+        CondSpec("U0",  None,                          RoutePolicy("none"), False),
+        CondSpec("U1",  F4,                            RoutePolicy("none"), True),
+        CondSpec("U2",  "F9_KIVI_Outlier16",           RoutePolicy("none"), True),
+        CondSpec("U3",  "SL_Outlier16_INT7side",       RoutePolicy("none"), True),
+        CondSpec("U4",  "U4_S4_plus_GEN8_INT7",        RoutePolicy("none"), True),
+        CondSpec("U5",  "U5_S4_plus_RND8_INT7",        RoutePolicy("none"), True),
+        CondSpec("U6",  "U6_S4_plus_TT8_INT7",         RoutePolicy("none"), True),
+        CondSpec("U7",  "U7_S4_plus_TV8_INT7",         RoutePolicy("none"), True),
+        CondSpec("U8",  "U8_S4_plus_VT8_INT7",         RoutePolicy("none"), True),
+        CondSpec("U9",  "U9_S4_plus_VV8_INT7",         RoutePolicy("none"), True),
+        CondSpec("U10", "U10_S4_plus_BAL8_INT7",       RoutePolicy("none"), True),
+        CondSpec("U11", "U11_S4_plus_MMNIAH8_INT7",    RoutePolicy("none"), True),
+        CondSpec("U12", "U12_S4_plus_LVB8_INT7",       RoutePolicy("none"), True),
+        CondSpec("U13", "U13_S4_plus_ALL16_INT7",      RoutePolicy("none"), True),
+    ]
+
+
 def s_conditions_sidecode_ladder() -> list[CondSpec]:
     """Exp S Phase 1 — sidecode bit-ladder on the same multi-image slice.
 
@@ -471,6 +516,17 @@ _STATIC_K_BITS = {
     "SL_Outlier16_INT5side":  _k_bits_top_n_int_m(16, 5),   # 4.125
     "SL_Outlier24_INT6side":  _k_bits_top_n_int_m(24, 6),   # 4.375
     "SL_Outlier32_INT6side":  _k_bits_top_n_int_m(32, 6),   # 4.500
+    # Exp U: residual extra-N at INT7. 24 = S4(16) + extra-8; 32 = S4(16) + extra-16.
+    "U4_S4_plus_GEN8_INT7":     _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U5_S4_plus_RND8_INT7":     _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U6_S4_plus_TT8_INT7":      _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U7_S4_plus_TV8_INT7":      _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U8_S4_plus_VT8_INT7":      _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U9_S4_plus_VV8_INT7":      _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U10_S4_plus_BAL8_INT7":    _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U11_S4_plus_MMNIAH8_INT7": _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U12_S4_plus_LVB8_INT7":    _k_bits_top_n_int_m(24, 7),  # 4.5625
+    "U13_S4_plus_ALL16_INT7":   _k_bits_top_n_int_m(32, 7),  # 4.750
     # F5 TextVisualLocal-F4 is also a true 4.00 K-bits format (text/visual
     # scales add only metadata overhead).
     "F5_KIVI_TextVisualSplit": 4.0,
@@ -1210,6 +1266,14 @@ def main():
     # Exp S flags
     ap.add_argument("--exp-s-ladder", action="store_true",
                     help="Exp S Phase 1: sidecode bit-ladder S0..S9 (no AllVisual).")
+    # Exp U flags
+    ap.add_argument("--exp-u", action="store_true",
+                    help="Exp U1: residual channel oracle/policy screen U0..U13. "
+                         "Requires the sibling _expU_extras.npz alongside the "
+                         "calibration NPZ (run expU_compute_extras.py to produce).")
+    ap.add_argument("--extras-npz", type=Path, default=None,
+                    help="Override the auto-derived expU_extras NPZ path. "
+                         "Default: <calib-npz-stem>_expU_extras.npz")
     # Exp T-mini flags
     ap.add_argument("--exp-t-mini", action="store_true",
                     help="Exp T-mini Phase 1/2: T0..T16 page-aware K formats on "
@@ -1304,12 +1368,31 @@ def main():
             print(f"  derived outlier_channel_idx_top32 from k_channel_energy "
                   f"(shape {top32.shape})", flush=True)
         print(f"loaded calibration {args.calib_npz} ({len(calib)} keys)", flush=True)
+        # Exp U: merge sibling expU_extras NPZ if --exp-u is on (or if the
+        # extras NPZ exists next to the calib NPZ — harmless if not used).
+        if args.exp_u or args.extras_npz is not None:
+            extras_path = args.extras_npz
+            if extras_path is None:
+                extras_path = args.calib_npz.with_name(
+                    args.calib_npz.stem + "_expU_extras.npz")
+            if not extras_path.exists():
+                raise SystemExit(
+                    f"[exp-u] required extras NPZ not found: {extras_path}. "
+                    f"Run `python expU_compute_extras.py --all` first."
+                )
+            xarr = np.load(extras_path)
+            for k in xarr.files:
+                calib[k] = xarr[k]
+            print(f"  merged Exp U extras from {extras_path.name} "
+                  f"({len(xarr.files)} new keys)", flush=True)
     else:
         print(f"[warn] calib NPZ not found at {args.calib_npz} — F9 conditions will fail",
               flush=True)
 
     # Build conditions
-    if args.exp_t_mini_counting:
+    if args.exp_u:
+        primary = u_conditions_residual_screen()
+    elif args.exp_t_mini_counting:
         # Exp T-mini Phase 3: counting-image C0..C12.
         primary = c_conditions_counting()
     elif args.exp_t_mini:

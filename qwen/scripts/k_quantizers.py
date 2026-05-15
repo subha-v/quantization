@@ -162,6 +162,15 @@ class KQuantizerConfig:
     # random_visual sentinel pattern. Combined with item-id at runtime so the
     # same item produces the same random boundaries / sentinels each pass.
     random_seed_namespace: Optional[str] = None
+    # Exp U: residual-extra channel composition. When set, _outlier_channel_indices
+    # fetches the primary outlier set (S4 top-16 from outlier_idx_key or the
+    # default outlier_channel_idx_top16) AND fetches outlier_idx_extra_n channels
+    # from outlier_idx_extra_key, then returns the concatenation. The full set
+    # is stored at outlier_storage_bits (single sidecode width across both).
+    # `n_outliers` must equal the TOTAL (primary + extra) channel count for the
+    # per-head loop in _kivi_outlier to address the full concatenated array.
+    outlier_idx_extra_key: Optional[str] = None
+    outlier_idx_extra_n: int = 0
 
     def __post_init__(self):
         if self.kind not in KQUANTIZER_KINDS:
@@ -861,11 +870,18 @@ def _outlier_channel_indices(cfg: KQuantizerConfig, layer_idx: int,
                              n: int) -> torch.Tensor:
     """Return [H_kv, n] long tensor of channel indices to protect at BF16.
 
-    Source priority:
+    Source priority for the *primary* channel set (first n_primary entries):
       1. cfg.outlier_idx_key (Exp J: cross-modal schemes like
          'outlier_idx_TT_top16', 'outlier_idx_TT_TV_top16', etc.)
       2. cfg.calib['outlier_channel_idx_top16'] (F-suite default)
       3. Online argsort from cfg.calib['k_channel_energy'] (fallback)
+
+    Exp U residual-extra composition (cfg.outlier_idx_extra_key set):
+      Concatenates `n_primary = n - cfg.outlier_idx_extra_n` channels from
+      the primary source with cfg.outlier_idx_extra_n channels from
+      cfg.calib[cfg.outlier_idx_extra_key]. The extra array is assumed
+      precomputed-residual to the primary set (per expU_compute_extras.py),
+      so no dedup is performed here.
 
     The selected key must be a numpy array of shape [L, H_kv, K] where K >= n;
     we return the first `n` columns sliced for the given layer.
@@ -875,7 +891,43 @@ def _outlier_channel_indices(cfg: KQuantizerConfig, layer_idx: int,
             f"{cfg.name}: outlier kind requires cfg.calib with an outlier-index "
             f"array or 'k_channel_energy'."
         )
-    key = cfg.outlier_idx_key or "outlier_channel_idx_top16"
+
+    # Exp U: split the total channel budget into primary + extra.
+    extra_n = int(cfg.outlier_idx_extra_n or 0)
+    if extra_n > 0 and cfg.outlier_idx_extra_key:
+        n_primary = max(0, n - extra_n)
+        primary = _fetch_outlier_subset(cfg, layer_idx, n_primary,
+                                        primary_key=cfg.outlier_idx_key)
+        extra_arr = cfg.calib.get(cfg.outlier_idx_extra_key)
+        if extra_arr is None:
+            raise RuntimeError(
+                f"{cfg.name}: cfg.outlier_idx_extra_key="
+                f"{cfg.outlier_idx_extra_key!r} not present in cfg.calib "
+                f"(keys: {sorted(cfg.calib)})."
+            )
+        if extra_arr.shape[-1] < extra_n:
+            raise RuntimeError(
+                f"{cfg.name}: extra key {cfg.outlier_idx_extra_key!r} has "
+                f"only {extra_arr.shape[-1]} channels per cell; need {extra_n}."
+            )
+        extra = torch.as_tensor(extra_arr[layer_idx, :, :extra_n], dtype=torch.long)
+        return torch.cat([primary, extra], dim=-1)
+
+    return _fetch_outlier_subset(cfg, layer_idx, n, primary_key=cfg.outlier_idx_key)
+
+
+def _fetch_outlier_subset(cfg: KQuantizerConfig, layer_idx: int, n: int,
+                          primary_key: Optional[str]) -> torch.Tensor:
+    """Helper used by _outlier_channel_indices to fetch one outlier subset.
+
+    Same source-priority rules as before Exp U.
+    """
+    if n <= 0:
+        # Caller asked for zero primary channels; return an empty tensor with
+        # the right column dimension.
+        num_kv = cfg.calib["k_channel_energy"].shape[1]
+        return torch.empty(num_kv, 0, dtype=torch.long)
+    key = primary_key or "outlier_channel_idx_top16"
     if key in cfg.calib:
         idx = cfg.calib[key]  # numpy [L, H_kv, K]
         if idx.shape[-1] >= n:
@@ -883,11 +935,11 @@ def _outlier_channel_indices(cfg: KQuantizerConfig, layer_idx: int,
         # Stored key has fewer channels than requested — fall through to
         # k_channel_energy argsort. Exp S Phase 1 needs top-24 / top-32 with
         # only top-16 precomputed.
-    elif cfg.outlier_idx_key is not None:
+    elif primary_key is not None:
         # User explicitly asked for a key that's missing — fail loudly rather
         # than silently falling back to the generic top-16.
         raise RuntimeError(
-            f"{cfg.name}: cfg.outlier_idx_key={cfg.outlier_idx_key!r} not present in "
+            f"{cfg.name}: outlier_idx_key={primary_key!r} not present in "
             f"cfg.calib (keys: {sorted(cfg.calib)})."
         )
     energy = cfg.calib.get("k_channel_energy")
@@ -1519,4 +1571,76 @@ def build_f_conditions(calib: Optional[dict] = None) -> list[KQuantizerConfig]:
                          kind="kivi_page_sentinel", bits=4,
                          base_kind="kivi_page_local",
                          sentinel_kind="first_visual", sentinel_n_per_page=4),
+        # ============================================================
+        # Exp U: residual channel oracle/policy screen.
+        # All U4..U13 share the S4 anchor (top-16 channels by generic
+        # k_channel_energy, INT7 sidecode) and add an extra-N residual
+        # set selected by a policy. Bit accounting:
+        #   U4..U12:  24 channels at INT7   →  K-bits = 4.5625, KV = 4.28125
+        #   U13:      32 channels at INT7   →  K-bits = 4.7500, KV = 4.37500
+        # The "extra" channels are residual to S4 (guaranteed disjoint by
+        # expU_compute_extras.py), so n_outliers = total = primary + extra.
+        # ============================================================
+        # U4: S4 + generic extra-8 at INT7 (top-8 by k_channel_energy
+        #     not in S4-top-16). Pure "more channels by same criterion" baseline.
+        KQuantizerConfig(name="U4_S4_plus_GEN8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_GEN_8",
+                         outlier_idx_extra_n=8),
+        # U5: S4 + random extra-8 at INT7 (matched-bit random control).
+        KQuantizerConfig(name="U5_S4_plus_RND8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_RND_8",
+                         outlier_idx_extra_n=8),
+        # U6: S4 + TT extra-8.
+        KQuantizerConfig(name="U6_S4_plus_TT8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_TT_8",
+                         outlier_idx_extra_n=8),
+        # U7: S4 + TV extra-8.
+        KQuantizerConfig(name="U7_S4_plus_TV8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_TV_8",
+                         outlier_idx_extra_n=8),
+        # U8: S4 + VT extra-8.
+        KQuantizerConfig(name="U8_S4_plus_VT8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_VT_8",
+                         outlier_idx_extra_n=8),
+        # U9: S4 + VV extra-8.
+        KQuantizerConfig(name="U9_S4_plus_VV8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_VV_8",
+                         outlier_idx_extra_n=8),
+        # U10: S4 + balanced 2/block extra-8.
+        KQuantizerConfig(name="U10_S4_plus_BAL8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_BAL_8",
+                         outlier_idx_extra_n=8),
+        # U11: S4 + MM-NIAH-prior extra-8 (averaged composite across MM-NIAH calibs).
+        KQuantizerConfig(name="U11_S4_plus_MMNIAH8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_MMNIAH_PRIOR_8",
+                         outlier_idx_extra_n=8),
+        # U12: S4 + LVB-prior extra-8.
+        KQuantizerConfig(name="U12_S4_plus_LVB8_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=24, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_LVB_PRIOR_8",
+                         outlier_idx_extra_n=8),
+        # U13: S4 + all-block top-16 extra (composite TT+TV+VT+VV, not in S4).
+        #      32 channels total at INT7 → K-bits = 4.750, KV = 4.375.
+        KQuantizerConfig(name="U13_S4_plus_ALL16_INT7", kind="kivi_outlier16",
+                         bits=4, n_outliers=32, calib=calib,
+                         outlier_storage_bits=7,
+                         outlier_idx_extra_key="outlier_idx_EXTRA_ALL_16",
+                         outlier_idx_extra_n=16),
     ]

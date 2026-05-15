@@ -132,6 +132,32 @@ CONDITIONS_NEEDING_CALIB_J = {
 }
 
 
+# Exp U on LongVideoBench-128f — residual channel oracle/policy screen.
+# Same condition semantics as expQ_driver.u_conditions_residual_screen but
+# adapted to the J/G frame-scaling runner (single 128f tier, no PageLayout).
+FIXED_FRAME_CONDITIONS_U = [
+    ("U0_BF16_128f",                128, "F0_BF16",                    "bf16"),
+    ("U1_F4_128f",                  128, "F4_KIVI_PerChannelSeq",      "v1_kcfg"),
+    ("U2_F9_128f",                  128, "F9_KIVI_Outlier16",          "v1_kcfg"),
+    ("U3_S4_INT7_128f",             128, "SL_Outlier16_INT7side",      "v1_kcfg"),
+    ("U4_S4_GEN8_INT7_128f",        128, "U4_S4_plus_GEN8_INT7",       "v1_kcfg"),
+    ("U5_S4_RND8_INT7_128f",        128, "U5_S4_plus_RND8_INT7",       "v1_kcfg"),
+    ("U6_S4_TT8_INT7_128f",         128, "U6_S4_plus_TT8_INT7",        "v1_kcfg"),
+    ("U7_S4_TV8_INT7_128f",         128, "U7_S4_plus_TV8_INT7",        "v1_kcfg"),
+    ("U8_S4_VT8_INT7_128f",         128, "U8_S4_plus_VT8_INT7",        "v1_kcfg"),
+    ("U9_S4_VV8_INT7_128f",         128, "U9_S4_plus_VV8_INT7",        "v1_kcfg"),
+    ("U10_S4_BAL8_INT7_128f",       128, "U10_S4_plus_BAL8_INT7",      "v1_kcfg"),
+    ("U11_S4_MMNIAH8_INT7_128f",    128, "U11_S4_plus_MMNIAH8_INT7",   "v1_kcfg"),
+    ("U12_S4_LVB8_INT7_128f",       128, "U12_S4_plus_LVB8_INT7",      "v1_kcfg"),
+    ("U13_S4_ALL16_INT7_128f",      128, "U13_S4_plus_ALL16_INT7",     "v1_kcfg"),
+]
+
+CONDITIONS_NEEDING_CALIB_U = {
+    name for name, _, _, _ in FIXED_FRAME_CONDITIONS_U
+    if name not in ("U0_BF16_128f", "U1_F4_128f")
+}
+
+
 # Pre-registered Stage-3 anchors (always run regardless of Stage-1 verdict).
 # J15/J16/J17 are pre-registered controls added at Stage 3.
 ANCHORS_ALWAYS_PROMOTED = {
@@ -151,18 +177,32 @@ def build_j_conditions(calib: Optional[dict]) -> list[dict]:
     """Build J-suite condition spec dicts in the shape expected by
     expG_frame_scaling.run_item_at_frames: {name, mode, cfg, frames, f_cfg_name}.
     """
+    return _build_conditions_from_tuples(FIXED_FRAME_CONDITIONS_J, calib)
+
+
+def build_u_conditions_lvb(calib: Optional[dict]) -> list[dict]:
+    """Build U-suite condition spec dicts for LongVideoBench-128f.
+
+    Same shape as build_j_conditions, sharing the calib dict so the F9 anchor
+    and S4 / U-prime configs see both the precomputed top-16 outliers and the
+    EXTRA index arrays merged from the sibling _expU_extras.npz.
+    """
+    return _build_conditions_from_tuples(FIXED_FRAME_CONDITIONS_U, calib)
+
+
+def _build_conditions_from_tuples(specs, calib):
     fc = build_f_conditions(calib=calib)
     by_name = {cfg.name: cfg for cfg in fc}
     out: list[dict] = []
-    for j_name, frames, f_cfg_name, mode in FIXED_FRAME_CONDITIONS_J:
+    for name, frames, f_cfg_name, mode in specs:
         if f_cfg_name not in by_name:
             raise KeyError(
-                f"[expJ] f_cfg_name={f_cfg_name!r} not found in build_f_conditions; "
+                f"[expJ/U] f_cfg_name={f_cfg_name!r} not found in build_f_conditions; "
                 f"available names: {sorted(by_name)}"
             )
         cfg = by_name[f_cfg_name]
         out.append({
-            "name": j_name,
+            "name": name,
             "mode": mode,
             "cfg": cfg,
             "frames": frames,
@@ -199,23 +239,26 @@ def ensure_j_split(stage: int, seed: int = 2) -> Path:
 # ===================================================================
 
 
-def rewrite_experiment_tag_j(out_jsonl: Path, stage: int) -> None:
+def _rewrite_experiment_tag(out_jsonl: Path, exp: str, phase: str) -> None:
     """The reused run_stage_g/run_item_at_frames stamps each row with
-    `experiment="G"` and `phase=f"G{stage}"`. Rewrite to "J" / "J{stage}".
+    experiment="G". Rewrite to the given experiment/phase tag.
     """
     if not out_jsonl.exists():
         return
     rows = [json.loads(l) for l in out_jsonl.read_text().splitlines() if l.strip()]
-    phase_tag = f"J{stage}"
     for r in rows:
-        r["experiment"] = "J"
+        r["experiment"] = exp
         if "phase" in r:
-            r["phase"] = phase_tag
+            r["phase"] = phase
     tmp = out_jsonl.with_suffix(out_jsonl.suffix + ".tmp")
     with open(tmp, "w") as f:
         for r in rows:
             f.write(json.dumps(r) + "\n")
     tmp.replace(out_jsonl)
+
+
+def rewrite_experiment_tag_j(out_jsonl: Path, stage: int) -> None:
+    _rewrite_experiment_tag(out_jsonl, exp="J", phase=f"J{stage}")
 
 
 def backfill_bf16_join_j(out_jsonl: Path,
@@ -301,10 +344,19 @@ def main():
     ap.add_argument("--min_free_gb_256", type=int, default=70,
                     help="Unused at 128f-only; kept for run_stage_g signature.")
     ap.add_argument("--stage3_promotion_file", type=Path, default=None)
+    ap.add_argument("--exp-u", action="store_true",
+                    help="Run Exp U1 (residual channel oracle/policy screen) on "
+                         "LongVideoBench-128f instead of the J-suite. Requires "
+                         "the sibling _expU_extras.npz alongside the calib.")
+    ap.add_argument("--extras-npz", type=Path, default=None,
+                    help="Override the auto-derived expU_extras NPZ path for --exp-u.")
     args = ap.parse_args()
 
     if args.out is None:
-        args.out = RESULTS_DIR / f"expJ_xmodal_stage{args.stage}_seed{args.seed}.jsonl"
+        if args.exp_u:
+            args.out = RESULTS_DIR / f"expU_lvb_stage{args.stage}_seed{args.seed}.jsonl"
+        else:
+            args.out = RESULTS_DIR / f"expJ_xmodal_stage{args.stage}_seed{args.seed}.jsonl"
     if args.split_file is None:
         args.split_file = ensure_j_split(args.stage, seed=args.seed)
     if args.calib_npz is None:
@@ -335,25 +387,91 @@ def main():
     # Validate that the J-suite calibration arrays are present.
     if calib is None:
         raise SystemExit(
-            "[expJ] calibration NPZ not loaded; J-suite needs cross-modal "
+            "[expJ] calibration NPZ not loaded; J/U-suite needs cross-modal "
             "outlier indices. Run expJ_calibrate.py first."
         )
-    required_xmodal_keys = {
-        "outlier_idx_TT_top16", "outlier_idx_TV_top16", "outlier_idx_TT_TV_top16",
-        "outlier_idx_BAL_top16", "outlier_idx_PIVOT_top16",
-        "cell_risk_TT_TV", "cell_risk_all",
-    }
-    missing = required_xmodal_keys - set(calib)
-    if missing:
-        raise SystemExit(
-            f"[expJ] calibration NPZ missing cross-modal arrays: {sorted(missing)}. "
-            f"Available keys: {sorted(calib)}. "
-            f"Re-run expJ_calibrate.py."
-        )
+
+    if args.exp_u:
+        # Exp U merges the residual extras NPZ alongside the calib. The
+        # required keys are the EXTRA index arrays + k_channel_energy.
+        extras_path = args.extras_npz
+        if extras_path is None:
+            extras_path = args.calib_npz.with_name(
+                args.calib_npz.stem + "_expU_extras.npz")
+        if not extras_path.exists():
+            raise SystemExit(
+                f"[expU] required extras NPZ not found: {extras_path}. "
+                f"Run `python expU_compute_extras.py --all` first."
+            )
+        xarr = np.load(extras_path)
+        for k in xarr.files:
+            calib[k] = xarr[k]
+        print(f"[expU] merged extras from {extras_path.name} "
+              f"({len(xarr.files)} new keys)", flush=True)
+        required_u_keys = {
+            "k_channel_energy",
+            "outlier_idx_EXTRA_GEN_8",
+            "outlier_idx_EXTRA_RND_8",
+            "outlier_idx_EXTRA_TT_8", "outlier_idx_EXTRA_TV_8",
+            "outlier_idx_EXTRA_VT_8", "outlier_idx_EXTRA_VV_8",
+            "outlier_idx_EXTRA_BAL_8",
+            "outlier_idx_EXTRA_MMNIAH_PRIOR_8",
+            "outlier_idx_EXTRA_LVB_PRIOR_8",
+            "outlier_idx_EXTRA_ALL_16",
+        }
+        missing = required_u_keys - set(calib)
+        if missing:
+            raise SystemExit(
+                f"[expU] calib+extras missing required arrays: {sorted(missing)}. "
+                f"Available keys: {sorted(calib)}"
+            )
+    else:
+        required_xmodal_keys = {
+            "outlier_idx_TT_top16", "outlier_idx_TV_top16", "outlier_idx_TT_TV_top16",
+            "outlier_idx_BAL_top16", "outlier_idx_PIVOT_top16",
+            "cell_risk_TT_TV", "cell_risk_all",
+        }
+        missing = required_xmodal_keys - set(calib)
+        if missing:
+            raise SystemExit(
+                f"[expJ] calibration NPZ missing cross-modal arrays: {sorted(missing)}. "
+                f"Available keys: {sorted(calib)}. "
+                f"Re-run expJ_calibrate.py."
+            )
 
     # Inject Stage-3 control arrays (J15 random, J16 random-cell, J17
     # error-weighted pivot). Computed on the fly with fixed seeds so the
     # randomness is reproducible and doesn't require recalibration.
+    # Skipped for Exp U (different control arrays — already in extras NPZ).
+    if args.exp_u:
+        conditions = build_u_conditions_lvb(calib=calib)
+        if args.conditions:
+            wanted = set(args.conditions)
+            conditions = [c for c in conditions if c["name"] in wanted]
+            print(f"[expU] filtered conditions: {[c['name'] for c in conditions]}",
+                  flush=True)
+        if not args.append and args.out.exists():
+            args.out.unlink()
+        from run_inference import load_model
+        model, processor = load_model(args.model, dtype="bfloat16",
+                                      attn_impl="sdpa", device_map="auto")
+        lm = getattr(model, "language_model", None) or model.model.language_model
+        layers = lm.layers if hasattr(lm, "layers") else lm.model.layers
+        num_layers = len(layers)
+        num_kv_heads = getattr(model.config, "num_key_value_heads", 4)
+        print(f"[expU] model loaded; num_layers={num_layers} num_kv_heads={num_kv_heads}",
+              flush=True)
+        run_stage_g(model, processor, eval_items,
+                    num_layers=num_layers, num_kv_heads=num_kv_heads,
+                    conditions=conditions, stage=args.stage,
+                    calibration_id=calibration_id,
+                    out_jsonl=args.out, progress_every=args.progress_every,
+                    min_free_gb_for_256=args.min_free_gb_256)
+        # Rewrite the experiment/phase tag from G to U.
+        _rewrite_experiment_tag(args.out, exp="U", phase=f"U{args.stage}")
+        backfill_bf16_join_j(args.out, bf16_cond_name="U0_BF16_128f")
+        return
+
     L, H_kv, D = calib["k_channel_energy"].shape
     n_top = int(calib["outlier_idx_TT_top16"].shape[-1])
     rng_chan = np.random.default_rng(42)

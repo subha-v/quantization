@@ -219,6 +219,13 @@ def main():
                          "and run P/Q/R/U assertions (logits-differ across "
                          "INT7/INT8/INT6, bit-math extended, cold-V K-only, "
                          "BF16 dense V correctly reported).")
+    ap.add_argument("--exp-u", action="store_true",
+                    help="Exp U mode: append U3/U4/U5/U6/U11/U13 residual-extra "
+                         "conditions and run V/W/X/Y/Z assertions on the residual "
+                         "invariant, bit-math, and per-policy logit divergence.")
+    ap.add_argument("--extras-npz", type=Path, default=None,
+                    help="Override the auto-derived expU_extras NPZ path "
+                         "(used with --exp-u).")
     args = ap.parse_args()
 
     os.environ.setdefault("CUDA_VISIBLE_DEVICES", str(args.gpu))
@@ -259,6 +266,22 @@ def main():
     calib = {k: calib_arrays[k] for k in calib_arrays.files}
     log(f"calib keys: {sorted(calib.keys())[:10]}... ({len(calib)} total)")
 
+    # Exp U: merge sibling extras NPZ.
+    if args.exp_u:
+        extras_path = args.extras_npz
+        if extras_path is None:
+            extras_path = args.calib_npz.with_name(
+                args.calib_npz.stem + "_expU_extras.npz")
+        if not extras_path.exists():
+            log(f"FATAL: --exp-u requires expU extras NPZ at {extras_path}; "
+                f"run expU_compute_extras.py first")
+            sys.exit(2)
+        xarr = np.load(extras_path)
+        for k in xarr.files:
+            calib[k] = xarr[k]
+        log(f"[exp-u] merged extras from {extras_path.name} "
+            f"({len(xarr.files)} new keys)")
+
     # 3. Model
     log(f"\n## Loading model {args.model}")
     model, processor = load_model(args.model, dtype="bfloat16", attn_impl="sdpa",
@@ -291,6 +314,16 @@ def main():
             if c.name in ("S3", "S4", "S5"):
                 primary.append(c)
         log("[exp-t] appended S3 (INT8) / S4 (INT7) / S5 (INT6) to smoke pool")
+
+    # Exp U: append a compact set of U conditions so the smoke assertions
+    # have real prefill K data to inspect. U3 (S4 anchor) + U4 (GEN extra) +
+    # U5 (RND extra) + U6 (TT extra) + U11 (MMNIAH prior) + U13 (ALL16).
+    if args.exp_u:
+        from expQ_driver import u_conditions_residual_screen
+        for c in u_conditions_residual_screen():
+            if c.name in ("U3", "U4", "U5", "U6", "U7", "U11", "U12", "U13"):
+                primary.append(c)
+        log("[exp-u] appended U3/U4/U5/U6/U7/U11/U12/U13 to smoke pool")
 
     cond_to_kcfg = {c.name: resolve_k_cfg(c.k_cfg_name, calib) if c.k_cfg_name else None
                     for c in primary}
@@ -657,6 +690,112 @@ def main():
             check(f"U.bf16_kv_16 item={it.id}",
                   kv_bits is not None and abs(kv_bits - 16.0) < 1e-6,
                   f"Q0 BF16 kv_bits={kv_bits} (expected 16.0 = (16+16)/2)")
+
+    # ===========================================================
+    # Exp U assertions (V/W/X/Y/Z) — run only with --exp-u.
+    # ===========================================================
+    if args.exp_u:
+        # V. U3 (S4 anchor inside U-suite) matches existing S4 condition
+        #    semantically — its bit math is (16 channels at INT7) → K=4.375.
+        log("\n## V. U3 (S4 anchor inside U) effective_k_bits = 4.375, KV = 4.1875")
+        for it in smoke_items:
+            r = by_cond.get("U3", {}).get(it.id, {})
+            k_bits = r.get("effective_k_bits")
+            kv_bits = r.get("effective_kv_bits")
+            check(f"V.bits_U3_k item={it.id}",
+                  k_bits is not None and abs(k_bits - 4.375) < 1e-3,
+                  f"k_bits={k_bits} (expected 4.375)")
+            check(f"V.bits_U3_kv item={it.id}",
+                  kv_bits is not None and abs(kv_bits - 4.1875) < 1e-3,
+                  f"kv_bits={kv_bits} (expected 4.1875)")
+
+        # W. U4..U12 (24 channels at INT7) → K=4.5625, KV=4.28125
+        log("\n## W. U4..U12 effective_k_bits = 4.5625, KV = 4.28125")
+        for cond_name in ("U4", "U5", "U6", "U7", "U11", "U12"):
+            for it in smoke_items:
+                r = by_cond.get(cond_name, {}).get(it.id, {})
+                k_bits = r.get("effective_k_bits")
+                kv_bits = r.get("effective_kv_bits")
+                check(f"W.bits_{cond_name}_k item={it.id}",
+                      k_bits is not None and abs(k_bits - 4.5625) < 1e-3,
+                      f"k_bits={k_bits} (expected 4.5625)")
+                check(f"W.bits_{cond_name}_kv item={it.id}",
+                      kv_bits is not None and abs(kv_bits - 4.28125) < 1e-3,
+                      f"kv_bits={kv_bits} (expected 4.28125)")
+
+        # X. U13 (32 channels at INT7) → K=4.75, KV=4.375
+        log("\n## X. U13 effective_k_bits = 4.75, KV = 4.375")
+        for it in smoke_items:
+            r = by_cond.get("U13", {}).get(it.id, {})
+            k_bits = r.get("effective_k_bits")
+            kv_bits = r.get("effective_kv_bits")
+            check(f"X.bits_U13_k item={it.id}",
+                  k_bits is not None and abs(k_bits - 4.75) < 1e-3,
+                  f"k_bits={k_bits} (expected 4.75)")
+            check(f"X.bits_U13_kv item={it.id}",
+                  kv_bits is not None and abs(kv_bits - 4.375) < 1e-3,
+                  f"kv_bits={kv_bits} (expected 4.375)")
+
+        # Y. Residual invariant on the calib NPZ — every EXTRA_*_8 array has
+        #    empty intersection with the S4 top-16 set, per (L, H_kv) cell.
+        log("\n## Y. Residual invariant: every EXTRA array is disjoint from S4-top-16")
+        s4_arr = calib.get("outlier_channel_idx_top16")
+        if s4_arr is None and "k_channel_energy" in calib:
+            energy = np.asarray(calib["k_channel_energy"])
+            s4_arr = (np.argsort(energy, axis=-1)[..., -16:][..., ::-1]
+                      .astype(np.int32).copy())
+        for key in ("outlier_idx_EXTRA_GEN_8", "outlier_idx_EXTRA_RND_8",
+                    "outlier_idx_EXTRA_TT_8", "outlier_idx_EXTRA_TV_8",
+                    "outlier_idx_EXTRA_VT_8", "outlier_idx_EXTRA_VV_8",
+                    "outlier_idx_EXTRA_BAL_8",
+                    "outlier_idx_EXTRA_MMNIAH_PRIOR_8",
+                    "outlier_idx_EXTRA_LVB_PRIOR_8",
+                    "outlier_idx_EXTRA_ALL_16"):
+            arr = calib.get(key)
+            if arr is None:
+                check(f"Y.has_{key}", False, "key missing from calib+extras")
+                continue
+            L, H_kv, _ = s4_arr.shape
+            bad_cells = 0
+            for l in range(L):
+                for h in range(H_kv):
+                    s = set(int(x) for x in s4_arr[l, h].tolist())
+                    e = set(int(x) for x in arr[l, h].tolist())
+                    if s & e:
+                        bad_cells += 1
+            check(f"Y.residual_{key}", bad_cells == 0,
+                  f"{bad_cells}/{L*H_kv} cells overlap with S4")
+
+        # Z. U6 (TT) / U7 (TV) / U11 (MMNIAH-prior) logits differ from U3 (S4 anchor)
+        #    on at least one smoke item — verifies extra channels are actually
+        #    different from the anchor (not silently empty).
+        log("\n## Z. Extra-channel policies produce logits distinct from U3")
+        for u_name in ("U6", "U7", "U11", "U12", "U13"):
+            any_differ = False
+            for it in smoke_items:
+                u3 = by_cond.get("U3", {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+                ux = by_cond.get(u_name, {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+                if _l2(ux, u3) > 1e-4:
+                    any_differ = True
+                    break
+            check(f"Z.logits_{u_name}_differs_from_U3", any_differ,
+                  f"||{u_name} - U3|| <= 1e-4 on ALL smoke items — extra channels "
+                  f"may be silently inactive")
+
+        # AA. Cross-policy distinctness — U6 (TT) vs U7 (TV) must differ on at
+        # least one item; otherwise extras NPZ has degenerate priors.
+        log("\n## AA. Distinct extra-channel policies produce distinct logits")
+        for a, b in (("U6", "U7"), ("U6", "U8"), ("U11", "U12")):
+            any_differ = False
+            for it in smoke_items:
+                la = by_cond.get(a, {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+                lb = by_cond.get(b, {}).get(it.id, {}).get("first_logits_AD", [0]*4)
+                if _l2(la, lb) > 1e-4:
+                    any_differ = True
+                    break
+            check(f"AA.{a}_vs_{b}_differs", any_differ,
+                  f"||{a} - {b}|| <= 1e-4 on ALL smoke items — "
+                  f"likely identical extra arrays (check extras NPZ)")
 
     log(f"\n## SUMMARY")
     log(f"PASS: {n_pass}")

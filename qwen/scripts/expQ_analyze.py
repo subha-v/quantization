@@ -194,6 +194,11 @@ def slice_cond_order(slice_tag: str) -> list[str]:
     if slice_tag == "S":
         # Exp S Phase 1 sidecode ladder.
         return ["S0", "S1", "S2", "S3", "S4", "S5", "S6", "S7", "S8", "S9"]
+    if slice_tag == "U":
+        # Exp U1 residual channel oracle/policy screen.
+        return ["U0", "U1", "U2", "U3", "U4", "U5",
+                "U6", "U7", "U8", "U9", "U10",
+                "U11", "U12", "U13"]
     return []
 
 
@@ -370,6 +375,62 @@ def pairs_slice_c() -> list[tuple[str, str, str]]:
     ]
 
 
+def pairs_slice_u() -> list[tuple[str, str, str]]:
+    """Exp U1 — residual channel oracle/policy screen load-bearing pairs.
+
+    Anchors: U2 = F9 (4.75 KV bits), U3 = S4 (4.1875 KV bits, anchor).
+    Extra-8 conditions: U4 GEN, U5 RND, U6 TT, U7 TV, U8 VT, U9 VV, U10 BAL,
+                        U11 MMNIAH-prior, U12 LVB-prior. All at 4.28125 KV bits.
+    U13 = ALL-16 extra (4.375 KV bits).
+    """
+    return [
+        # Anchors
+        ("U2", "U0", "F9 vs BF16 ceiling (anchor sanity)"),
+        ("U3", "U0", "S4 vs BF16 ceiling"),
+        ("U3", "U2", "S4 (INT7, 4.1875) vs F9 (4.75) — Pareto-tie test from Exp S"),
+        # Does ANY extra help over the S4 anchor?
+        ("U4", "U3", "GEN extra-8 vs S4 anchor — does generic-energy extra help?"),
+        ("U6", "U3", "TT extra-8 vs S4 anchor"),
+        ("U7", "U3", "TV extra-8 vs S4 anchor"),
+        ("U8", "U3", "VT extra-8 vs S4 anchor"),
+        ("U9", "U3", "VV extra-8 vs S4 anchor"),
+        ("U10", "U3", "BAL extra-8 vs S4 anchor"),
+        ("U11", "U3", "MM-NIAH-prior extra-8 vs S4 anchor"),
+        ("U12", "U3", "LVB-prior extra-8 vs S4 anchor"),
+        ("U13", "U3", "ALL-16 extra vs S4 anchor (extra-16 at 4.375 KV bits)"),
+        # Structured vs random (central question)
+        ("U6", "U5", "TT vs RND extra-8 — structured selection >= random?"),
+        ("U7", "U5", "TV vs RND extra-8"),
+        ("U8", "U5", "VT vs RND extra-8"),
+        ("U9", "U5", "VV vs RND extra-8"),
+        ("U10", "U5", "BAL vs RND extra-8"),
+        ("U11", "U5", "MM-NIAH-prior vs RND extra-8"),
+        ("U12", "U5", "LVB-prior vs RND extra-8"),
+        # Structured vs generic-energy
+        ("U6", "U4", "TT vs GEN extra-8"),
+        ("U7", "U4", "TV vs GEN extra-8"),
+        ("U8", "U4", "VT vs GEN extra-8"),
+        ("U9", "U4", "VV vs GEN extra-8"),
+        ("U10", "U4", "BAL vs GEN extra-8"),
+        ("U11", "U4", "MM-NIAH-prior vs GEN extra-8"),
+        ("U12", "U4", "LVB-prior vs GEN extra-8"),
+        # Balanced vs single-block
+        ("U10", "U6", "BAL vs TT extra-8"),
+        ("U10", "U7", "BAL vs TV extra-8"),
+        ("U10", "U8", "BAL vs VT extra-8"),
+        ("U10", "U9", "BAL vs VV extra-8"),
+        # Same-domain prior vs foreign-domain prior — KEY transfer test
+        ("U11", "U12", "MM-NIAH-prior vs LVB-prior — cross-domain transfer"),
+        # Extra-16 vs extra-8 (diminishing returns?)
+        ("U13", "U4", "ALL-16 vs GEN-8 (4.375 vs 4.28125 KV bits)"),
+        # Does best-U match F9 below 4.75 KV bits?
+        ("U6", "U2", "TT extra-8 vs F9 dense"),
+        ("U10", "U2", "BAL extra-8 vs F9 dense"),
+        ("U11", "U2", "MM-NIAH-prior extra-8 vs F9 dense"),
+        ("U13", "U2", "ALL-16 extra vs F9 dense (closest to F9 bits)"),
+    ]
+
+
 def pairs_slice_a() -> list[tuple[str, str, str]]:
     return [
         ("Q2", "Q0", "F9 vs BF16 anchor"),
@@ -413,6 +474,8 @@ def write_paired(rows: list[dict], out_md: Path, slice_tag: str) -> None:
         pairs = pairs_slice_c()
     elif slice_tag == "S":
         pairs = pairs_slice_s()
+    elif slice_tag == "U":
+        pairs = pairs_slice_u()
     else:
         pairs = []
     lines = [f"# Exp Q/R paired McNemar slice {slice_tag} — "
@@ -540,6 +603,90 @@ def write_branch_json(rows: list[dict], out_json: Path, slice_tag: str) -> dict:
                      ("C4", "S8"), ("C7", "S8"), ("C4", "C2"), ("C7", "C2")):
             if a in rows_by_item and b in rows_by_item:
                 out["paired_net"][f"{a}_vs_{b}"] = _paired_net(rows_by_item[a], rows_by_item[b])
+    elif slice_tag == "U":
+        # Exp U1 — residual channel oracle/policy screen.
+        out["accuracy"] = {c: _acc(rs) for c, rs in by_cond.items()}
+        out["paired_net"] = {}
+
+        u_extras = ("U4", "U5", "U6", "U7", "U8", "U9",
+                    "U10", "U11", "U12", "U13")
+
+        # 1. Does ANY extra-N policy paired-significantly beat the S4 anchor?
+        any_beats_s4 = False
+        for u in u_extras:
+            if u in rows_by_item and "U3" in rows_by_item:
+                m = paired_mcnemar(rows_by_item[u], rows_by_item["U3"])
+                out["paired_net"][f"{u}_vs_U3"] = (
+                    m["a_only_correct"] - m["b_only_correct"]
+                )
+                if m["chi2"] >= 3.84 and m["favored"] == "A":
+                    any_beats_s4 = True
+        out["pass_any_extra_beats_s4"] = any_beats_s4
+
+        # 2. Does any structured extra paired-significantly beat random (U5)?
+        structured = ("U6", "U7", "U8", "U9", "U10",
+                      "U11", "U12", "U13")
+        structured_beats_random = False
+        for u in structured:
+            if u in rows_by_item and "U5" in rows_by_item:
+                m = paired_mcnemar(rows_by_item[u], rows_by_item["U5"])
+                out["paired_net"][f"{u}_vs_U5"] = (
+                    m["a_only_correct"] - m["b_only_correct"]
+                )
+                if m["chi2"] >= 3.84 and m["favored"] == "A":
+                    structured_beats_random = True
+        out["pass_structured_beats_random"] = structured_beats_random
+
+        # 3. Does any U paired-tie or beat F9 (U2) at < 4.75 KV bits?
+        def _mean_ekvb(cond_name: str) -> float:
+            if cond_name not in by_cond:
+                return float("nan")
+            vals = [r.get("effective_kv_bits") for r in by_cond[cond_name]
+                    if r.get("effective_kv_bits") is not None]
+            return float(np.mean(vals)) if vals else float("nan")
+
+        match_or_beat_f9 = False
+        for u in u_extras:
+            if u not in rows_by_item or "U2" not in rows_by_item:
+                continue
+            m = paired_mcnemar(rows_by_item[u], rows_by_item["U2"])
+            kvb = _mean_ekvb(u)
+            tie_or_better = m["chi2"] < 3.84 or m["favored"] == "A"
+            if tie_or_better and not math.isnan(kvb) and kvb < 4.75 - 1e-3:
+                match_or_beat_f9 = True
+                break
+        out["pass_match_or_beat_f9"] = match_or_beat_f9
+
+        # 4. Winning policy — argmax accuracy among U4..U13 (tie-break = lower KV bits).
+        candidates = []
+        for u in u_extras:
+            if u in by_cond:
+                candidates.append((u, _acc(by_cond[u]), _mean_ekvb(u)))
+        candidates_sorted = sorted(candidates, key=lambda t: (-t[1], t[2]))
+        out["winning_policy"] = candidates_sorted[0][0] if candidates_sorted else None
+        out["candidate_ranking"] = [
+            {"cond": c, "acc": a, "eff_kv_bits": k} for c, a, k in candidates_sorted
+        ]
+
+        # 5. Same-prior beats foreign-prior?
+        if "U11" in rows_by_item and "U12" in rows_by_item:
+            m = paired_mcnemar(rows_by_item["U11"], rows_by_item["U12"])
+            out["pass_same_prior_beats_foreign"] = (
+                m["chi2"] >= 3.84 and m["favored"] == "A"
+            )
+            out["paired_net"]["U11_vs_U12"] = (
+                m["a_only_correct"] - m["b_only_correct"]
+            )
+        else:
+            out["pass_same_prior_beats_foreign"] = False
+
+        # Anchor sanity: U3 ~ Exp S S4 (retrieval = 0.571 ± 0.04 expected);
+        # U2 ~ Exp S F9 (0.548 ± 0.04). Just record actuals; the orchestrator
+        # decides whether to fail on drift.
+        out["anchor_actual"] = {
+            "U3_acc": _acc(by_cond.get("U3", [])),
+            "U2_acc": _acc(by_cond.get("U2", [])),
+        }
     else:
         # Slice B does not branch into further reseeds in this plan.
         out["accuracy"] = {c: _acc(rs) for c, rs in by_cond.items()}
@@ -642,6 +789,55 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
                         f"need_q8_seeds={branch.get('need_q8_seeds')} "
                         f"need_q11_seeds={branch.get('need_q11_seeds')}")
         verdicts.append(f"Slice B recommendation: {branch.get('slice_b_recommendation')}")
+    elif slice_tag == "U":
+        u0, u1, u2, u3 = acc("U0"), acc("U1"), acc("U2"), acc("U3")
+        if not any(math.isnan(x) for x in (u0, u1, u2, u3)):
+            verdicts.append(
+                f"Anchors: U0 BF16={u0:.3f} U1 F4={u1:.3f} "
+                f"U2 F9={u2:.3f} U3 S4={u3:.3f}"
+            )
+
+        # Headline rules per the plan
+        verdicts.append(
+            f"pass_any_extra_beats_s4 = {branch.get('pass_any_extra_beats_s4')}"
+        )
+        verdicts.append(
+            f"pass_structured_beats_random = {branch.get('pass_structured_beats_random')}"
+        )
+        verdicts.append(
+            f"pass_match_or_beat_f9 = {branch.get('pass_match_or_beat_f9')}"
+        )
+        verdicts.append(
+            f"pass_same_prior_beats_foreign (U11 > U12) = "
+            f"{branch.get('pass_same_prior_beats_foreign')}"
+        )
+        verdicts.append(
+            f"winning_policy = {branch.get('winning_policy')}"
+        )
+
+        # Top-3 candidates with their KV bits.
+        ranking = branch.get("candidate_ranking") or []
+        for r in ranking[:3]:
+            verdicts.append(
+                f"  {r['cond']}: acc={r['acc']:.3f} eff_kv_bits={r['eff_kv_bits']:.3f}"
+            )
+
+        # Strong-pass / clean-fail summary.
+        strong_pass = (
+            branch.get("pass_any_extra_beats_s4")
+            and branch.get("pass_structured_beats_random")
+            and branch.get("pass_match_or_beat_f9")
+        )
+        if strong_pass:
+            verdicts.append(
+                f"STRONG PASS on this slice — extra-channel structure is "
+                f"load-bearing; cross-slice differential (vs other datasets) "
+                f"determines the Wonsuk-central headline."
+            )
+        else:
+            verdicts.append(
+                f"NOT STRONG PASS — at least one of the three pass conditions failed."
+            )
     else:
         # Slice B
         r0, r2 = acc("R0"), acc("R2")
@@ -674,6 +870,14 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
                 "Q3": "ROLE_ONLY",
                 "Q6": "ORACLE", "Q9": "ORACLE",
             }.get(c, "PROPOSED")
+        elif slice_tag == "U":
+            status = {
+                "U0": "ANCHOR", "U1": "ANCHOR", "U2": "ANCHOR", "U3": "ANCHOR",
+                "U4": "GENERIC_EXTRA", "U5": "RANDOM_CONTROL",
+                "U6": "TT", "U7": "TV", "U8": "VT", "U9": "VV",
+                "U10": "BALANCED", "U11": "MMNIAH_PRIOR",
+                "U12": "LVB_PRIOR", "U13": "ALL16_EXTRA",
+            }.get(c, "PROPOSED")
         else:
             status = {"R0": "ANCHOR", "R1": "ANCHOR", "R2": "ANCHOR",
                       "R3": "ROLE_ONLY", "R6": "ORACLE"}.get(c, "PROPOSED")
@@ -685,10 +889,15 @@ def write_verdict(rows: list[dict], out_md: Path, slice_tag: str,
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--slice", choices=("A", "B", "C", "S"), default="A",
+    ap.add_argument("--slice", choices=("A", "B", "C", "S", "U"), default="A",
                     help="A=Slice A retrieval-image (Exp Q), B=Slice B reasoning-image (Exp Q), "
                          "C=Exp R Sub-experiment C (AllVisual + static baselines), "
-                         "S=Exp S Phase 1 sidecode bit-ladder (S0..S9).")
+                         "S=Exp S Phase 1 sidecode bit-ladder (S0..S9), "
+                         "U=Exp U1 residual channel oracle/policy screen (U0..U13).")
+    ap.add_argument("--out-prefix", default=None,
+                    help="Override the output file prefix. Default: expQ for "
+                         "A/B/C/S; expU for U. Useful when running multiple Exp U "
+                         "slices that need separate output paths.")
     ap.add_argument("--in-jsonl", type=Path, default=None,
                     help="Default: results/expQ_rollouts_slice{A|B}.jsonl")
     ap.add_argument("--out-summary", type=Path, default=None)
@@ -699,16 +908,23 @@ def main():
                     help="Emit branch JSON only (no markdown writes).")
     args = ap.parse_args()
 
+    if args.out_prefix is not None:
+        prefix = args.out_prefix
+    elif args.slice == "U":
+        prefix = "expU"
+    else:
+        prefix = "expQ"
+
     if args.in_jsonl is None:
-        args.in_jsonl = RESULTS_DIR / f"expQ_rollouts_slice{args.slice}.jsonl"
+        args.in_jsonl = RESULTS_DIR / f"{prefix}_rollouts_slice{args.slice}.jsonl"
     if args.out_summary is None:
-        args.out_summary = RESULTS_DIR / f"expQ_summary_slice{args.slice}.md"
+        args.out_summary = RESULTS_DIR / f"{prefix}_summary_slice{args.slice}.md"
     if args.out_paired is None:
-        args.out_paired = RESULTS_DIR / f"expQ_paired_slice{args.slice}.md"
+        args.out_paired = RESULTS_DIR / f"{prefix}_paired_slice{args.slice}.md"
     if args.out_verdict is None:
-        args.out_verdict = RESULTS_DIR / f"expQ_verdict_matrix_slice{args.slice}.md"
+        args.out_verdict = RESULTS_DIR / f"{prefix}_verdict_matrix_slice{args.slice}.md"
     if args.out_branch is None:
-        args.out_branch = RESULTS_DIR / f"expQ_branch_slice{args.slice}.json"
+        args.out_branch = RESULTS_DIR / f"{prefix}_branch_slice{args.slice}.json"
 
     rows = load_rollouts(args.in_jsonl)
     if not rows:
