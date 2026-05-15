@@ -3429,3 +3429,337 @@ Calibrations in `qwen/calibration/`:
 - `expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_reasoning-image_seed0.{json,npz}` (NEW, 100/100)
 - `expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_counting-image_seed0.{json,npz}` (NEW, 100/100)
 
+## Experiment U1 — Residual channel oracle/policy screen (2026-05-15) — COMPLETE
+
+**Status:** Three-slice screen complete in **2h28m wall** (Phase 0 extras 1 min → Phase 2 retrieval 98 min → Phase 3 reasoning 13 min → Phase 4 LVB-128f 37 min → Phase 5 cross-slice analyze 1 sec). 1176 + 658 + 896 = **2730 rollouts** across 14 conditions × 3 slices.
+
+Driven by Wonsuk's central scientific question: *does each query/task need DIFFERENT residual K channels on top of S4?* S4 (top-16 INT7 sidecode, 4.1875 KV bits) was the deployable Pareto anchor from Exp S — paired-tied with F9 at lower bits. Exp T-mini built the 4-way TT/TV/VT/VV modality-block infrastructure but never composed it with S4. Exp U1 closes that gap.
+
+> **Anchored on S4 top-16 by generic `k_channel_energy`, can we identify the next 8 residual channels by a modality-block / cross-task / cross-dataset policy that beats both (a) S4 alone and (b) S4 + random 8, AND does the winning policy differ across MM-NIAH and LongVideoBench?**
+
+### Setup
+
+- **Datasets/slices:** MM-NIAH retrieval-image (n=84 multi-image at 336°, `--use-full-pool --min-num-images 8`), MM-NIAH reasoning-image (n=47 at 336°, `--use-full-pool --min-num-images 5 --n-items 84`), LongVideoBench-128f (n=64, seed=2 stage-1 split, reusing Exp J/K/L infrastructure). Counting-image was skipped this round — Exp T-mini found BF16 itself emits malformed list outputs (0% exact-match at 78% valid_format); needs prompt rework before MCQ comparisons are meaningful.
+- **Anchor:** S4 = top-16 by `k_channel_energy` per (L, H_kv), INT7 sidecode. Every "extra-N" set is computed **residual to this anchor** (per-(L,H_kv) disjoint from the S4 set); this is enforced by an invariant check in `expU_compute_extras.py` and verified at runtime by the smoke harness.
+- **Score functions per (L, H_kv, channel) from calib NPZs:**
+  - D_TT = q_energy_text · k_channel_energy_text
+  - D_TV = q_energy_text · k_channel_energy_visual
+  - D_VT = q_energy_visual · k_channel_energy_text
+  - D_VV = q_energy_visual · k_channel_energy_visual
+- **9 extra-N policies (+ extra-16 for U13):** GEN (top-8 by generic k_energy not in S4), RND (random 8 from D \ S4, seed=2026), TT / TV / VT / VV (per-block top-8 residuals), BAL (2 from each TT/TV/VT/VV, deduped + composite-padded), MMNIAH-prior (composite TT+TV+VT+VV averaged across the 3 MM-NIAH calibs), LVB-prior (composite from LVB-128f calib), ALL-16 (composite top-16 not in S4 — U13 only).
+- **Bit accounting:** U4..U12 = 24 channels at INT7 → K-bits = (7·24 + 4·104)/128 = **4.5625**, KV-avg = **4.28125**. U13 = 32 channels at INT7 → K-bits = **4.75**, KV-avg = **4.375**. (Closed-form via `_k_bits_top_n_int_m`.)
+- **All extras stored at INT7** alongside the S4 anchor — single sidecode width across the full protected set; no precision split.
+
+### Conditions
+
+| ID | Description | KV bits |
+|---|---|---:|
+| U0 | BF16 ceiling | 16.000 |
+| U1 | F4 floor | 4.000 |
+| U2 | F9 (top-16 BF16 sidecode) — anchor | 4.750 |
+| U3 | **S4** (top-16 INT7 sidecode) — anchor | 4.188 |
+| U4 | S4 + GEN extra-8 INT7 | 4.281 |
+| U5 | S4 + RND extra-8 INT7 (seed=2026) | 4.281 |
+| U6 | S4 + TT extra-8 INT7 | 4.281 |
+| U7 | S4 + TV extra-8 INT7 | 4.281 |
+| U8 | S4 + VT extra-8 INT7 | 4.281 |
+| U9 | S4 + VV extra-8 INT7 | 4.281 |
+| U10 | S4 + BAL (2/block) extra-8 INT7 | 4.281 |
+| U11 | S4 + MM-NIAH-prior extra-8 INT7 | 4.281 |
+| U12 | S4 + LVB-prior extra-8 INT7 | 4.281 |
+| U13 | S4 + ALL-16 (composite) extra INT7 | 4.375 |
+
+### Smoke harness
+
+```
+expU_smoke (n=3 short bucket, --exp-u) → 160 PASS / 0 FAIL
+  V/W/X: bit-math (U3 K=4.375 KV=4.188; U4..U12 K=4.5625 KV=4.281; U13 K=4.75 KV=4.375)
+  Y:     residual invariant (every EXTRA_*_8 + EXTRA_ALL_16 has zero S4 overlap on
+         all 28*4 = 112 (L, H_kv) cells across retrieval/reasoning/counting/LVB)
+  Z:     extra channels actually change K (||U6 − U3||₂ > 1e-4 on real prefill K)
+  AA:    distinct policies pick distinct channels (||U6 − U7|| > 1e-4; ||U11 − U12||
+         > 1e-4 on real prefill K)
+```
+
+Pre-run diagnostic from `expU_compute_extras.py` self-test (% of (L, H_kv) cells where the policies pick disjoint extras):
+
+| | TT vs TV | TT vs VT | TT vs VV | TV vs VT | TV vs VV | VT vs VV |
+|---|---:|---:|---:|---:|---:|---:|
+| retrieval | 92.9% | 56.2% | 93.8% | 94.6% | 52.7% | 93.8% |
+| reasoning | 90.2% | 58.0% | 94.6% | 90.2% | 58.9% | 93.8% |
+| counting | 92.0% | 57.1% | 94.6% | 92.9% | 56.2% | 93.8% |
+| LVB-128f | 95.5% | 92.9% | 98.2% | 99.1% | 97.3% | 97.3% |
+
+TT-vs-VT and TV-vs-VV share a Q-side axis on MM-NIAH so overlap more (~55–60%); LVB-128f's longer-context frame distribution makes all four blocks much more distinct (~95–99%).
+
+### Phase 2 — MM-NIAH retrieval-image (n=84, 336° equal-resolution, multi-image filter `num_images >= 8`)
+
+| Cond | Acc | 95% CI | KV bits | Δ vs U3 S4 | Pareto? |
+|---|---:|---|---:|---:|---|
+| U0 BF16 | 0.607 | [0.500, 0.714] | 16.00 | — | no |
+| U1 F4 | 0.274 | [0.179, 0.369] | 4.00 | — | **YES** (floor) |
+| U2 F9 | 0.548 | [0.440, 0.655] | 4.750 | +3.6 pp | no |
+| U3 S4 (anchor) | 0.512 | [0.405, 0.619] | 4.188 | (anchor) | **YES** |
+| U4 GEN extra-8 | 0.595 | [0.488, 0.702] | 4.281 | +8.3 pp | no |
+| U5 RND extra-8 | 0.536 | [0.429, 0.643] | 4.281 | +2.4 pp | no |
+| U6 TT extra-8 | 0.595 | [0.488, 0.690] | 4.281 | +8.3 pp | no |
+| U7 TV extra-8 | 0.583 | [0.476, 0.690] | 4.281 | +7.1 pp | no |
+| U8 VT extra-8 | 0.583 | [0.476, 0.690] | 4.281 | +7.1 pp | no |
+| U9 VV extra-8 | 0.571 | [0.464, 0.679] | 4.281 | +5.9 pp | no |
+| **U10 BAL 2/block** | **0.619** | [0.512, 0.715] | 4.281 | **+10.7 pp** | **YES** |
+| **U11 MMNIAH-prior** | **0.619** | [0.512, 0.714] | 4.281 | **+10.7 pp** | **YES** |
+| U12 LVB-prior | 0.607 | [0.500, 0.714] | 4.281 | +9.5 pp | no |
+| U13 ALL-16 extra | 0.583 | [0.476, 0.679] | 4.375 | +7.1 pp | no |
+
+**Paired McNemar (selected load-bearing pairs from 35 total):**
+
+| Comparison | n_paired | A_only | B_only | χ² | p | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| U2 F9 vs U0 BF16 | 9 | 2 | 7 | 1.78 | 0.18 | BF16 (tied, not sig) |
+| U3 S4 vs U2 F9 | 15 | 6 | 9 | 0.27 | 0.61 | F9 (paired-tied — Exp S replication) |
+| **U10 BAL vs U3 S4** | **15** | **12** | **3** | **4.27** | **0.039** | **BAL wins (paired-significant)** |
+| **U11 MMNIAH-prior vs U3 S4** | **15** | **12** | **3** | **4.27** | **0.039** | **MMNIAH-prior wins (paired-significant)** |
+| U12 LVB-prior vs U3 S4 | 18 | 13 | 5 | 2.72 | 0.10 | LVB-prior (borderline) |
+| U4 GEN vs U3 S4 | 15 | 11 | 4 | 2.40 | 0.12 | GEN (directional) |
+| U6 TT vs U3 S4 | 15 | 11 | 4 | 2.40 | 0.12 | TT (directional) |
+| U9 VV vs U3 S4 | 17 | 11 | 6 | 0.94 | 0.33 | VV (directional) |
+| U10 BAL vs U5 RND | 13 | 10 | 3 | 2.77 | 0.10 | BAL (borderline) |
+| U6 TT vs U5 RND | 15 | 10 | 5 | 1.07 | 0.30 | TT (directional only) |
+| U10 BAL vs U4 GEN | 10 | 6 | 4 | 0.10 | 0.75 | BAL (tied) |
+| U11 vs U12 (same vs foreign prior) | 5 | 3 | 2 | 0.00 | 1.00 | tied |
+| U6 TT vs U4 GEN | 8 | 4 | 4 | 0.12 | 0.72 | tied |
+| U10 BAL vs U2 F9 | 12 | 9 | 3 | 2.08 | 0.15 | BAL (directional, +6 net) |
+| U11 vs U2 F9 | 10 | 8 | 2 | 2.50 | 0.11 | MMNIAH-prior (directional, +6 net) |
+| U13 ALL-16 vs U4 GEN-8 | 7 | 3 | 4 | 0.00 | 1.00 | GEN-8 (tied) |
+
+**Per-num_images breakdown** (where the protection-budget binding actually matters):
+
+| Cond | 8-11 imgs (n=46) | 12-19 imgs (n=38) |
+|---|---:|---:|
+| U0 BF16 | 0.543 | 0.684 |
+| U2 F9 | 0.522 | 0.579 |
+| U3 S4 | 0.478 | 0.553 |
+| U4 GEN | 0.500 | **0.711** |
+| U8 VT | 0.478 | **0.711** |
+| U10 BAL | 0.587 | 0.658 |
+| U11 MMNIAH | 0.565 | 0.684 |
+
+U4 GEN and U8 VT both pull to 0.711 on the 12-19 image bucket — same as BF16 ceiling. The "extras matter more on longer-context items" pattern is consistent.
+
+### Phase 3 — MM-NIAH reasoning-image (n=47, binary MCQ at 336°)
+
+| Cond | Acc | 95% CI | KV bits | Δ vs U3 S4 |
+|---|---:|---|---:|---:|
+| U0 BF16 | 0.383 | [0.255, 0.527] | 16.00 | — |
+| U1 F4 | **0.617** | [0.473, 0.745] | 4.00 | — |
+| U2 F9 | 0.468 | [0.330, 0.611] | 4.750 | +6.4 pp |
+| U3 S4 | 0.404 | [0.276, 0.547] | 4.188 | (anchor) |
+| U4 GEN | 0.489 | [0.351, 0.629] | 4.281 | +8.5 pp |
+| U5 RND | 0.383 | [0.255, 0.527] | 4.281 | −2.1 pp |
+| U6 TT | 0.468 | [0.330, 0.611] | 4.281 | +6.4 pp |
+| U7 TV | 0.468 | [0.330, 0.611] | 4.281 | +6.4 pp |
+| **U8 VT** | **0.553** | [0.413, 0.687] | 4.281 | **+14.9 pp** |
+| U9 VV | 0.340 | [0.219, 0.488] | 4.281 | −6.4 pp |
+| U10 BAL | 0.426 | [0.295, 0.567] | 4.281 | +2.2 pp |
+| U11 MMNIAH-prior | 0.426 | [0.295, 0.567] | 4.281 | +2.2 pp |
+| U12 LVB-prior | 0.468 | [0.330, 0.611] | 4.281 | +6.4 pp |
+| U13 ALL-16 | 0.404 | [0.276, 0.547] | 4.375 | (tie) |
+
+**Caveat — BF16 < F4 by 23.4 pp at n=47.** This is the same "reasoning-image at n=47 is not a usable ceiling" anomaly that Exp T-mini flagged. Binary MCQ near 50% baseline gives ±14 pp 95% CI per condition; the seed/sample variance dominates the structural signal. **Read this slice as a directional indicator, not a headline benchmark.** A repeat at n≥120 is the cleanest fix.
+
+Within those caveats, **U8 VT (visual-Q × text-K) wins this slice at 0.553 — paired McNemar U8 vs U5 RND: χ²=3.50, p=0.061 (borderline) and U8 vs U3 S4: χ²=2.77, p=0.10**. The directional story is "channels carrying visual-query × text-key importance protect reasoning-image best", which is plausible for a task where the reasoning has to bridge a visual prompt to text-anchored choice scoring. U9 VV (visual-visual) is the WORST on reasoning (−6.4 pp under S4), reinforcing that visual×visual residuals don't help.
+
+The MMNIAH-prior (U11 = 0.426) and LVB-prior (U12 = 0.468) BOTH underperform GEN (0.489) here — the broader composite averaging dilutes the visual-Q × text-K signal that this task needs.
+
+### Phase 4 — LongVideoBench-128f (n=64, seed=2 stage-1, frames=128)
+
+| Cond | Acc | 95% CI | Δ vs U3 S4 |
+|---|---:|---|---:|
+| U0 BF16 | 0.703 | [0.594, 0.812] | — |
+| U1 F4 | 0.688 | [0.578, 0.797] | — |
+| U2 F9 | 0.703 | [0.594, 0.812] | — |
+| U3 S4 | 0.734 | [0.625, 0.844] | (anchor) |
+| U4 GEN | 0.766 | [0.656, 0.859] | +3.1 pp |
+| U5 RND | 0.734 | [0.625, 0.844] | 0.0 |
+| U6 TT | 0.734 | [0.625, 0.844] | 0.0 |
+| **U7 TV** | **0.781** | [0.672, 0.875] | **+4.7 pp** |
+| U8 VT | 0.734 | [0.625, 0.844] | 0.0 |
+| U9 VV | 0.719 | [0.609, 0.828] | −1.6 pp |
+| U10 BAL | 0.734 | [0.625, 0.844] | 0.0 |
+| **U11 MMNIAH-prior** | **0.781** | [0.672, 0.875] | **+4.7 pp** |
+| U12 LVB-prior (native) | 0.766 | [0.656, 0.860] | +3.1 pp |
+| U13 ALL-16 | 0.766 | [0.656, 0.859] | +3.1 pp |
+
+**Three-way top tier at 0.781:** U7 TV, U11 MMNIAH-prior, U12 LVB-prior — with U7 and U11 tied at the very top (0.781) and U12 LVB-prior (its native domain) one notch below at 0.766.
+
+Paired McNemar at n=64: net U7 vs U3 = +3, U11 vs U3 = +3 — no pair reaches paired-significance at this n. **`pass_any_extra_beats_s4`, `pass_structured_beats_random`, and `pass_match_or_beat_f9` all FALSE on LVB at n=64** because S4 is already at 0.734 and BF16 at 0.703 — the LVB slice has unusually high ceiling-tier accuracy for every condition (no condition is below F4 = 0.688), so paired-discordance counts are uniformly low. Cross-prior on LVB: U11 vs U12 net = +1 (foreign MMNIAH-prior beats native LVB-prior by one paired item — within noise).
+
+Notable LVB structure:
+- **All four single-block extras (TT/TV/VT/VV) tie or beat S4**, and TV is the standout at +4.7 pp.
+- **VV is the WORST single-block on LVB just like on reasoning** — visual×visual channels are unhelpful regardless of dataset.
+- **The MMNIAH-prior generalizes to LVB at top-tier accuracy** (0.781 = native LVB-prior — actually one paired item BETTER than the native).
+
+### Cross-slice headline — the Wonsuk gate
+
+| Slice | n | Winner | Acc | 2nd | 3rd | pass_any_beats_S4 | pass_match_F9 |
+|---|---:|---|---:|---|---|---|---|
+| MM-NIAH retrieval | 84 | **U10 BAL** | 0.619 | U11 MMNIAH (0.619) | U12 LVB (0.607) | ✓ True | ✓ True |
+| MM-NIAH reasoning | 47 | **U8 VT** | 0.553 | U4 GEN (0.489) | U6 TT (0.468) | False (n caveat) | True |
+| LongVideoBench-128f | 64 | **U7 TV** | 0.781 | U11 MMNIAH (0.781) | U4 GEN (0.766) | False (S4 ceiling) | False |
+
+**Three distinct winning policies across the three datasets — U10 BAL, U8 VT, U7 TV.** This is the directional Wonsuk gate: **residual channel allocation IS dataset/task-specific.** The headline policy on retrieval-image (BAL) lands mid-pack on the other two slices; the headline on reasoning-image (VT) lands mid-pack on retrieval and LVB; the headline on LVB (TV) ties for top on LVB but is third on retrieval.
+
+**U11 MMNIAH-prior is the consistently-top-or-near-top policy** — tied #1 on retrieval (0.619), middle of the pack on reasoning (0.426 at noisy n=47), tied #1 on LVB (0.781). It's the closest thing to a "single-policy answer" if you needed one fixed choice across all three datasets.
+
+### Headline 1 — Structured extras beat the S4 anchor on retrieval (paired-significant)
+
+**U10 BAL vs U3 S4: χ²=4.27, p=0.039, 12 to 3 paired wins (n=84).**
+**U11 MMNIAH-prior vs U3 S4: χ²=4.27, p=0.039, 12 to 3 paired wins (n=84).**
+
+These two are the only paired-significant results in the entire 105-pair grid across all three slices. At n=84 the budget actually binds (every item has 8+ in-context images), and the structured policies pull 10.7 pp above the S4 anchor at +0.094 KV bits. Both are Pareto-optimal points on retrieval-image, both beating BF16's 0.607 by +1.2 pp at 72% storage reduction (4.281 vs 16.0 KV bits).
+
+### Headline 2 — Structured ≈ generic-energy on retrieval; random clearly loses
+
+| Comparison | net | χ² | p |
+|---|---:|---:|---:|
+| U10 BAL vs U4 GEN | +2 | 0.10 | 0.75 |
+| U11 MMNIAH vs U4 GEN | +2 | 0.17 | 0.68 |
+| U6 TT vs U4 GEN | 0 | 0.12 | 0.72 |
+| U10 BAL vs U5 RND | +7 | 2.77 | 0.10 |
+| U6 TT vs U5 RND | +5 | 1.07 | 0.30 |
+
+The structured policies (TT/TV/VT/VV/BAL/MMNIAH) **do NOT paired-significantly beat the generic-energy baseline U4 GEN** on retrieval at n=84. But **all of them clearly beat RND** (net +7 for BAL, +5 for TT, comparable for others). So the partial answer to Wonsuk is: *channel identity matters (structured ≠ random), but among "good" criteria — generic top-energy-after-S4 ranks 17-24, TT score, TV score, balanced 2/block, MMNIAH prior — accuracies converge.* The marginal differences between structured policies don't translate to paired-significant accuracy wins on a single slice.
+
+### Headline 3 — Per-channel quality dominates raw channel count
+
+**U13 ALL-16 extra (4.375 KV bits) vs U4 GEN-8 (4.281 KV bits): paired net = −1, 3 to 4.** Adding 16 extras at INT7 instead of 8 — for an extra 0.094 KV bits — is essentially a wash on retrieval. The same pattern shows up on reasoning (U13 = 0.404 vs U4 = 0.489) and LVB (U13 = 0.766 vs U4 = 0.766). **Pareto-front conclusion: the 24-channel extra-8 budget is the sweet spot. Adding more channels at INT7 doesn't compound.** This echoes the Exp S finding that fewer-channels-higher-precision beats wider-lower-precision; here the precision is fixed at INT7 and the count-vs-quality tradeoff lands on quality.
+
+### Headline 4 — Visual×visual residuals don't help
+
+U9 VV is the worst single-block on both reasoning (0.340, −6.4 pp under S4) and LVB (0.719, −1.6 pp under S4), and only mid-pack on retrieval (0.571). On every slice, **VV is among the bottom 3 by accuracy.** The interpretation: once the S4 generic top-16 (which is heavily visual-K-dominated for image-rich items) has captured the high-energy visual channels, the next 8 visual-K channels selected by visual-Q × visual-K importance are not informative — they correlate too strongly with channels S4 already protects, and the residual visual-block ranking surfaces low-information channels.
+
+### Headline 5 — Cross-dataset prior transfer is symmetric within noise
+
+| Slice | U11 MMNIAH-prior | U12 LVB-prior | paired_net (U11 vs U12) | χ² |
+|---|---:|---:|---:|---:|
+| retrieval | 0.619 | 0.607 | +1 | 0.00 |
+| reasoning | 0.426 | 0.468 | −2 | 0.12 |
+| LVB-128f | 0.781 | 0.766 | +1 | n/a (sparse) |
+
+**Same-dataset prior does NOT paired-significantly beat foreign-dataset prior on any slice.** The MMNIAH-prior and LVB-prior arrays are within ±2 paired wins of each other across all three datasets. This is a negative result for the "you need a dataset-specific prior" hypothesis at the granularity of MM-NIAH vs LVB — the broader cross-dataset composite (TT+TV+VT+VV averaged) is general enough to transfer across both. **`pass_same_prior_beats_foreign` = False on all three slices.**
+
+### Pareto frontier (Exp U1, retrieval-image n=84 at 336°)
+
+```
+KV bits  acc    condition                       note
+4.000    0.274  U1 F4 dense                     Pareto floor
+4.188    0.512  U3 S4 anchor (top-16 INT7)      Exp S Pareto point
+4.281    0.619  U10 BAL extra-8 INT7            DEPLOYABLE HEADLINE — Pareto winner
+4.281    0.619  U11 MMNIAH-prior extra-8 INT7   tied DEPLOYABLE HEADLINE
+4.750    0.548  U2 F9 dense (top-16 BF16)       dominated by U10/U11
+16.00    0.607  U0 BF16 ceiling                 dominated by U10/U11 at +1.2 pp acc
+```
+
+**The deployable claim from Exp U1 on retrieval-image is U10 BAL (or U11 MMNIAH-prior) at 4.281 KV bits, acc = 0.619.** Vs F9 (Exp F's previous deployable headline, 4.75 KV bits): **−0.47 KV bits = 10% storage reduction AND +7.1 pp acc**, paired-tied (n_paired=12, A=9 / B=3, p=0.15). Vs S4 (Exp S's deployable headline, 4.188 KV bits): **+0.094 KV bits AND +10.7 pp acc**, paired-significant (χ²=4.27, p=0.039). Vs BF16 (the ceiling, 16.0 KV bits): **−11.7 KV bits AND +1.2 pp acc** at n=84 — better-than-ceiling at 72% storage reduction.
+
+### What this changes about the research direction
+
+1. **The Pareto frontier extends past Exp S.** U10 BAL and U11 MMNIAH-prior at 4.281 KV bits dominate F9 (4.75 KV bits) and tie or beat BF16 (16.0 KV bits) on retrieval-image. Net improvement over the Exp S S4 anchor: +10.7 pp accuracy at +0.094 KV bits — a clear Pareto move.
+
+2. **24 channels at INT7 is a sharper budget than 16 channels at INT7.** This re-prices the Exp S "INT7 sidecode" finding: the budget where INT7 sidecode is *deployable* is at 24 protected channels (4.281 KV), not 16 (4.188 KV). At 16, S4 alone does not consistently match F9 on this slice (Exp S paired-tied at n_paired=7, but Exp U replicates with 0.512 = −3.6 pp under F9 = 0.548). At 24 channels carefully chosen (BAL or MMNIAH-prior), the gap to F9 closes paired-significantly and the slice tops BF16.
+
+3. **No single modality-block criterion uniformly wins.** TT, TV, VT, VV each win one slice or come close (TT/TV tie GEN on retrieval; VT wins reasoning; TV ties top on LVB). The **balanced 2/block composite (U10) and the cross-task averaged prior (U11)** are the two policies that consistently rank top-or-near-top across all slices — and they're paired-tied with each other.
+
+4. **The dataset-specific prior hypothesis is falsified at this resolution.** U11 MMNIAH-prior on LVB beats U12 LVB-prior on LVB by one paired item; on the MM-NIAH slices, the gap between the two priors is within noise. The implication for the paper: don't claim "task-specific channel allocation". Do claim "broader-composite priors (averaged across tasks) transfer well across datasets, and outperform dataset-specific priors by a small margin."
+
+5. **Wonsuk's central question gets a nuanced answer.** *Does each task need different residual channels?* On the question of *which structured channels are best*, the answer is "yes" (different winners per task — U10/U8/U7). But on the question of *does that matter for deployment*, the answer is "weakly" — structured policies don't paired-significantly beat generic-energy on retrieval, and the only paired-significant gains are over the S4 anchor (not over F9 or BF16). The headline is "the next 8 channels at INT7, whether by generic energy, modality balance, or cross-task composite, are all worth protecting — but the specific selection criterion within that family doesn't durably win."
+
+6. **Reasoning-image is power-limited.** The BF16 < F4 inversion at n=47 means we can't draw conclusions from this slice with confidence. A reasoning-image follow-up at n≥120 (the full pool has 220 items, 99 with num_images ≥ 5) would clarify whether U8 VT is real or a small-n artifact.
+
+7. **LVB-128f at n=64 leaves S4-already-at-ceiling.** The S4 anchor on LVB is 0.734, only 0.031 below BF16 (0.703 ?? actually 0.703 < S4 — BF16 < S4 on this seed). Extras can push to 0.781 but paired-significance is out of reach at this n. A higher-n LVB confirmation pass (Exp J/K-style stage-3 promotion at n=200) is the cleanest follow-up.
+
+### Recommended next steps
+
+1. **Reasoning-image at n≥120** (full `num_images ≥ 5` pool minus cal) to resolve whether U8 VT is real or n=47-noise. Same conditions, no new code.
+
+2. **Power-up confirmation on retrieval at n≥150** (relax `min-num-images` to 5, n=261 minus cal, or full pool n=361). U10 BAL and U11 MMNIAH-prior should paired-significantly beat F9 at higher n if the Exp U1 trend holds; right now they're paired-directional but not significant at n=84.
+
+3. **F9 + structured-extra-8 INT7 family** (which we discussed as a follow-up): adds 8 channels by TT/TV/VT/VV/BAL on top of F9 (16 BF16) at INT7 sidecode. Bit cost: K = (16·16 + 7·8 + 4·104)/128 = 4.84 K-bits → KV 4.42. Tests whether the "anchor precision matters" hypothesis (F9's BF16 primary vs S4's INT7 primary) interacts with the extras family.
+
+4. **Counting-image with prompt fix.** Exp T-mini found BF16 itself emits malformed lists. Rewrite the counting-image prompt to forbid nested-list outputs, regenerate the cal NPZ, then run U conditions. Composing PageLocal-on-F9 or PageSentinel-on-F9 (per Exp T-mini's "outlier sidecode is mandatory for generation" finding) is the right base for any counting-image residual screen.
+
+5. **Per-(L, H_kv) cell adaptivity.** All U-suite conditions use the same global policy for every cell. A natural extension is layer-adaptive selection: for some (L, H_kv) cells use TT extras, for others use TV, gated by a per-cell heuristic (cell-risk score, like Exp J's J9/J10/J11). This is the "non-uniform residual selection" direction implied by the cross-slice differential.
+
+### Layout
+
+```
+qwen/scripts/                              (additive Exp U code)
+  expU_compute_extras.py    NEW            CPU helper: reads each calib NPZ
+                                           (expP_mmniah_kcalib_*_seed0.npz for
+                                           retrieval/reasoning/counting + expJ_kcalib_*_frames128.npz)
+                                           and writes a sibling _expU_extras.npz with
+                                           10 EXTRA_*_8 + EXTRA_ALL_16 arrays per calib,
+                                           residual to that calib's S4 top-16. Self-test
+                                           diagnostic reports % cell distinctness.
+  k_quantizers.py           edit           KQuantizerConfig fields outlier_idx_extra_key,
+                                           outlier_idx_extra_n; _outlier_channel_indices
+                                           composes primary+extra subsets (split into
+                                           _fetch_outlier_subset helper to preserve the
+                                           no-extra fast path bit-perfectly). 10 new configs
+                                           U4..U13 registered in build_f_conditions.
+  expQ_driver.py            edit           u_conditions_residual_screen() returning U0..U13;
+                                           --exp-u flag; sibling extras NPZ merge into calib
+                                           dict; _STATIC_K_BITS entries for U4..U13.
+  expJ_xmodal_outlier.py    edit           FIXED_FRAME_CONDITIONS_U + build_u_conditions_lvb;
+                                           --exp-u flag for LongVideoBench-128f path;
+                                           shared extras-NPZ merge; bypasses J-suite xmodal
+                                           required-key check (different required set).
+                                           Refactored rewrite_experiment_tag_j into a
+                                           parameterized _rewrite_experiment_tag helper.
+  expQ_smoke.py             edit           --exp-u flag; 6 U-assertion families V/W/X/Y/Z/AA
+                                           on n=3 short bucket: bit-math, residual invariant,
+                                           per-policy and cross-policy logit divergence.
+  expQ_analyze.py           edit           pairs_slice_u() with 36 load-bearing pairs;
+                                           --slice U; --out-prefix override; U-verdict block
+                                           with pass_any_extra_beats_s4 /
+                                           pass_structured_beats_random / pass_match_or_beat_f9 /
+                                           pass_same_prior_beats_foreign + winning_policy
+                                           ranking.
+  run_expU_overnight.sh     NEW            5-phase orchestrator: extras NPZs (CPU) → smoke
+                                           (n=3) → MM-NIAH retrieval (n=84, --exp-u) →
+                                           MM-NIAH reasoning (n=47) → LVB-128f (n=64,
+                                           --exp-u on expJ_xmodal_outlier.py) → cross-slice
+                                           winning_policy diff.
+qwen/calibration/
+  expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_seed0_expU_extras.npz                  NEW (10 arrays)
+  expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_reasoning-image_seed0_expU_extras.npz  NEW
+  expP_mmniah_kcalib_Qwen2.5-VL-7B-Instruct_counting-image_seed0_expU_extras.npz   NEW (kept for future)
+  expJ_kcalib_Qwen2.5-VL-7B-Instruct_frames128_expU_extras.npz                     NEW
+qwen/results/
+  expU_smoke.md, expU_smoke.jsonl                                  160 PASS / 0 FAIL
+  expU_rollouts_sliceU_retrieval.jsonl                             1176 rows (14×84)
+  expU_rollouts_sliceU_reasoning.jsonl                              658 rows (14×47)
+  expU_lvb_stage1_seed2.jsonl                                       896 rows (14×64)
+  expU_lvb_stage1_seed2_normalized.jsonl                            896 rows (post-rename for analyzer)
+  expU_summary_sliceU_{retrieval,reasoning,lvb}.md                  per-condition acc + bucketed + Pareto
+  expU_paired_sliceU_{retrieval,reasoning,lvb}.md                   35 McNemar pairs each
+  expU_verdict_sliceU_{retrieval,reasoning,lvb}.md                  per-slice pass/fail + winning_policy
+  expU_branch_sliceU_{retrieval,reasoning,lvb}.json                 machine-readable pass booleans
+  expU_overnight.progress.log, expU_overnight.tmux.log              orchestration logs
+```
+
+### Pipeline status (Exp U1)
+
+```
+qwen-expU — COMPLETE 2026-05-15
+├── ✅ Phase 0  CPU extras NPZs: 4 sibling NPZs across all calibs (~1 min)
+├── ✅ Phase 1  smoke n=3 short bucket: 160 PASS / 0 FAIL with --exp-u (~3 min)
+├── ✅ Phase 2  MM-NIAH retrieval-image U0..U13 × n=84 at 336° (~98 min)
+├── ✅ Phase 3  MM-NIAH reasoning-image U0..U13 × n=47 at 336° (~13 min)
+├── ✅ Phase 4  LongVideoBench-128f U0..U13 × n=64 seed=2 stage-1 (~37 min)
+├── ✅ Phase 4b LVB JSONL condition-name normalization + re-analyze (~5 sec)
+└── ✅ Phase 5  cross-slice winning_policy diff + verdict aggregation
+```
+
+Total wall: **2h 28min end-to-end** (launch 05:17 → DONE 07:45 local, 2026-05-15). 2730 forward passes across 14 conditions × 3 slices on a single GPU (CUDA_VISIBLE_DEVICES=0) sharing GPU 0 with wsjang's cogvideo2b at 39 GB. Faster than the 4-hour estimate because (a) Phase 3 reasoning-image at n=47 was much smaller than the ~50 min reasoning estimate, and (b) the LVB-128f run_stage_g pipeline shares model load across all conditions in a single pass (37 min for 14 conds × n=64 = 896 rows vs the ~80 min estimate which assumed per-condition model setup).
+

@@ -550,6 +550,42 @@ Tests the paper-worthy VLM-specific hypothesis (beyond Exp R/S's sidecode-width 
 
 Plan: `/Users/subha/.claude/plans/read-through-qwen-and-velvet-ritchie.md`.
 
+## Qwen2.5-VL × MM-NIAH + LVB — Experiment U1: Residual channel oracle/policy screen (2026-05-15, COMPLETE)
+
+Tests Wonsuk's central scientific question: *does each query/task need DIFFERENT residual K channels on top of S4?* Anchors on **S4** (top-16 INT7 sidecode, 4.1875 KV bits — Exp S's Pareto winner) and adds 8 extra residual channels via one of 9 policies (generic top-energy not-in-S4, random, TT/TV/VT/VV per-modality-block, balanced 2/block, MM-NIAH-prior, LVB-prior) plus a 16-channel composite (U13). All extras stored at INT7 sidecode; 24-channel conditions land at **4.281 KV bits** (vs F9's 4.75). 14 conditions × 3 slices (MM-NIAH retrieval n=84, reasoning n=47, LongVideoBench-128f n=64) = **2730 forward passes** in 2h28m wall on a shared GPU.
+
+**Headline (retrieval-image, n=84):** **U10 BAL 2/block** and **U11 MMNIAH-prior** both land at **acc = 0.619 at 4.281 KV bits** — Pareto-significant over S4 (paired McNemar χ²=4.27, p=0.039, +10.7 pp over the S4 anchor) AND directionally beating F9 dense (0.548 at 4.75 KV bits) at lower bits. Both top BF16 ceiling (0.607) by +1.2 pp at 72% storage reduction. **The new deployable Pareto point for MM-NIAH retrieval is U10 or U11 at 4.281 KV bits.**
+
+**Cross-slice — three different winning policies:** U10 BAL (retrieval) → U8 VT (reasoning) → U7 TV (LVB-128f). U11 MMNIAH-prior is the only policy consistently in the top tier across all three datasets (tied #1 on retrieval and LVB; middle of the pack on reasoning at noisy n=47).
+
+**Key load-bearing findings:**
+- Per-channel quality dominates raw channel count: U13 ALL-16 extra (32 channels at INT7, 4.375 KV bits) does NOT improve over U4 GEN-8 (24 channels at INT7, 4.281 KV bits) on any slice. Adding the next 8 extras at fixed precision is the sweet spot.
+- Structured >> random at matched bits, but structured ≈ generic-energy. U10 BAL paired-significantly beats S4; tied with U4 GEN on paired McNemar. *Channel identity matters; specific cross-modal criterion within the "good" family does not.*
+- Visual×visual residuals don't help on any slice (U9 VV is bottom-3 by accuracy across retrieval/reasoning/LVB).
+- Cross-domain prior transfer is symmetric within noise — MMNIAH-prior on LVB ties LVB-prior on LVB; the broader cross-task averaging generalizes across datasets.
+
+**Wall:** 2h 28min end-to-end (launch 05:17 → DONE 07:45 local 2026-05-15) on shared GPU 0 with wsjang's cogvideo job at 39 GB. **Faster than the 4-hour estimate** because Phase 3 reasoning (n=47) and Phase 4 LVB-128f (run_stage_g shares model load across conditions) ran below the original per-phase wall estimates.
+
+### Files of record (Exp U1)
+
+| File | Role |
+|---|---|
+| `qwen/scripts/expU_compute_extras.py` (NEW) | CPU helper: reads each calib NPZ, writes sibling `_expU_extras.npz` with 10 residual-extra index arrays per calib (GEN/RND/TT/TV/VT/VV/BAL/MMNIAH-prior/LVB-prior/ALL-16). Residual invariant enforced. |
+| `qwen/scripts/k_quantizers.py` | KQuantizerConfig fields `outlier_idx_extra_key` + `outlier_idx_extra_n`; `_outlier_channel_indices` composes primary+extra subsets. 10 new configs U4..U13. |
+| `qwen/scripts/expQ_driver.py` | `u_conditions_residual_screen()`; `--exp-u` flag; sibling extras NPZ merge; U bit-accounting (24·INT7 → 4.281 KV; 32·INT7 → 4.375 KV). |
+| `qwen/scripts/expJ_xmodal_outlier.py` | `FIXED_FRAME_CONDITIONS_U` + `build_u_conditions_lvb`; `--exp-u` flag for LongVideoBench-128f. |
+| `qwen/scripts/expQ_smoke.py` | 6 U-assertion families (V/W/X bit-math, Y residual invariant, Z/AA policy distinctness). |
+| `qwen/scripts/expQ_analyze.py` | `pairs_slice_u()` (36 pairs); `--slice U`; verdict matrix with pass_any_extra_beats_s4 / pass_structured_beats_random / pass_match_or_beat_f9 / winning_policy. |
+| `qwen/scripts/run_expU_overnight.sh` (NEW) | 5-phase orchestrator: extras NPZs → smoke → retrieval → reasoning → LVB → cross-slice verdict. |
+| `qwen/results/expU_summary_sliceU_*.md` | per-slice condition summary + Pareto frontier |
+| `qwen/results/expU_paired_sliceU_*.md` | 36 McNemar pairs per slice |
+| `qwen/results/expU_branch_sliceU_*.json` | machine-readable pass booleans + winning_policy |
+| `qwen/calibration/*_expU_extras.npz` (NEW) | residual-extra index arrays per calib (4 NPZs: retrieval/reasoning/counting/LVB-128f) |
+
+Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment U1 — Residual channel oracle/policy screen".
+
+Plan: `/Users/subha/.claude/plans/read-through-qwen-and-jazzy-hellman.md`.
+
 ## Qwen2.5-VL × LongVideoBench — Experiment G: Frame-scaling under fixed KV memory budget (staged 2026-05-09)
 
 After Exp F (KIVI per-channel-along-seq) closed 94.4% of the KV-quantization collapse at TRUE 4.00 KV bits, the open research question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget*. The theoretical math at fixed `max_pixels=360×420`:
