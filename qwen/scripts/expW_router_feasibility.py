@@ -133,22 +133,32 @@ def extract_features(matrix, item_id, dataset_tag, include_s4_features=True):
     feats.append(1 if dataset_tag == "lvb" else 0)
     if include_s4_features:
         # Two-pass diagnostic: features from a cheap first S4 pass.
+        # Use option_logprobs (per-A/B/C/D log-probs from the rollout writer).
         s4_row = d.get(S4, {})
-        logits = s4_row.get("first_logits_AD") or s4_row.get("first_logits") or [0.0, 0.0, 0.0, 0.0]
-        if isinstance(logits, list) and len(logits) >= 4:
-            arr = np.array(logits[:4], dtype=np.float64)
-            top1 = float(arr.max())
-            top2 = float(np.sort(arr)[-2])
-            margin = top1 - top2
-            p = np.exp(arr - arr.max())
+        logprobs = s4_row.get("option_logprobs")
+        if isinstance(logprobs, list) and len(logprobs) >= 2:
+            arr = np.array(logprobs, dtype=np.float64)
+            # Truncate/pad to 4 to keep feature dim consistent across binary/4-way tasks.
+            if len(arr) < 4:
+                arr = np.pad(arr, (0, 4 - len(arr)), constant_values=arr.min() - 10.0)
+            arr4 = arr[:4]
+            top1 = float(arr4.max())
+            top2 = float(np.sort(arr4)[-2])
+            margin = top1 - top2  # In log-prob space; larger = more confident.
+            # Probability margin (softmax over options).
+            p = np.exp(arr4 - arr4.max())
             p = p / max(p.sum(), 1e-9)
+            prob_top1 = float(p.max())
+            prob_top2 = float(np.sort(p)[-2])
+            prob_margin = prob_top1 - prob_top2
             entropy = -float((p * np.log(np.clip(p, 1e-9, 1.0))).sum())
-            argmax = int(arr.argmax())
+            argmax = int(arr4.argmax())
         else:
             top1 = top2 = margin = 0.0
+            prob_top1 = prob_top2 = prob_margin = 0.0
             entropy = 0.0
             argmax = 0
-        feats += [top1, top2, margin, entropy]
+        feats += [top1, top2, margin, prob_top1, prob_top2, prob_margin, entropy]
         feats += [1 if argmax == k else 0 for k in range(4)]
     return np.array(feats, dtype=np.float64)
 
@@ -433,7 +443,9 @@ def report_split(name, train_rows, test_rows, tier2_policies):
     # the S4 features (indices >= 8 in extract_features layout).
     # Layout: [0]=ctx_bucket, [1]=num_images, [2]=num_img_bucket, [3]=seq_len,
     #         [4]=context_length, [5..7]=task one-hot,
-    #         [8]=top1, [9]=top2, [10]=margin, [11]=entropy, [12..15]=argmax one-hot.
+    #         [8]=lp_top1, [9]=lp_top2, [10]=lp_margin,
+    #         [11]=p_top1, [12]=p_top2, [13]=p_margin, [14]=entropy,
+    #         [15..18]=argmax one-hot.
     N_ONE_PASS = 8  # features before S4-features
     for tag, slice_idx in (("one-pass", slice(0, N_ONE_PASS)),
                             ("two-pass", slice(0, None))):
