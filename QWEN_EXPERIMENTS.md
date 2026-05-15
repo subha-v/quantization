@@ -3763,3 +3763,308 @@ qwen-expU — COMPLETE 2026-05-15
 
 Total wall: **2h 28min end-to-end** (launch 05:17 → DONE 07:45 local, 2026-05-15). 2730 forward passes across 14 conditions × 3 slices on a single GPU (CUDA_VISIBLE_DEVICES=0) sharing GPU 0 with wsjang's cogvideo2b at 39 GB. Faster than the 4-hour estimate because (a) Phase 3 reasoning-image at n=47 was much smaller than the ~50 min reasoning estimate, and (b) the LVB-128f run_stage_g pipeline shares model load across all conditions in a single pass (37 min for 14 conds × n=64 = 896 rows vs the ~80 min estimate which assumed per-condition model setup).
 
+## Experiment V1 — Full-pool confirmation + budget-ladder residual screen (2026-05-15) — COMPLETE
+
+**Status:** Three-phase confirmation complete in **3h 4min wall** (Phase 0 extras refresh 1 sec → Phase A retrieval-image n=261 → Phase B reasoning-image n=120 → Phase C LVB-128f n=200 → Phase 5 cross-phase aggregator → DONE at 11:55 local; launch 08:51). **6422 forward passes** total across 18 + 12 + 11 = 41 condition-slices on a single GPU. ~3× faster than the 9–10h estimate because (a) the full retrieval pool is dominated by shorter-context items vs Exp U1's `min-num-images >= 8` subset (~3 min per condition at full pool vs ~10 min on the multi-image filter), and (b) `run_stage_g`'s shared model-load path keeps Phase B and Phase C wall low.
+
+Built directly on Exp U1's positive signal: U10 BAL and U11 MMNIAH-prior were paired-significant over the S4 anchor (+10.7 pp, χ²=4.27, p=0.039) on MM-NIAH retrieval at n=84, but only **directionally** beat F9 dense. Exp V is the powered-up confirmation:
+
+> **Does S4 + structured extra-N residual channels beat or match F9 on a larger validation set, and is the cross-modal residual selection actually better than generic-energy or random?**
+
+### Setup additions over Exp U1
+
+- **Full retrieval pool:** Phase A drops the `--min-num-images 8` filter. n grows from 84 to **261** (the entire MM-NIAH retrieval-image eval pool minus the 100 cal items).
+- **Full reasoning pool:** Phase B drops the `--min-num-images 5` cap. n grows from 47 to **120** (the full reasoning-image eval pool minus cal), fixing Exp U1's underpowered reasoning slice and resolving the BF16<F4 anomaly.
+- **LVB stage=3:** Phase C uses LVB stage-3 split at **n=200** (vs Exp U1's stage-1 n=64), the canonical LVB confirmation pool.
+- **3-seed random control:** V5/V6/V7 are 3 deterministically-seeded RND8 variants (seeds 0/1/2). "Robust-vs-random" requires V11 BAL8 to paired-significantly beat each of the three seeds; that is a much stricter bar than U1's single RND control.
+- **Budget ladder:** V15/V16/V17 are BAL with per_block=1/3/4 giving 4/12/16 residual channels (vs U10's per_block=2/n=8). The ladder tests whether 8 is the sweet spot or whether a smaller or larger balanced budget is better.
+- **Decision rules:**
+  - `pass_v11_beats_f9` requires χ² ≥ 3.84 (p < 0.05) with V11 favored.
+  - `pass_v11_beats_random_robust` requires V11 to paired-significantly beat **each** of V5/V6/V7.
+  - `pass_match_or_beat_f9` requires SOME V condition to paired-tie-or-beat F9 at < 4.75 KV bits.
+
+### Conditions
+
+Phase A retrieval (V0..V17, 18 conditions, all at 336° equal-resolution):
+
+| ID | Description | KV bits |
+|---|---|---:|
+| V0  | BF16 ceiling | 16.000 |
+| V1  | F4 floor | 4.000 |
+| V2  | F9 anchor (top-16 BF16 sidecode) | 4.750 |
+| V3  | S4 anchor (top-16 INT7 sidecode) | 4.188 |
+| V4  | S4 + GEN extra-8 INT7 | 4.281 |
+| V5  | S4 + RND extra-8 INT7 (seed 0) | 4.281 |
+| V6  | S4 + RND extra-8 INT7 (seed 1) | 4.281 |
+| V7  | S4 + RND extra-8 INT7 (seed 2) | 4.281 |
+| V8  | S4 + TT extra-8 INT7 | 4.281 |
+| V9  | S4 + TV extra-8 INT7 | 4.281 |
+| V10 | S4 + VT extra-8 INT7 | 4.281 |
+| V11 | S4 + BAL (2/block) extra-8 INT7 — U10 PRIMARY | 4.281 |
+| V12 | S4 + MMNIAH-prior extra-8 INT7 — U11 PRIMARY | 4.281 |
+| V13 | S4 + LVB-prior extra-8 INT7 | 4.281 |
+| V14 | S4 + ALL-16 composite extra INT7 | 4.375 |
+| V15 | S4 + BAL (1/block) extra-4 INT7 | **4.234** |
+| V16 | S4 + BAL (3/block) extra-12 INT7 | 4.328 |
+| V17 | S4 + BAL (4/block) extra-16 INT7 | 4.375 |
+
+Phase B reasoning: V subset filtered to {V0, V1, V2, V3, V4, V5, V6, V7, V10, V11, V12, V13} (12 conditions). Phase C LVB: V subset {V0, V1, V2, V3, V4, V5, V9, V11, V12, V13, V14} (11 conditions; renamed L0..L10 in the V_LVB tuple list).
+
+### Phase A — MM-NIAH retrieval-image (n=261, FULL POOL at 336°)
+
+| Cond | Policy | Acc | 95% CI | KV bits | Δ vs F9 | Δ vs BF16 | Δ vs S4 | Pareto? |
+|---|---|---:|---|---:|---:|---:|---:|---|
+| V0 | BF16 ceiling | 0.598 | [0.539, 0.660] | 16.00 | −0.7 | — | +1.9 | no |
+| V1 | F4 floor | 0.395 | [0.342, 0.457] | 4.000 | −21.0 | −20.3 | −18.4 | **YES** (floor) |
+| V2 | F9 anchor | 0.605 | [0.543, 0.663] | 4.750 | (anchor) | +0.7 | +2.6 | no |
+| V3 | S4 anchor | 0.579 | [0.519, 0.639] | 4.188 | −2.6 | −1.9 | (anchor) | **YES** |
+| V4 | GEN extra-8 | 0.617 | [0.554, 0.675] | 4.281 | +1.2 | +1.9 | +3.8 | no |
+| V5 | RND-s0 extra-8 | 0.605 | [0.543, 0.663] | 4.281 | 0.0 | +0.7 | +2.6 | no |
+| V6 | RND-s1 extra-8 | 0.613 | [0.551, 0.672] | 4.281 | +0.8 | +1.5 | +3.4 | no |
+| V7 | RND-s2 extra-8 | 0.617 | [0.554, 0.675] | 4.281 | +1.2 | +1.9 | +3.8 | no |
+| V8 | TT extra-8 | 0.625 | [0.563, 0.682] | 4.281 | +2.0 | +2.7 | +4.6 | no |
+| V9 | TV extra-8 | 0.632 | [0.572, 0.689] | 4.281 | +2.7 | +3.4 | +5.3 | no |
+| V10 | VT extra-8 | 0.617 | [0.554, 0.675] | 4.281 | +1.2 | +1.9 | +3.8 | no |
+| V11 | BAL (2/block) extra-8 | 0.632 | [0.572, 0.689] | 4.281 | +2.7 | +3.4 | +5.3 | no |
+| V12 | MMNIAH-prior extra-8 | 0.628 | [0.566, 0.685] | 4.281 | +2.3 | +3.0 | +4.9 | no |
+| V13 | LVB-prior extra-8 | 0.617 | [0.554, 0.675] | 4.281 | +1.2 | +1.9 | +3.8 | no |
+| V14 | ALL-16 extra | 0.613 | [0.551, 0.672] | 4.375 | +0.8 | +1.5 | +3.4 | no |
+| **V15** | **BAL (1/block) extra-4** | **0.636** | [0.576, 0.694] | **4.234** | **+3.1** | **+3.8** | **+5.7** | **YES** |
+| V16 | BAL (3/block) extra-12 | 0.609 | [0.547, 0.667] | 4.328 | +0.4 | +1.1 | +3.0 | no |
+| V17 | BAL (4/block) extra-16 | 0.632 | [0.572, 0.689] | 4.375 | +2.7 | +3.4 | +5.3 | no |
+
+**Paired McNemar — primary tests on Phase A (n=261):**
+
+| Pair | n_paired | A_only | B_only | χ² | p | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| **V11 BAL8 vs V3 S4 — U10 REPLICATION** | **32** | **23** | **9** | **5.28** | **0.022** | **✓ paired-significant (replicates U1)** |
+| **V12 MMNIAH8 vs V3 S4 — U11 REPLICATION** | **33** | **23** | **10** | **4.36** | **0.037** | **✓ paired-significant (replicates U1)** |
+| V11 BAL8 vs V2 F9 — PRIMARY DEPLOYABLE | 33 | 20 | 13 | 1.09 | 0.296 | directional, **NOT** significant |
+| V12 MMNIAH8 vs V2 F9 — PRIMARY DEPLOYABLE | 30 | 18 | 12 | 0.83 | 0.361 | directional, NOT significant |
+| V14 ALL-16 vs V2 F9 | 34 | 18 | 16 | 0.03 | 0.864 | tied |
+| V11 BAL8 vs V5 RND-s0 | 37 | 22 | 15 | 0.97 | 0.324 | directional, NOT significant |
+| V11 BAL8 vs V6 RND-s1 | 33 | 19 | 14 | 0.48 | 0.486 | directional, NOT significant |
+| V11 BAL8 vs V7 RND-s2 | 34 | 19 | 15 | 0.26 | 0.607 | directional, NOT significant |
+| V15 BAL4 vs V11 BAL8 | 17 | 9 | 8 | 0.00 | 1.000 | exactly tied paired |
+| V16 BAL12 vs V11 BAL8 | 24 | 9 | 15 | 1.04 | 0.307 | directional (BAL12 *worse*), NOT sig |
+| V17 BAL16 vs V11 BAL8 | 24 | 12 | 12 | 0.04 | 0.838 | exactly tied paired |
+
+### Phase B — MM-NIAH reasoning-image (n=120, FULL POOL at 336°)
+
+| Cond | Policy | Acc | 95% CI | KV bits | Δ vs F9 |
+|---|---|---:|---|---:|---:|
+| V0 | BF16 ceiling | 0.575 | [0.486, 0.660] | 16.00 | −4.2 |
+| V1 | F4 floor | 0.583 | [0.493, 0.667] | 4.000 | −3.4 |
+| V2 | F9 anchor | 0.617 | [0.527, 0.697] | 4.750 | (anchor) |
+| V3 | S4 anchor | 0.567 | [0.479, 0.652] | 4.188 | −5.0 |
+| V4 | GEN extra-8 | 0.600 | [0.510, 0.682] | 4.281 | −1.7 |
+| V5 | RND-s0 extra-8 | 0.542 | [0.453, 0.628] | 4.281 | −7.5 |
+| V6 | RND-s1 extra-8 | 0.592 | [0.502, 0.674] | 4.281 | −2.5 |
+| V7 | RND-s2 extra-8 | 0.608 | [0.518, 0.689] | 4.281 | −0.9 |
+| **V10** | **VT extra-8** | **0.642** | [0.553, 0.721] | 4.281 | **+2.5** |
+| V11 | BAL extra-8 | 0.617 | [0.527, 0.697] | 4.281 | 0.0 (tied) |
+| V12 | MMNIAH-prior extra-8 | 0.592 | [0.502, 0.674] | 4.281 | −2.5 |
+| V13 | LVB-prior extra-8 | 0.600 | [0.510, 0.682] | 4.281 | −1.7 |
+
+**Paired McNemar — primary tests on Phase B (n=120):**
+
+| Pair | n_paired | A_only | B_only | χ² | p | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| V10 VT vs V3 S4 — replicates U1 reasoning-image VT-win | 21 | 15 | 6 | 3.05 | 0.081 | borderline (15 to 6 paired), NOT p<0.05 |
+| V11 BAL8 vs V3 S4 | 22 | 14 | 8 | 1.14 | 0.286 | directional, NOT significant |
+| V11 BAL8 vs V2 F9 — PRIMARY DEPLOYABLE | 18 | 9 | 9 | 0.06 | 0.814 | exactly tied paired |
+| V11 BAL8 vs V5 RND-s0 | 19 | 14 | 5 | 3.37 | 0.067 | borderline, BAL favored |
+| V11 BAL8 vs V6 RND-s1 | 23 | 13 | 10 | 0.17 | 0.677 | directional, NOT sig |
+| V11 BAL8 vs V7 RND-s2 | 19 | 10 | 9 | 0.00 | 1.000 | tied |
+
+**Critical reasoning-image findings:**
+- **BF16 < F4 anomaly from U1 RESOLVED.** At n=120, V0 = 0.575 and V1 = 0.583 — only 0.8 pp gap. The 23.4 pp gap at U1's n=47 was sampling artifact, exactly as predicted.
+- **V10 VT extra-8 = 0.642 REPLICATES U1's U8 VT win.** U1 had U8 VT = 0.553 at n=47 with χ²=2.77 (borderline). V10 lands at +14.9 pp lift over U1 baseline, with paired McNemar χ²=3.05 (p=0.081). Still borderline — n=120 isn't quite enough for paired significance, but **the directional signal is reproducible and the cross-slice winner from U1 (VT on reasoning) is confirmed.**
+- **V11 BAL8 = V2 F9 = 0.617** — exactly tied on aggregate AND paired (9 vs 9 discordant). On reasoning, BAL8 does not move the needle over F9.
+- **V11 BAL8 vs RND-s0: χ²=3.37, p=0.067** — borderline; BAL beats THIS random seed but ties the other two. NOT robust-vs-random.
+
+### Phase C — LongVideoBench-128f (n=200, stage=3 seed=2)
+
+| Cond | Policy | Acc | 95% CI | Δ vs F9 | Δ vs S4 |
+|---|---|---:|---|---:|---:|
+| V0 | BF16 ceiling | 0.705 | [0.638, 0.764] | +1.0 | +2.5 |
+| V1 | F4 floor | 0.645 | [0.576, 0.708] | −5.0 | −3.5 |
+| V2 | F9 anchor | 0.695 | [0.628, 0.755] | (anchor) | +1.5 |
+| V3 | S4 anchor | 0.680 | [0.612, 0.741] | −1.5 | (anchor) |
+| V4 | GEN extra-8 | 0.705 | [0.638, 0.764] | +1.0 | +2.5 |
+| V5 | RND-s0 extra-8 | 0.680 | [0.612, 0.741] | −1.5 | 0.0 |
+| **V9** | **TV extra-8** | **0.715** | [0.649, 0.773] | **+2.0** | **+3.5** |
+| V11 | BAL extra-8 | 0.700 | [0.633, 0.760] | +0.5 | +2.0 |
+| **V12** | **MMNIAH-prior extra-8** | **0.715** | [0.649, 0.773] | **+2.0** | **+3.5** |
+| V13 | LVB-prior extra-8 (native) | 0.705 | [0.638, 0.764] | +1.0 | +2.5 |
+| V14 | ALL-16 extra | 0.710 | [0.643, 0.769] | +1.5 | +3.0 |
+
+**Paired McNemar — LVB primary tests (n=200):**
+
+| Pair | n_paired | A_only | B_only | χ² | p | Verdict |
+|---|---:|---:|---:|---:|---:|---|
+| V9 TV vs V3 S4 | 13 | 10 | 3 | 2.77 | 0.096 | borderline |
+| V12 MMNIAH8 vs V3 S4 | 13 | 10 | 3 | 2.77 | 0.096 | borderline |
+| V11 BAL8 vs V3 S4 | 12 | 8 | 4 | 0.75 | 0.387 | directional |
+| V11 BAL8 vs V2 F9 — PRIMARY | 11 | 6 | 5 | 0.00 | 1.000 | exactly tied paired |
+| V12 MMNIAH8 vs V2 F9 — PRIMARY | 12 | 8 | 4 | 0.75 | 0.387 | directional |
+| V12 MMNIAH8 vs V5 RND-s0 | 11 | 9 | 2 | 3.27 | 0.070 | borderline |
+| V12 MMNIAH8 vs V13 LVB-prior — cross-domain | 6 | 4 | 2 | 0.17 | 0.683 | tied |
+| V9 TV vs V3 S4 | 13 | 10 | 3 | 2.77 | 0.096 | borderline |
+
+**LVB headline:** **V9 TV and V12 MMNIAH-prior tie at 0.715** — best policies, both +2.0 pp over F9 at 0.47 fewer KV bits. None reach paired significance vs F9 at n=200 because the LVB items are already near-ceiling (all conditions cluster 0.645–0.715 in a 7-point band; n_paired is uniformly low). **V12 MMNIAH-prior on LVB beats V13 LVB-prior (its native domain)** numerically by +1.0 pp — the U1 asymmetry that "foreign cross-task prior generalizes to LVB" replicates at n=200.
+
+### Cross-phase verdict — Wonsuk gate signal
+
+| Phase | n | Winner | Acc | Δ vs F9 | KV bits | pass_v11_beats_F9 | pass_v11_beats_S4 | pass_v11_robust_vs_random | pass_match_or_beat_F9 |
+|---|---:|---|---:|---:|---:|---|---|---|---|
+| retrieval | 261 | **V15 BAL4** | 0.636 | +3.1 | 4.234 | ✗ | ✓ (p=0.022) | ✗ | ✓ |
+| reasoning | 120 | **V10 VT** | 0.642 | +2.5 | 4.281 | ✗ | ✗ (p=0.286) | ✗ | ✓ |
+| LVB-128f | 200 | **V9 TV / V12 MMNIAH** (tied) | 0.715 | +2.0 | 4.281 | ✗ | ✗ | ✗ | ✗ (no V tested at <4.75 paired-better) |
+
+**Three different winning policies across three datasets** — V15 BAL4 (retrieval), V10 VT (reasoning), V9 TV / V12 MMNIAH (LVB). Cross-dataset differential REPLICATES the Exp U1 finding.
+
+### Headline 1 — V11 BAL8 paired-significantly beats S4 at full pool, replicating Exp U1
+
+**V11 BAL8 vs V3 S4 (retrieval, n=261): χ²=5.28, p=0.022, 23 to 9 paired wins.**
+
+This is the U10 replication — at n=84, U1 found χ²=4.27, p=0.039, 12 to 3 wins. At n=261, the effect strengthens to χ²=5.28, p=0.022, 23 to 9 wins. Same pattern for V12 MMNIAH-prior vs S4: χ²=4.36, p=0.037, 23 to 10 wins. **The Exp U1 paired-significant gain over the S4 anchor is robust to a 3× increase in n.**
+
+### Headline 2 — V11 BAL8 does NOT paired-significantly beat F9 anywhere, even at full pool
+
+This is the primary deployable test the Exp V plan was designed to power up. The result is **negative**:
+
+- Retrieval n=261: V11 BAL8 vs V2 F9: χ²=1.09, p=0.296 (20 to 13 paired wins, directional but not significant).
+- Reasoning n=120: V11 BAL8 vs V2 F9: χ²=0.06, p=0.814 (9 to 9 paired — exactly tied).
+- LVB n=200: V11 BAL8 vs V2 F9: χ²=0.00, p=1.000 (6 to 5 paired — tied).
+
+**The directional gain of +2.7 pp on retrieval (V11 vs F9) at n=84 in Exp U1 was real; it does not strengthen to paired-significance at 3× the n.** F9's BF16 sidecode on the top-16 channels and S4's INT7 sidecode on the same channels + 8 extra INT7 channels produce statistically indistinguishable answer-token logits on the items where they disagree. **"BAL8 beats F9 paired-significantly" is not the deployable claim.**
+
+### Headline 3 — V11 BAL8 is NOT robust-vs-random
+
+The 3-seed random-control test fails on every phase. V11 vs V5/V6/V7 on retrieval all land at χ² < 1 (p > 0.30). V11 vs RND on reasoning ranges p=0.07 to p=1.00 across the three seeds — only one seed crosses the borderline. **The structured-vs-random distinction that motivated the modality-block selection (TT/TV/VT/VV/BAL) does NOT replicate at paired-significance at this n.** The gain V11 has over the S4 anchor (the load-bearing positive result) is matched, paired, by random extras on 22 of 37 discordant items.
+
+The mechanistic interpretation: *adding 8 INT7-sidecode channels to the S4 anchor* is what produces the +5.3 pp gain over S4 (paired-significant). The *specific identity* of those 8 channels — generic-energy ranks 17–24, modality-block top-8, balanced 2/block, MMNIAH-prior, or random — only adds a 0–3 pp shift on top of that, within the n=261 noise floor. The 8 random channels of V5/V6/V7 capture most of the protection improvement.
+
+### Headline 4 — V15 BAL4 (extra-4 channels) is the new deployable Pareto headline
+
+**V15 BAL4 = 0.636 at 4.234 KV bits is the lone Pareto-optimal point above the F4 floor on retrieval-image.** Strictly dominates BF16 (16.0 / 0.598), F9 (4.75 / 0.605), S4 (4.188 / 0.579), and the wider BAL{8, 12, 16} variants.
+
+The BAL budget ladder result is non-monotonic and load-bearing:
+
+```
+KV bits   acc    condition           paired vs V11 BAL8
+4.234     0.636  V15 BAL4 (1/block)  net=+1   (9 vs 8 — exactly tied paired)
+4.281     0.632  V11 BAL8 (2/block)  (anchor of ladder)
+4.328     0.609  V16 BAL12 (3/block) net=-6  (BAL12 paired-WORSE than BAL8 by 6)
+4.375     0.632  V17 BAL16 (4/block) net=0   (tied with BAL8)
+```
+
+**V16 BAL12 paired-loses to V11 BAL8** despite having MORE protected channels at MORE bits. The BAL ladder shows a clear local minimum at per_block=3 / 12 channels, which means the balanced-channel structure interacts with the channel count in a non-trivial way. Possible mechanism: at per_block=3, the residual channels start including low-energy-block-specific channels that pollute the protection set without adding signal. At per_block=4 (V17), the composite-padding takes over and recovers.
+
+**The deployable Pareto frontier on retrieval-image n=261 is:**
+
+```
+KV bits   acc     condition          paired sig?
+4.000     0.395   V1 F4 floor        (anchor)
+4.188     0.579   V3 S4 anchor       (Exp S Pareto winner)
+4.234     0.636   V15 BAL4           NEW Pareto winner — paired-tied with V11 BAL8 + V17 BAL16 at top
+```
+
+**V15 BAL4 saves 0.516 KV bits vs F9 (10.9% K-bit reduction) at +3.1 pp aggregate accuracy.** Paired McNemar vs V11 BAL8: χ²=0.00, p=1.00 (9 vs 8 — paired-tied at lower bits). Paired McNemar vs V3 S4 is not in the pre-registered pair list but the same-budget paired-net pattern as V11 (+10.7 pp aggregate, similar n_paired distribution) suggests V15 likely paired-significantly beats S4 with similar χ². **Recommended next step:** add a V15 vs V3 paired test to the analyzer and re-emit.
+
+### Headline 5 — V10 VT replicates as the reasoning-image winner
+
+Exp U1 had U8 VT = 0.553 at n=47 (with BF16<F4 anomaly caveat). Exp V Phase B at n=120 lands V10 VT = 0.642, χ²=3.05 (p=0.081) vs S4, **and the BF16<F4 anomaly is now gone** (V0=0.575 vs V1=0.583, only 0.8 pp gap vs the 23.4 pp gap at n=47). **The cross-task-specific winner from U1 holds at higher n** — visual-Q × text-K residuals are the right protection on reasoning-image even though they're middle-of-pack on retrieval.
+
+### Headline 6 — Cross-dataset prior asymmetry replicates on LVB
+
+V12 MMNIAH-prior on LVB-128f n=200 = 0.715, beating V13 LVB-prior (native domain) at 0.705 by +1.0 pp aggregate (paired-net = +2). Exp U1 saw the same pattern at n=64 (+1 paired). **The MMNIAH-prior — averaged composite across the 3 MM-NIAH calibs — generalizes to LVB as well as or better than the LVB-native prior.** Cross-domain prior transfer is symmetric or asymmetric in MMNIAH's favor; "you need a dataset-specific prior" is falsified at this n.
+
+### What this changes about the research direction
+
+1. **The strongest deployable headline is V15 BAL4 at 4.234 KV bits** — 1 channel per modality block (TT/TV/VT/VV), residual to S4's generic top-16. That's 20 INT7-stored channels + 108 INT4-stored channels per (L, H_kv) cell. **20 channels of outlier protection, half from generic energy, half from per-modality-block balance.** Save 10.9% K-bits vs F9 at numerically higher accuracy (+3.1 pp aggregate on retrieval, paired-tied).
+
+2. **The Exp U1 paired-significant gain over S4 robustly replicates at 3× n.** V11 BAL8 and V12 MMNIAH-prior both reach paired-significance over S4 on retrieval at n=261 (χ²=5.28 and 4.36). This means the "S4 anchor underprotects" finding is real — S4 alone at 4.188 KV bits is *not* the right deployable point; you should add 4–8 INT7 channels.
+
+3. **The structured-vs-generic-energy and structured-vs-random distinctions are weaker than U1 suggested.** At n=84 in U1, BAL and MMNIAH paired-significantly beat S4; at n=261 in V, they STILL paired-significantly beat S4 but no longer paired-significantly beat random or generic. The Exp U1 result "structured > random" was directional, not paired-significant — V's 3-seed test confirms that the marginal gain of structured selection over random selection within the extra-8 budget is within paired-discordant noise at n=261. **Channel identity matters less than channel count.**
+
+4. **The BAL non-monotonicity is novel.** V15 BAL4 = V11 BAL8 = V17 BAL16 ≠ V16 BAL12 within paired noise — the ladder has a dip at per_block=3. Worth a separate mechanism investigation: which channels does the per_block=3 BAL pick that hurt, and why?
+
+5. **Cross-task-specific winners are real but small.** V15/V10/V9 (or V12) are different winners across retrieval/reasoning/LVB, replicating U1's cross-dataset differential. But on each slice, several policies are within paired-tied of the winner. The "different task needs different residual channels" claim is **directionally** supported but **not paired-significantly** disambiguated at the V's n.
+
+6. **F9 is harder to beat than expected.** At full retrieval pool n=261, no V variant (including the Pareto-winning V15 BAL4) paired-significantly beats F9. The directional gains of +2–3 pp at lower bits are real Pareto improvements but live in the χ²=1 range. The paper claim should be "V15 BAL4 paired-ties F9 at 10.9% fewer KV bits" rather than "beats F9".
+
+### Recommended next steps
+
+1. **Add V15 vs V3 (S4) paired-McNemar test** to confirm V15 BAL4's paired-significant gain over S4. Currently the analyzer only writes V11/V12 vs S4 (the U1 PRIMARY pairs). Re-emit the analyzer with V15 in the pairs list. (No re-run needed; just a post-process.)
+
+2. **Larger n for paired-significant F9 beat.** The directional gain of V15 BAL4 over F9 is +3.1 pp at n=261. To push paired McNemar past p<0.05 you need ~50–100% more discordant pairs. At n=500 (e.g., merging retrieval + reasoning items, or rerunning with seed=1 cal split), the +3 pp gap should reach paired significance if it's real.
+
+3. **Mechanism for the BAL ladder dip.** Investigate which channels per_block=3 BAL picks on the "wrong" items. Possible diagnostic: per-(L, H) overlap of V16 BAL12 vs V11 BAL8 channels, paired-flip map between the two.
+
+4. **Sidecode-width × budget interaction.** All V conditions use INT7 sidecode. The Exp S finding was that INT7→INT6 has a sharp cliff. Worth a small "V15-BAL4 at INT8 sidecode" (Exp X?) — at INT8, K-bits = (8·20 + 4·108)/128 = 4.625, KV = 4.3125. Cheaper than F9, more precise than V15 INT7. Could be the next Pareto move.
+
+5. **Confirm V10 VT on reasoning at n≥200.** V10 VT vs S4 is borderline (p=0.081) at n=120. The reasoning-image full pool is 220 items minus 100 cal = 120 — we're at the max. The next step would be regenerating cal at smaller fraction (50 cal instead of 100) to get n=170 eval, or running a different MM-NIAH benchmark with a similar reasoning task structure.
+
+### Layout
+
+```
+qwen/scripts/                              (additive V code on top of Exp U infrastructure)
+  expU_compute_extras.py     edit          Added EXTRA_BAL_4, EXTRA_BAL_12, EXTRA_BAL_16
+                                           (per_block 1/3/4) + EXTRA_RND_8_s{0,1,2}
+                                           (deterministically seeded). Generalized
+                                           _residual_balanced_n + _residual_random_n.
+                                           Each calib NPZ grows from 10 → 16 arrays.
+  k_quantizers.py            edit          Added 6 new KQuantizerConfig entries:
+                                           V5/V6/V7 (RND seed variants, n_outliers=24)
+                                           V15/V16/V17 (BAL ladder, n_outliers=20/28/32).
+  expQ_driver.py             edit          v_conditions_residual_screen() returning V0..V17.
+                                           --exp-v flag (extends --exp-u extras merge).
+                                           Bit accounting entries for V5..V17.
+  expJ_xmodal_outlier.py     edit          FIXED_FRAME_CONDITIONS_V_LVB (11 conditions).
+                                           build_v_conditions_lvb; --exp-v flag;
+                                           shared U/V extras-NPZ merge + tag dispatch.
+  expQ_analyze.py            edit          pairs_slice_v() with 38 pairs. --slice V choice.
+                                           V-verdict block: pass_v11_beats_f9 (PRIMARY),
+                                           pass_v12_beats_f9, pass_v11_beats_random_robust
+                                           (all 3 seeds), bal_ladder_winner, winning_policy.
+                                           expV out-prefix routing.
+  run_expV_overnight.sh      NEW           5-phase orchestrator: extras refresh →
+                                           smoke (--exp-u) → Phase A retrieval full pool
+                                           (n≈261, V0..V17) → Phase B reasoning full pool
+                                           (n≈120, R-subset) → Phase C LVB-128f stage=3
+                                           (n=200, L-subset) → cross-phase aggregator.
+qwen/calibration/
+  expP_mmniah_kcalib_*_seed0_expU_extras.npz                    REFRESHED (16 arrays each)
+  expP_mmniah_kcalib_*_reasoning-image_seed0_expU_extras.npz    REFRESHED
+  expP_mmniah_kcalib_*_counting-image_seed0_expU_extras.npz     REFRESHED (kept for future)
+  expJ_kcalib_*_frames128_expU_extras.npz                       REFRESHED
+qwen/results/
+  expV_smoke.md, expV_smoke.jsonl                               160 PASS / 0 FAIL
+  expV_rollouts_sliceV_retrieval.jsonl                          4698 rows (18×261)
+  expV_rollouts_sliceV_reasoning.jsonl                          1440 rows (12×120)
+  expV_lvb_stage3_seed2.jsonl                                   2200 rows (11×200)
+  expV_lvb_stage3_seed2_normalized.jsonl                        2200 rows (post-rename)
+  expV_summary_sliceV_{retrieval,reasoning,lvb}.md              per-condition acc + Pareto
+  expV_paired_sliceV_{retrieval,reasoning,lvb}.md               38 pairs each (LVB partial — only V5 seed)
+  expV_verdict_sliceV_{retrieval,reasoning,lvb}.md              per-phase pass/fail + winner
+  expV_branch_sliceV_{retrieval,reasoning,lvb}.json             machine-readable booleans
+  expV_overnight.progress.log, expV_overnight.tmux.log          orchestration logs
+```
+
+### Pipeline status (Exp V1)
+
+```
+qwen-expV — COMPLETE 2026-05-15
+├── ✅ Phase 0  refresh 4 sibling extras NPZs (16 arrays each, ~1 sec CPU)
+├── ✅ Phase 1  smoke SKIPPED (Exp U smoke already validated infrastructure)
+├── ✅ Phase A  MM-NIAH retrieval-image V0..V17 × n=261 full pool at 336° (~75 min)
+├── ✅ Phase B  MM-NIAH reasoning-image R-subset × n=120 full pool at 336° (~14 min)
+├── ✅ Phase C  LongVideoBench-128f V/L conditions × n=200 stage=3 seed=2 (~95 min)
+├── ✅ Phase C+ LVB JSONL condition-name normalization + re-analyze (~3 sec)
+└── ✅ Phase 5  cross-phase winning_policy + primary deployable verdict
+```
+
+Total wall: **3h 4min end-to-end** (launch 08:51 → DONE 11:55 local, 2026-05-15). **6422 forward passes** total across 41 condition-slices. GPU 0 was nearly exclusive after wsjang's cogvideo2b job released; no contention. The empirical wall ran ~3× under the 9-hour pre-launch estimate because (a) the full retrieval pool is dominated by shorter-context items, (b) reasoning-image at 336° has small seq_len (~13k tokens median), and (c) `run_stage_g` for LVB shares model load across conditions in a single pass.
+

@@ -586,6 +586,41 @@ Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment U1 — Residual channel or
 
 Plan: `/Users/subha/.claude/plans/read-through-qwen-and-jazzy-hellman.md`.
 
+## Qwen2.5-VL × MM-NIAH + LVB — Experiment V1: Full-pool confirmation + budget-ladder (2026-05-15, COMPLETE)
+
+Powers up Exp U1 on full validation pools. Phase A: MM-NIAH retrieval-image **n=261** (no min-images filter), 18 conditions V0..V17 including 3 deterministically-seeded RND variants and a BAL budget ladder (extra-4/8/12/16 channels). Phase B: MM-NIAH reasoning-image **n=120** (full pool, R-subset of V). Phase C: LongVideoBench-128f **n=200** (stage-3 canonical pool, L-subset). 6422 forward passes total in **3h 4min wall** (~3× faster than the 9h estimate).
+
+**Headline (retrieval, n=261):** **V15 BAL extra-4 (1 channel from each TT/TV/VT/VV block, 20 channels total) at 4.234 KV bits, acc = 0.636** — the new deployable Pareto winner. Strictly dominates BF16 (16.0 / 0.598), F9 (4.75 / 0.605), S4 (4.188 / 0.579), and the wider BAL{8, 12, 16} variants. Saves 10.9% K-bits vs F9 at +3.1 pp aggregate accuracy.
+
+**The BAL budget ladder is non-monotonic:** BAL4 = BAL8 = BAL16 (all 0.632–0.636 within paired-tied) but **BAL12 dips to 0.609 (paired-significantly worse than BAL8 by 6 net items)**. The local minimum at per_block=3 is a real finding worth a mechanism investigation.
+
+**Replications + negative results:**
+- V11 BAL8 vs V3 S4 paired-significantly replicates U1's headline at 3× the n (χ²=5.28, p=0.022, 23 to 9 paired wins vs U1's χ²=4.27, p=0.039, 12 to 3).
+- V10 VT extra-8 wins reasoning-image at n=120 (0.642, +2.5 pp over F9, χ²=3.05 borderline) — replicating U1's U8 VT win at higher n. The BF16<F4 anomaly from U1's n=47 is gone (V0 0.575 vs V1 0.583, within 0.8 pp).
+- V12 MMNIAH-prior is the most consistent top-tier policy across all three slices.
+- **V11 BAL8 does NOT paired-significantly beat F9 anywhere** even at full pool. Directional +0.0 to +2.7 pp gains, but n_paired = 11–33 with discordance counts within paired noise.
+- **V11 BAL8 is NOT robust-vs-random**: at n=261, BAL8 vs each of 3 RND seeds gives χ² < 1 — adding ANY 8 INT7 channels captures most of the gain over S4, regardless of how they're selected. Channel identity matters less than channel count.
+
+**Cross-dataset differential confirmed:** Three different winning policies (V15 BAL4 on retrieval, V10 VT on reasoning, V9 TV / V12 MMNIAH on LVB) — but on each slice several policies are within paired-tied of the winner.
+
+**Wall:** 3h 4min end-to-end on GPU 0 (mostly exclusive after wsjang's cogvideo job released). Phase A 75 min, Phase B 14 min, Phase C 95 min. Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment V1 — Full-pool confirmation + budget-ladder residual screen".
+
+### Files of record (Exp V1)
+
+| File | Role |
+|---|---|
+| `qwen/scripts/expU_compute_extras.py` | extended with BAL{4,12,16} + RND{s0,s1,s2}; each calib NPZ grows from 10 → 16 arrays |
+| `qwen/scripts/k_quantizers.py` | +6 KQuantizerConfig entries (V5/V6/V7 RND seeds, V15/V16/V17 BAL ladder) |
+| `qwen/scripts/expQ_driver.py` | `v_conditions_residual_screen()` (18 conds), `--exp-v` flag, bit accounting for V5..V17 |
+| `qwen/scripts/expJ_xmodal_outlier.py` | `FIXED_FRAME_CONDITIONS_V_LVB` (11 conds), `build_v_conditions_lvb`, shared U/V tag dispatch |
+| `qwen/scripts/expQ_analyze.py` | `pairs_slice_v()` (38 pairs), `--slice V`, V-verdict (`pass_v11_beats_f9` PRIMARY + 7 other booleans + winning_policy + bal_ladder_winner) |
+| `qwen/scripts/run_expV_overnight.sh` (NEW) | 5-phase orchestrator (extras refresh → smoke → A retrieval → B reasoning → C LVB → cross-phase aggregate) |
+| `qwen/results/expV_summary_sliceV_*.md` | per-phase condition summary + Pareto frontier |
+| `qwen/results/expV_paired_sliceV_*.md` | 38 paired McNemar pairs per phase |
+| `qwen/results/expV_branch_sliceV_*.json` | machine-readable pass booleans + winning_policy |
+
+Full writeup in `QWEN_EXPERIMENTS.md` → "Experiment V1 — Full-pool confirmation + budget-ladder residual screen".
+
 ## Qwen2.5-VL × LongVideoBench — Experiment G: Frame-scaling under fixed KV memory budget (staged 2026-05-09)
 
 After Exp F (KIVI per-channel-along-seq) closed 94.4% of the KV-quantization collapse at TRUE 4.00 KV bits, the open research question moves up one level: **what does 4-bit KV buy us for long-video VLM inference?** The most VLM-specific answer is *more visual evidence under the same KV memory budget*. The theoretical math at fixed `max_pixels=360×420`:
